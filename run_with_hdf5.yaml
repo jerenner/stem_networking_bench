@@ -1,0 +1,22 @@
+%YAML 1.2
+---
+# Select the HDF5 data source
+source: "hdf5"
+
+scheduler:
+  worker_thread_number: 2 # One for replayer, one for processor
+
+replayer:
+  filepath: "/home/daquser/jrenner/sparse_frames.h5"
+  dataset_name: "/frames"
+  repeat: true
+  allocator: &allocator # Define an allocator to be shared
+
+processor:
+  # Add any parameters for your processor op here
+
+resources:
+  # Define the actual allocator resource
+  - &allocator
+    type: holoscan::UnboundedAllocator
+    name: "pool"
