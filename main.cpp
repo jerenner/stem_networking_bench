@@ -17,6 +17,7 @@
 #include "hdf5_replayer_op.h"
 #include "stem_receiver_op.h"
 #include "pytorch_processor_op.h"
+#include "hdf5_writer_op.h"
 #include "advanced_network/kernels.h"
 #include "holoscan/holoscan.hpp"
 #include <assert.h>
@@ -29,6 +30,7 @@ class App : public holoscan::Application {
 
     // The processor is common to both paths
     auto processor = make_operator<ops::PyTorchProcessorOp>("processor", from_config("processor"));
+    auto writer = make_operator<ops::HDF5WriterOp>("writer", from_config("writer"));
 
     // Check config to decide which data source to use
     std::string source_type = from_config("source").as<std::string>();
@@ -50,8 +52,9 @@ class App : public holoscan::Application {
       // DPDK is the default manager backend
       auto receiver = make_operator<ops::StemReceiverOp>("receiver", from_config("receiver"));    
       add_flow(receiver, processor, {{"output", "input"}});
-      //add_operator(bench_rx);
     }
+
+    add_flow(processor, writer);
   }
 };
 

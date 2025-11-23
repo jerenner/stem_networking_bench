@@ -38,9 +38,10 @@ set(CMAKE_CUDA_ARCHITECTURES "70;80;90")
 add_executable(stem_networking_bench
   kernels.cu
   main.cpp
-  stem_receiver_op.h
   hdf5_replayer_op.cpp
+  stem_receiver_op.h
   pytorch_processor_op.cpp
+  hdf5_writer_op.cpp
 )
 target_include_directories(stem_networking_bench 
   BEFORE

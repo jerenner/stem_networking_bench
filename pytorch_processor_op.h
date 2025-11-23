@@ -18,6 +18,7 @@ class PyTorchProcessorOp : public Operator {
   void compute(InputContext& op_input, OutputContext&, ExecutionContext& context) override;
 
  private:
+  Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
   torch::nn::Conv2d conv_{nullptr};
   long long frames_processed_ = 0;
 };
