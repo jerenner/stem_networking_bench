@@ -77,6 +77,9 @@ int main(int argc, char** argv) {
                                                            app->from_config("scheduler")));
   app->run();
 
-  advanced_network::shutdown();
+  std::string source_type = app->from_config("source").as<std::string>();
+  if (source_type != "hdf5") {
+    advanced_network::shutdown();
+  }
   return 0;
 }

@@ -20,7 +20,7 @@ project(stem_networking_bench CXX CUDA)
 # Dependencies
 find_package(holoscan 2.6 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
-find_package(Torch REQUIRED PATHS "/home/daquser/jrenner/libtorch")
+find_package(Torch REQUIRED PATHS "/home/jrenner/local/software/libtorch")
 find_package(HDF5 COMPONENTS CXX HL REQUIRED)
 
 include(FetchContent)
@@ -80,8 +80,8 @@ endforeach()
 
 # Copy config file
 add_custom_target(stem_networking_bench_yaml
-  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/../stem_networking_bench_default_tx_rx.yaml" ${CMAKE_CURRENT_BINARY_DIR}
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../stem_networking_bench_default_tx_rx.yaml"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/run_with_hdf5.yaml" ${CMAKE_CURRENT_BINARY_DIR}
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/run_with_hdf5.yaml"
 )
 add_dependencies(stem_networking_bench stem_networking_bench_yaml)
 
@@ -92,7 +92,7 @@ install(TARGETS stem_networking_bench
 
 install(
   FILES
-    ../stem_networking_bench_default_tx_rx.yaml
+    run_with_hdf5.yaml
   DESTINATION examples/stem_networking_bench
   COMPONENT stem_networking_bench-configs
   PERMISSIONS OWNER_READ OWNER_WRITE
@@ -115,6 +115,8 @@ install(
     main.cpp
     kernels.cu
     kernels.cuh
+    hdf5_replayer_op.cpp
+    hdf5_writer_op.cpp
     pytorch_bench_op_rx.h
     stem_bench_op_tx.h
   DESTINATION examples/stem_networking_bench

@@ -7,7 +7,7 @@ scheduler:
   worker_thread_number: 3 # One for replayer, one for processor, one for writer
 
 replayer:
-  filepath: "/home/daquser/jrenner/sparse_frames.h5"
+  filepath: "/home/jrenner/local/lbl/holoscan/sparse_frames.h5"
   dataset_name: "/frames"
   repeat: false
   count: 16
@@ -16,7 +16,7 @@ processor:
   # Add any parameters for your processor op here
 
 writer:
-  filepath: "/home/daquser/jrenner/sparse_frames_out.h5"
+  filepath: "/home/jrenner/local/lbl/holoscan/sparse_frames_out.h5"
   dataset_name: "/processed"
 
 resources:

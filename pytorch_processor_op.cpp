@@ -2,10 +2,11 @@
 #include "pytorch_processor_op.h"
 #include "holoscan/core/domain/tensor.hpp"
 #include "gxf/std/tensor.hpp"
+#include "holoscan/utils/cuda_macros.hpp"
 
 namespace holoscan::ops {
 
-void PyTorchProcessorOp::setup(OperatorSpec& spec) override {
+void PyTorchProcessorOp::setup(OperatorSpec& spec) {
   spec.input<holoscan::TensorMap>("input");
   spec.output<holoscan::TensorMap>("output");
 
@@ -26,7 +27,7 @@ void PyTorchProcessorOp::initialize() {
     HOLOSCAN_LOG_INFO("PyTorchProcessorOp: Conv2d module initialized on GPU.");
 }
 
-void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext&, ExecutionContext&) {
+void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) {
 
   // Receive a gxf::Entity
   //auto in_entity = op_input.receive<gxf::Entity>("input").value();
@@ -65,9 +66,9 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext&, Executi
   
   // 2. Reshape it (allocates memory)
   auto allocator_handle = nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(context.context(), allocator_->gxf_cid());
-  auto shape = output_tensor.sizes(); // shape is [N, C, H, W]
+  auto out_shape = output_tensor.sizes(); // shape is [N, C, H, W]
   auto result = gxf_out_tensor->reshape<float>(
-      nvidia::gxf::Shape{shape[0], shape[1], shape[2], shape[3]},
+      nvidia::gxf::Shape{static_cast<int32_t>(out_shape[0]), static_cast<int32_t>(out_shape[1]), static_cast<int32_t>(out_shape[2]), static_cast<int32_t>(out_shape[3])},
       nvidia::gxf::MemoryStorageType::kDevice,
       allocator_handle.value());
   if (!result) { throw std::runtime_error("Failed to reshape processor output tensor"); }
