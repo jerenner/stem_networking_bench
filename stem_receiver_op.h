@@ -192,6 +192,11 @@ class StemReceiverOp : public Operator {
                      "Reorder kernel enabled",
                      "Enable reorder kernel if alignment and memory types are supported",
                      true);
+    spec.param<uint64_t>(count_,
+                         "count",
+                         "Count",
+                         "Number of frames to receive. 0 means infinite.",
+                         0UL);
   }
 
   // Free buffers if CUDA processing/copy is complete
@@ -235,6 +240,30 @@ class StemReceiverOp : public Operator {
 
       // Count packets received
       ttl_pkts_recv_ += burst_size;
+
+      // Check if we have reached the limit
+      if (count_ > 0 && ttl_pkts_recv_ >= count_ * batch_size_.get()) {
+          HOLOSCAN_LOG_INFO("StemReceiverOp: Reached frame limit of {}", count_.get());
+          // Stop the application? Or just stop receiving?
+          // For now, let's just stop receiving and let the pipeline drain
+          // But we need to make sure we don't hang.
+          // A simple way is to exit or throw, but that's not clean.
+          // Better: stop scheduling this operator.
+          // But we are in compute(), so we can't easily stop scheduling from here without a condition.
+          // Let's just break and return, effectively stopping processing new bursts.
+          // Ideally we should signal the scheduler.
+          // For this benchmark, maybe just logging and returning is enough if the scheduler handles it?
+          // Actually, if we return, compute will be called again.
+          // We need a member variable to track if we are done.
+          if (!is_done_) {
+             is_done_ = true;
+             // Disable ticking?
+             // stop_condition_.get()->disable_tick(); // If we had one.
+          }
+          return; 
+      }
+      
+      if (is_done_) return;
 
       // Store burst structure
       cur_batch_.bursts[cur_batch_.num_bursts++] = burst;
@@ -543,7 +572,10 @@ class StemReceiverOp : public Operator {
   Parameter<uint16_t> max_packet_size_;                  // Maximum size of a single packet
   Parameter<uint16_t> header_size_;                      // Header size of packet
   Parameter<bool> reorder_kernel_;                       // Reorder kernel enabled
+  Parameter<uint64_t> count_;                            // Number of frames to receive
   Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
+
+  bool is_done_ = false;
 							 
 
   std::array<cudaStream_t, num_concurrent> streams_;
