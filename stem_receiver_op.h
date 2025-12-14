@@ -17,7 +17,10 @@
 
 #include "advanced_network/common.h"
 #include "advanced_network/kernels.h"
+#include "kernels.cuh"
 #include "holoscan/holoscan.hpp"
+#include "holoscan/core/domain/tensor.hpp"
+#include "holoscan/utils/cuda_macros.hpp"
 #include <queue>
 #include <arpa/inet.h>
 #include <assert.h>
@@ -112,6 +115,12 @@ class StemReceiverOp : public Operator {
         if (cudaSuccess != cuda_error) {
           throw std::runtime_error("Could not allocate cuda memory for h_dev_ptrs_");
         }
+        // Allocate device-side pointer array
+        cuda_error = 
+            CUDA_TRY(cudaMalloc(&d_dev_ptrs_[n], sizeof(void*) * batch_size_.get()));
+        if (cudaSuccess != cuda_error) {
+          throw std::runtime_error("Could not allocate cuda memory for d_dev_ptrs_");
+        }
       }
       cudaStreamCreate(&streams_[n]);
       cudaEventCreate(&events_[n]);
@@ -127,8 +136,8 @@ class StemReceiverOp : public Operator {
 
       // Warmup streams and kernel
 #if ADV_NETWORK_MANAGER_WARMUP_KERNEL
-      simple_packet_reorder(NULL, NULL, 1, 1, streams_[n]);
-      cudaStreamSynchronize(streams_[n]);
+      // simple_packet_reorder(NULL, NULL, 1, 1, streams_[n]);
+      // cudaStreamSynchronize(streams_[n]);
 #endif
     }
 
@@ -143,6 +152,7 @@ class StemReceiverOp : public Operator {
       if (full_batch_data_d_[n]) { cudaFree(full_batch_data_d_[n]); }
       if (full_batch_data_h_[n]) { cudaFreeHost(full_batch_data_h_[n]); }
       if (h_dev_ptrs_[n]) { cudaFreeHost(h_dev_ptrs_[n]); }
+      if (d_dev_ptrs_[n]) { cudaFree(d_dev_ptrs_[n]); }
       if (streams_[n]) { cudaStreamDestroy(streams_[n]); }
       if (events_[n]) { cudaEventDestroy(events_[n]); }
       // if (events_start_[n]) { cudaEventDestroy(events_start_[n]); }
@@ -395,14 +405,19 @@ class StemReceiverOp : public Operator {
           // supported. Currently the reorder kernel expects the packets to be 16B-aligned, and
           // anything that's not will cause an access error on the GPU
           if (reorder_kernel_.get()) {
-            simple_packet_reorder(static_cast<uint8_t*>(full_batch_data_d_[cur_batch_idx_]),
-                                  h_dev_ptrs_[cur_batch_idx_],
-                                  nom_payload_size_,
-                                  batch_size_.get(),
-                                  streams_[cur_batch_idx_]);
+            // Copy the list of pointers to the device
+            CUDA_TRY(cudaMemcpyAsync(d_dev_ptrs_[cur_batch_idx_],
+                                     h_dev_ptrs_[cur_batch_idx_],
+                                     sizeof(void*) * batch_size_.get(),
+                                     cudaMemcpyHostToDevice,
+                                     streams_[cur_batch_idx_]));
 
-            // // Run the PyTorch test
-            // pytorch_test_frame();
+            // Use our custom gather kernel which handles unaligned addresses
+            gather_packets(reinterpret_cast<uint8_t**>(d_dev_ptrs_[cur_batch_idx_]),
+                           static_cast<uint8_t*>(full_batch_data_d_[cur_batch_idx_]),
+                           nom_payload_size_,
+                           batch_size_.get(),
+                           streams_[cur_batch_idx_]);
           }
 
         } else {
@@ -417,37 +432,47 @@ class StemReceiverOp : public Operator {
         }
     
         // Tensor creation logic:
+        
+        // 1. Create a GXF Tensor to handle allocation
+        auto gxf_tensor = std::make_shared<nvidia::gxf::Tensor>();
+	      HOLOSCAN_LOG_INFO("-> Created a GXF Tensor");
 
-        // 1. Create a new GXF Entity for the output message
-        auto out_message = nvidia::gxf::Entity::New(context.context());
-        if (!out_message) { throw std::runtime_error("Failed to create output message entity"); }
-
-        // 2. Add a GXF Tensor component to the entity, naming it "frame"
-        auto out_tensor = out_message.value().add<nvidia::gxf::Tensor>("frame");
-        if (!out_tensor) { throw std::runtime_error("Failed to add tensor to output entity"); }
-
-        // 3. Reshape the GXF Tensor
+        // 2. Reshape the GXF Tensor
         auto allocator_handle = nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(context.context(), allocator_->gxf_cid());
+	      HOLOSCAN_LOG_INFO("-> Created allocator handle.");
         int height = FRAME_HEIGHT;
         int width = FRAME_WIDTH;
-        auto result = out_tensor.value()->reshape<uint16_t>(
+        auto result = gxf_tensor->reshape<uint16_t>(
             nvidia::gxf::Shape{height, width},
             nvidia::gxf::MemoryStorageType::kDevice,
             allocator_handle.value());
         if (!result) { throw std::runtime_error("Failed to reshape output tensor"); }
+	      HOLOSCAN_LOG_INFO("-> Reshaped tensor.");
 
-        // 4. Copy the aggregated frame data to the new tensor's buffer
-        cudaMemcpyAsync(out_tensor.value()->pointer(),
+        // 3. Copy the aggregated frame data to the new tensor's buffer
+        HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(gxf_tensor->pointer(),
                         full_batch_data_d_[cur_batch_idx_],
-                        out_tensor.value()->bytes_size(),
+                        gxf_tensor->bytes_size(),
                         cudaMemcpyDeviceToDevice,
-                        streams_[cur_batch_idx_]);
+                        streams_[cur_batch_idx_]));
+	      HOLOSCAN_LOG_INFO("-> Copied data to GPU tensor");
 
-        // 5. Emit the entire entity
-        op_output.emit(out_message.value(), "output");
+        // 4. Wrap in Holoscan Tensor and emit as TensorMap
+        auto maybe_dl_ctx = gxf_tensor->toDLManagedTensorContext();
+        if (!maybe_dl_ctx) {
+            throw std::runtime_error("Failed to get DLManagedTensorContext from nvidia::gxf::Tensor");
+        }
+        auto holoscan_tensor = std::make_shared<Tensor>(maybe_dl_ctx.value());
+        
+        TensorMap out_message;
+        out_message.insert({"frame", holoscan_tensor});
+        op_output.emit(out_message, "output");
 
-        if (cudaGetLastError() != cudaSuccess) {
-          HOLOSCAN_LOG_ERROR("CUDA error with {} packets in batch and {} bytes total",
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+          HOLOSCAN_LOG_ERROR("CUDA error '{}' ({}) with {} packets in batch and {} bytes total",
+                            cudaGetErrorString(err),
+                            static_cast<int>(err),
                             batch_size_.get(),
                             batch_size_.get() * nom_payload_size_);
           exit(1);
@@ -473,8 +498,6 @@ class StemReceiverOp : public Operator {
         cur_batch_.num_bursts = 0;
         cur_batch_idx_ = (++cur_batch_idx_ % num_concurrent);
 
-        // NOTE: output for the next operator would be full_batch_data_d_,
-        // once the CUDA event is completed
       }
     }
   }
@@ -563,6 +586,7 @@ class StemReceiverOp : public Operator {
   int64_t ttl_packets_dropped_ = 0;                // Total packets dropped in operator
   uint16_t nom_payload_size_;                      // Nominal payload size (no headers)
   std::array<void**, num_concurrent> h_dev_ptrs_;  // Host-pinned list of device pointers
+  std::array<void*, num_concurrent> d_dev_ptrs_;   // Device-side list of device pointers
   std::array<void*, num_concurrent> full_batch_data_d_;  // Device aggregated batch
   std::array<void*, num_concurrent> full_batch_data_h_;  // Host aggregated batch
   Parameter<std::string> interface_name_;                // Port name from advanced_network config

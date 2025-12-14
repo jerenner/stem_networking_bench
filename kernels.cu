@@ -89,3 +89,19 @@ void populate_packets_from_frame(uint8_t* frame_buf, uint16_t pkt_len, uint32_t 
                                  cudaStream_t stream) {
   populate_packets_from_frame_kernel<<<num_pkts, 256, 0, stream>>>(frame_buf, pkt_len, num_pkts, offset);
 }
+
+__global__ void gather_packets_kernel(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t pkt_len, uint32_t num_pkts) {
+  int pkt_idx = blockIdx.x;
+  if (pkt_idx >= num_pkts) return;
+
+  uint8_t* src = src_ptrs[pkt_idx];
+  uint8_t* dst = dst_base + pkt_idx * pkt_len;
+
+  for (int i = threadIdx.x; i < pkt_len; i += blockDim.x) {
+    dst[i] = src[i];
+  }
+}
+
+void gather_packets(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t pkt_len, uint32_t num_pkts, cudaStream_t stream) {
+  gather_packets_kernel<<<num_pkts, 256, 0, stream>>>(src_ptrs, dst_base, pkt_len, num_pkts);
+}
