@@ -22,6 +22,7 @@ class HDF5WriterOp : public Operator {
  private:
   Parameter<std::string> filepath_;
   Parameter<std::string> dataset_name_;
+  Parameter<bool> noop_;
 
   // HDF5 specific members
   std::unique_ptr<H5::H5File> file_;

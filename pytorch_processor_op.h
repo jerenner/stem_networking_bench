@@ -19,6 +19,7 @@ class PyTorchProcessorOp : public Operator {
 
  private:
   Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
+  Parameter<bool> noop_;
   torch::nn::Conv2d conv_{nullptr};
   long long frames_processed_ = 0;
 };

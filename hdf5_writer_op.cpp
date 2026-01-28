@@ -10,22 +10,30 @@ void HDF5WriterOp::setup(OperatorSpec& spec) {
 
   spec.param(filepath_, "filepath", "File Path", "Path to the output HDF5 file.");
   spec.param(dataset_name_, "dataset_name", "Dataset Name", "Name of the dataset to write (e.g., '/processed_frames').");
+  spec.param(noop_, "noop", "No-Op Mode", "If true, receive tensor but do not write to file.", false);
 }
 
 void HDF5WriterOp::initialize() {
   Operator::initialize();
 
   // Open HDF5 file for writing, truncate if it exists
-  try {
-    file_ = std::make_unique<H5::H5File>(filepath_.get(), H5F_ACC_TRUNC);
-  } catch (H5::Exception& e) {
-    HOLOSCAN_LOG_ERROR("HDF5 error in initialize (open file): {}", e.getCDetailMsg());
-    throw;
+  if (!noop_.get()) {
+    try {
+      file_ = std::make_unique<H5::H5File>(filepath_.get(), H5F_ACC_TRUNC);
+    } catch (H5::Exception& e) {
+      HOLOSCAN_LOG_ERROR("HDF5 error in initialize (open file): {}", e.getCDetailMsg());
+      throw;
+    }
   }
 }
 
 void HDF5WriterOp::compute(InputContext& op_input, OutputContext&, ExecutionContext&) {
   auto in_message = op_input.receive<TensorMap>("input").value();
+  
+  if (noop_.get()) {
+      return;
+  }
+
   auto tensor = in_message.at("processed_frame");
 
   auto shape = tensor->shape();

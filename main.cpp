@@ -30,7 +30,7 @@ class App : public holoscan::Application {
 
     // The processor is common to both paths
     auto processor = make_operator<ops::PyTorchProcessorOp>("processor", from_config("processor"));
-    auto writer = make_operator<ops::HDF5WriterOp>("writer", from_config("writer"));
+
 
     // Check config to decide which data source to use
     std::string source_type = from_config("source").as<std::string>();
@@ -54,6 +54,7 @@ class App : public holoscan::Application {
       add_flow(receiver, processor, {{"output", "input"}});
     }
 
+    auto writer = make_operator<ops::HDF5WriterOp>("writer", from_config("writer"));
     add_flow(processor, writer);
   }
 };

@@ -12,6 +12,7 @@ void PyTorchProcessorOp::setup(OperatorSpec& spec) {
 
   // Add an allocator parameter needed for creating the output tensor
   spec.param(allocator_, "allocator", "Allocator", "Allocator for output tensors.");
+  spec.param(noop_, "noop", "No-Op Mode", "If true, pass input tensor to output without processing.", false);
 }
 
 void PyTorchProcessorOp::initialize() {
@@ -56,8 +57,14 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
   torch::Tensor reshaped_tensor = pt_tensor.reshape({1, 1, (long)shape[0], (long)shape[1]});
   torch::Tensor frame_float32 = reshaped_tensor.to(torch::kFloat32);
 
-  // Run the processing
-  auto output_tensor = conv_->forward(frame_float32);
+  torch::Tensor output_tensor;
+  if (noop_.get()) {
+      // Pass through the converted float tensor (or original)
+      output_tensor = frame_float32;
+  } else {
+      // Run the processing
+      output_tensor = conv_->forward(frame_float32);
+  }
 
   // === TENSOR EMISSION LOGIC ===
 
