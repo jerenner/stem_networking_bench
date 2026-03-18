@@ -50,8 +50,10 @@ class App : public holoscan::Application {
       HOLOSCAN_LOG_INFO("Configured the Advanced Network manager");
 
       // DPDK is the default manager backend
-      auto receiver = make_operator<ops::StemReceiverOp>("receiver", from_config("receiver"));    
-      add_flow(receiver, processor, {{"output", "input"}});
+      auto receiver0 = make_operator<ops::StemReceiverOp>("receiver0", from_config("receiver0"));
+      auto receiver1 = make_operator<ops::StemReceiverOp>("receiver1", from_config("receiver1"));
+      add_flow(receiver0, processor, {{"output", "input"}});
+      add_flow(receiver1, processor, {{"output", "input"}});
     }
 
     auto writer = make_operator<ops::HDF5WriterOp>("writer", from_config("writer"));
