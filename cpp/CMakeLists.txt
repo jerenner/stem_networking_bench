@@ -16,20 +16,49 @@
 cmake_minimum_required(VERSION 3.20)
 project(stem_networking_bench CXX CUDA)
 
-
 # Dependencies
 find_package(holoscan 2.6 REQUIRED CONFIG
              PATHS "/opt/nvidia/holoscan" "/workspace/holoscan-sdk/install")
+
+# Torch is found via CMAKE_PREFIX_PATH set in the Dockerfile
+# (On x86 this points to LibTorch CXX11, on ARM this points to Pip Torch)
 find_package(Torch REQUIRED PATHS "/home/jrenner/local/software/libtorch")
+
+# FIX ABI MISMATCH caused by PyTorch defaulting to ABI=0
+# Strip the flag from global flags
+string(REPLACE "-D_GLIBCXX_USE_CXX11_ABI=0" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+
+# Strip from TORCH_CXX_FLAGS
+if(TORCH_CXX_FLAGS)
+  string(REPLACE "-D_GLIBCXX_USE_CXX11_ABI=0" "" TORCH_CXX_FLAGS "${TORCH_CXX_FLAGS}")
+endif()
+
+# Strip from common Torch targets if they exist
+foreach(t "torch" "Torch" "torch_cpu" "torch_cuda")
+  if(TARGET ${t})
+    get_target_property(opts ${t} INTERFACE_COMPILE_OPTIONS)
+    if(opts)
+      string(REPLACE "-D_GLIBCXX_USE_CXX11_ABI=0" "" opts "${opts}")
+      set_property(TARGET ${t} PROPERTY INTERFACE_COMPILE_OPTIONS "${opts}")
+    endif()
+  endif()
+endforeach()
+
+# Force ABI=1
+add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
+
 find_package(HDF5 COMPONENTS CXX HL REQUIRED)
 
 include(FetchContent)
 FetchContent_Declare(
   MatX
   GIT_REPOSITORY https://github.com/NVIDIA/MatX.git
-  GIT_TAG v0.8.0
+  GIT_TAG v0.9.4
 )
 FetchContent_MakeAvailable(MatX)
+
+# Add this line to define CUDA::cublas, CUDA::cufft, etc.
+find_package(CUDAToolkit REQUIRED)
 
 # Global variables
 set(CMAKE_CUDA_ARCHITECTURES "70;80;90")
@@ -83,7 +112,11 @@ add_custom_target(stem_networking_bench_yaml
   COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/run_with_hdf5.yaml" ${CMAKE_CURRENT_BINARY_DIR}
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/run_with_hdf5.yaml"
 )
-add_dependencies(stem_networking_bench stem_networking_bench_yaml)
+add_custom_target(stem_networking_bench_fpga_yaml
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/run_with_network_fpga.yaml" ${CMAKE_CURRENT_BINARY_DIR}
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/run_with_network_fpga.yaml"
+)
+add_dependencies(stem_networking_bench stem_networking_bench_yaml stem_networking_bench_fpga_yaml)
 
 # Installation
 install(TARGETS stem_networking_bench
