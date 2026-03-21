@@ -55,63 +55,74 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
 
   void* out_tensor_data_ptr = gpu_data_ptr; // Default to pass-through
 
-  // Only allocate and use PyTorch on CUDA if it was natively compiled with GPU support
-  torch::Tensor pt_tensor;
-  torch::Tensor reshaped_tensor;
-  torch::Tensor frame_float32;
-  torch::Tensor output_tensor;
-
   bool use_torch_cuda = torch::cuda::is_available();
+  torch::Tensor output_tensor;
+  bool is_float = false;
 
-  if (use_torch_cuda) {
+  if (use_torch_cuda && !noop_.get()) {
       auto options = torch::TensorOptions()
           .dtype(torch::kUInt16)
           .device(torch::kCUDA);
-      pt_tensor = torch::from_blob(gpu_data_ptr, {(long)shape[0], (long)shape[1]}, options);
       
-      reshaped_tensor = pt_tensor.reshape({1, 1, (long)shape[0], (long)shape[1]});
-      frame_float32 = reshaped_tensor.to(torch::kFloat32);
+      std::vector<int64_t> pt_sizes;
+      for (auto& s : shape) pt_sizes.push_back((long)s);
 
-      if (!noop_.get()) {
-          output_tensor = conv_->forward(frame_float32);
-          out_tensor_data_ptr = output_tensor.data_ptr();
+      torch::Tensor pt_tensor = torch::from_blob(gpu_data_ptr, pt_sizes, options);
+      
+      torch::Tensor reshaped_tensor;
+      if (shape.size() == 3) {
+          // Assume [Batch, Height, Width], reshape to [Batch, 1, Height, Width]
+          reshaped_tensor = pt_tensor.reshape({(long)shape[0], 1, (long)shape[1], (long)shape[2]});
       } else {
-          output_tensor = frame_float32;
-          out_tensor_data_ptr = output_tensor.data_ptr();
+          reshaped_tensor = pt_tensor;
       }
+      
+      torch::Tensor frame_float32 = reshaped_tensor.to(torch::kFloat32);
+
+      output_tensor = conv_->forward(frame_float32);
+      out_tensor_data_ptr = output_tensor.data_ptr();
+      is_float = true;
   } else {
       if (frames_processed_ == 0) {
-          HOLOSCAN_LOG_WARN("PyTorchProcessorOp: PyTorch installation lacks CUDA support! Bypassing PyTorch inference entirely and simulating no-op passthrough.");
+          HOLOSCAN_LOG_INFO("PyTorchProcessorOp: Bypassing inference (NOOP Mode). Passes original Uint16 tensor natively.");
       }
+      is_float = false;
   }
 
   // === TENSOR EMISSION LOGIC ===
-  // 1. Create a GXF Tensor for the output
   auto gxf_out_tensor = std::make_shared<nvidia::gxf::Tensor>();
-  
-  // 2. Reshape it (allocates memory)
   auto allocator_handle = nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(context.context(), allocator_->gxf_cid());
-  
-  int32_t out_channels = 1;
-  int32_t out_height = shape[0];
-  int32_t out_width = shape[1];
-  int32_t element_size = sizeof(uint16_t);
+  nvidia::gxf::Shape out_gxf_shape;
 
-  if (use_torch_cuda) {
+  if (is_float) {
       auto out_shape = output_tensor.sizes(); // shape is [N, C, H, W]
-      out_channels = out_shape[1];
-      out_height = out_shape[2];
-      out_width = out_shape[3];
-      element_size = sizeof(float); // Float32 from PyTorch
+      out_gxf_shape = nvidia::gxf::Shape{static_cast<int32_t>(out_shape[0]), 
+                                         static_cast<int32_t>(out_shape[1]), 
+                                         static_cast<int32_t>(out_shape[2]), 
+                                         static_cast<int32_t>(out_shape[3])};
+      auto result = gxf_out_tensor->reshape<float>(
+          out_gxf_shape,
+          nvidia::gxf::MemoryStorageType::kDevice,
+          allocator_handle.value());
+      if (!result) { throw std::runtime_error("Failed to reshape processor output tensor"); }
+  } else {
+      // NOOP pass-through original uint16_t shape
+      std::vector<int32_t> i32_shape;
+      for (auto s : shape) i32_shape.push_back(s);
+      
+      if (shape.size() == 3) {
+          out_gxf_shape = nvidia::gxf::Shape{i32_shape[0], i32_shape[1], i32_shape[2]};
+      } else if (shape.size() == 4) {
+          out_gxf_shape = nvidia::gxf::Shape{i32_shape[0], i32_shape[1], i32_shape[2], i32_shape[3]};
+      }
+      auto result = gxf_out_tensor->reshape<uint16_t>(
+          out_gxf_shape,
+          nvidia::gxf::MemoryStorageType::kDevice,
+          allocator_handle.value());
+      if (!result) { throw std::runtime_error("Failed to reshape processor output tensor"); }
   }
 
-  auto result = gxf_out_tensor->reshape<uint8_t>( // Use uint8_t just for raw memory allocation
-      nvidia::gxf::Shape{1, out_channels, out_height, out_width * element_size},
-      nvidia::gxf::MemoryStorageType::kDevice,
-      allocator_handle.value());
-  if (!result) { throw std::runtime_error("Failed to reshape processor output tensor"); }
-
-  // 3. Copy from the PyTorch tensor to the new GXF tensor
+  // 3. Copy data to the new GXF tensor
   HOLOSCAN_CUDA_CALL(cudaMemcpy(gxf_out_tensor->pointer(),
                                out_tensor_data_ptr,
                                gxf_out_tensor->bytes_size(),

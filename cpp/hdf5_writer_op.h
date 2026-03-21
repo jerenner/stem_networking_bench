@@ -34,7 +34,7 @@ class HDF5WriterOp : public Operator {
   bool dataset_created_ = false;
 
   // Host buffer for transferring data from GPU before writing
-  std::vector<float> host_buffer_;
+  std::vector<uint8_t> host_buffer_;
 };
 
 }  // namespace holoscan::ops

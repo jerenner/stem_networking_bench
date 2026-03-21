@@ -90,18 +90,36 @@ void populate_packets_from_frame(uint8_t* frame_buf, uint16_t pkt_len, uint32_t 
   populate_packets_from_frame_kernel<<<num_pkts, 256, 0, stream>>>(frame_buf, pkt_len, num_pkts, offset);
 }
 
-__global__ void gather_packets_kernel(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t pkt_len, uint32_t num_pkts) {
+__global__ void gather_packets_kernel(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t payload_len, uint16_t header_len, uint32_t num_pkts, uint32_t max_rows) {
   int pkt_idx = blockIdx.x;
   if (pkt_idx >= num_pkts) return;
 
   uint8_t* src = src_ptrs[pkt_idx];
-  uint8_t* dst = dst_base + pkt_idx * pkt_len;
+  
+  // Extract row number from bytes 4 and 5 of the custom header (little-endian)
+  uint16_t row_number = ((uint16_t)src[5] << 8) | (uint16_t)src[4];
+  
+  // Map row to the correct offset within the output tensor
+  uint32_t target_row = row_number % max_rows;
 
-  for (int i = threadIdx.x; i < pkt_len; i += blockDim.x) {
-    dst[i] = src[i];
+  uint8_t* payload_src = src + header_len;
+  uint8_t* dst = dst_base + target_row * payload_len;
+
+  // Optimized vectorized copy (7680 bytes is a multiple of 16)
+  if (payload_len % 16 == 0) {
+      uint4* src4 = (uint4*)payload_src;
+      uint4* dst4 = (uint4*)dst;
+      int unroll_len = payload_len / sizeof(uint4);
+      for (int i = threadIdx.x; i < unroll_len; i += blockDim.x) {
+        dst4[i] = src4[i];
+      }
+  } else {
+      for (int i = threadIdx.x; i < payload_len; i += blockDim.x) {
+        dst[i] = payload_src[i];
+      }
   }
 }
 
-void gather_packets(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t pkt_len, uint32_t num_pkts, cudaStream_t stream) {
-  gather_packets_kernel<<<num_pkts, 256, 0, stream>>>(src_ptrs, dst_base, pkt_len, num_pkts);
+void gather_packets(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t payload_len, uint16_t header_len, uint32_t num_pkts, uint32_t max_rows, cudaStream_t stream) {
+  gather_packets_kernel<<<num_pkts, 256, 0, stream>>>(src_ptrs, dst_base, payload_len, header_len, num_pkts, max_rows);
 }

@@ -37,13 +37,28 @@ void HDF5WriterOp::compute(InputContext& op_input, OutputContext&, ExecutionCont
   auto tensor = in_message.at("processed_frame");
 
   auto shape = tensor->shape();
-  int height = shape[2];
-  int width = shape[3];
+  int batch_idx = 0;
+  int height_idx = 1;
+  int width_idx = 2;
+  
+  if (shape.size() == 4) { // NCHW
+      height_idx = 2;
+      width_idx = 3;
+  }
+  
+  int batch_frames = shape[batch_idx];
+  int height = shape[height_idx];
+  int width = shape[width_idx];
+
+  H5::DataType h5_type = H5::PredType::NATIVE_FLOAT;
+  if (tensor->element_type() == holoscan::ElementType::kUnsigned16) {
+      h5_type = H5::PredType::NATIVE_UINT16;
+  }
 
   if (!dataset_created_) {
     try {
       // Create a dataspace with unlimited dimension for frames
-      hsize_t dims[3] = {1, (hsize_t)height, (hsize_t)width};
+      hsize_t dims[3] = {(hsize_t)batch_frames, (hsize_t)height, (hsize_t)width};
       hsize_t max_dims[3] = {H5S_UNLIMITED, (hsize_t)height, (hsize_t)width};
       filespace_ = std::make_unique<H5::DataSpace>(3, dims, max_dims);
 
@@ -54,9 +69,9 @@ void HDF5WriterOp::compute(InputContext& op_input, OutputContext&, ExecutionCont
 
       // Create the dataset
       dataset_ = std::make_unique<H5::DataSet>(
-          file_->createDataSet(dataset_name_.get(), H5::PredType::NATIVE_FLOAT, *filespace_, prop));
+          file_->createDataSet(dataset_name_.get(), h5_type, *filespace_, prop));
       
-      current_dims_[0] = 1;
+      current_dims_[0] = batch_frames;
       current_dims_[1] = height;
       current_dims_[2] = width;
 
@@ -66,39 +81,37 @@ void HDF5WriterOp::compute(InputContext& op_input, OutputContext&, ExecutionCont
       throw;
     }
   } else {
-    // Extend the dataset size for the new frame
-    current_dims_[0] = frame_count_ + 1;
+    // Extend the dataset size for the new frames
+    current_dims_[0] = frame_count_ + batch_frames;
     dataset_->extend(current_dims_);
   }
 
   // Get a fresh dataspace for the extended dataset
   filespace_ = std::make_unique<H5::DataSpace>(dataset_->getSpace());
 
-  // Define the hyperslab for the new frame
+  // Define the hyperslab for the new frame block
   hsize_t offset[3] = {frame_count_, 0, 0};
-  hsize_t count[3] = {1, (hsize_t)height, (hsize_t)width};
+  hsize_t count[3] = {(hsize_t)batch_frames, (hsize_t)height, (hsize_t)width};
   filespace_->selectHyperslab(H5S_SELECT_SET, count, offset);
 
   // Define memory dataspace for the buffer
-  hsize_t mem_dims[2] = {(hsize_t)height, (hsize_t)width};
-  H5::DataSpace memspace(2, mem_dims);
+  hsize_t mem_dims[3] = {(hsize_t)batch_frames, (hsize_t)height, (hsize_t)width};
+  H5::DataSpace memspace(3, mem_dims);
 
   // Copy data from GPU to host buffer
-  host_buffer_.resize(height * width);
+  host_buffer_.resize(tensor->nbytes());
   HOLOSCAN_CUDA_CALL(cudaMemcpy(host_buffer_.data(), tensor->data(), tensor->nbytes(), cudaMemcpyDeviceToHost));
 
   // Write the data
   try {
-    dataset_->write(host_buffer_.data(), H5::PredType::NATIVE_FLOAT, memspace, *filespace_);
+    dataset_->write(host_buffer_.data(), h5_type, memspace, *filespace_);
   } catch (H5::Exception& e) {
     HOLOSCAN_LOG_ERROR("HDF5 error in compute (write): {}", e.getCDetailMsg());
     throw;
   }
 
-  frame_count_++;
-  if (frame_count_ % 100 == 0) {
-      HOLOSCAN_LOG_INFO("HDF5WriterOp: Wrote frame {}", frame_count_);
-  }
+  frame_count_ += batch_frames;
+  HOLOSCAN_LOG_INFO("HDF5WriterOp: Wrote up to frame {}", frame_count_);
 }
 
 }  // namespace holoscan::ops

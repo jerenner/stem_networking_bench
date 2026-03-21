@@ -1,6 +1,5 @@
 /*
  * Original code based on: https://github.com/nvidia-holoscan/holohub/blob/main/applications/adv_networking_bench/cpp/default_bench_op_rx.h
- * (copyright below).
  *
  * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
@@ -18,6 +17,7 @@
  * limitations under the License.
  */
 
+#pragma once
 #include "advanced_network/common.h"
 #include "advanced_network/kernels.h"
 #include "kernels.cuh"
@@ -35,13 +35,13 @@
 
 #define BURST_ACCESS_METHOD_RAW_PTR 0
 #define BURST_ACCESS_METHOD_DIRECT_ACCESS 1
-
 #define BURST_ACCESS_METHOD BURST_ACCESS_METHOD_RAW_PTR
 
-#define FRAME_WIDTH 576
-#define FRAME_HEIGHT 576
-#define FRAME_SIZE_BYTES (FRAME_WIDTH * FRAME_HEIGHT * sizeof(uint16_t))  // 16-bit samples
-									  
+// New Frame Geometry
+#define FRAME_WIDTH 3840
+#define FRAME_HEIGHT 128
+#define FRAME_SIZE_BYTES (FRAME_WIDTH * FRAME_HEIGHT * sizeof(uint16_t))
+
 using namespace holoscan::advanced_network;
 
 namespace holoscan::ops {
@@ -60,7 +60,6 @@ namespace holoscan::ops {
     _holoscan_cuda_err;                                                                         \
   })
 
-#define ADV_NETWORK_MANAGER_WARMUP_KERNEL 1
 
 class StemReceiverOp : public Operator {
  public:
@@ -70,10 +69,7 @@ class StemReceiverOp : public Operator {
 
   ~StemReceiverOp() {
     HOLOSCAN_LOG_INFO("Finished receiver with {}/{} bytes/packets received and {} packets dropped",
-                      ttl_bytes_recv_,
-                      ttl_pkts_recv_,
-                      ttl_packets_dropped_);
-
+                      ttl_bytes_recv_, ttl_pkts_recv_, ttl_packets_dropped_);
     HOLOSCAN_LOG_INFO("StemReceiverOp shutting down");
     freeResources();
   }
@@ -89,68 +85,39 @@ class StemReceiverOp : public Operator {
     HOLOSCAN_LOG_INFO("AdvNetworkingBenchDefaultRxOp::initialize()");
     holoscan::Operator::initialize();
 
-    cudaError_t cuda_error;
     port_id_ = get_port_id(interface_name_.get());
     if (port_id_ == -1) {
       HOLOSCAN_LOG_ERROR("Invalid RX port {} specified in the config", interface_name_.get());
       exit(1);
     }
 
-    // For this example assume all packets are the same size, specified in the config
-    nom_payload_size_ = max_packet_size_.get() - header_size_.get();
+    // Fixed packet payload constants based on protocol
+    custom_header_size_ = 64;   // 1 Word of generic info
+    nom_payload_size_ = 7680;   // 120 words of actual frame row data
+
+    // Derived from user params
+    rows_per_tensor_ = frames_per_tensor_.get() * 128; // 128 rows per frame
 
     for (int n = 0; n < num_concurrent; n++) {
-      cuda_error =
-          CUDA_TRY(cudaMalloc(&full_batch_data_d_[n], batch_size_.get() * nom_payload_size_));
-      if (cudaSuccess != cuda_error) {
-        throw std::runtime_error("Could not allocate cuda memory for full_batch_data_d_[n]");
-      }
+      CUDA_TRY(cudaMalloc(&full_batch_data_d_[n], rows_per_tensor_ * nom_payload_size_));
 
       if (!gpu_direct_.get()) {
-        cuda_error =
-            CUDA_TRY(cudaMallocHost(&full_batch_data_h_[n], batch_size_.get() * nom_payload_size_));
-        if (cudaSuccess != cuda_error) {
-          throw std::runtime_error("Could not allocate cuda memory for full_batch_data_h_[n]");
-        }
+        CUDA_TRY(cudaMallocHost(&full_batch_data_h_[n], rows_per_tensor_ * nom_payload_size_));
       } else {
-        cuda_error =
-            CUDA_TRY(cudaMallocHost((void**)&h_dev_ptrs_[n], sizeof(void*) * batch_size_.get()));
-        if (cudaSuccess != cuda_error) {
-          throw std::runtime_error("Could not allocate cuda memory for h_dev_ptrs_");
-        }
-        // Allocate device-side pointer array
-        cuda_error = 
-            CUDA_TRY(cudaMalloc(&d_dev_ptrs_[n], sizeof(void*) * batch_size_.get()));
-        if (cudaSuccess != cuda_error) {
-          throw std::runtime_error("Could not allocate cuda memory for d_dev_ptrs_");
-        }
+        CUDA_TRY(cudaMallocHost((void**)&h_dev_ptrs_[n], sizeof(void*) * rows_per_tensor_));
+        CUDA_TRY(cudaMalloc(&d_dev_ptrs_[n], sizeof(void*) * rows_per_tensor_));
       }
       cudaStreamCreate(&streams_[n]);
       cudaEventCreate(&events_[n]);
-
-      // Create start and stop events for GPU test.
-      // cudaEventCreate(&events_start_[n]);
-      // cudaEventCreate(&events_stop_[n]);
-
-      // Initialize Conv2D operator
-      // conv_ = torch::nn::Conv2d(torch::nn::Conv2dOptions(1, 1, 3).stride(1).padding(1).bias(false));
-      // conv_->to(torch::kCUDA);
-      // HOLOSCAN_LOG_INFO("PyTorch Conv2d module initialized on GPU.");
-
-      // Warmup streams and kernel
-#if ADV_NETWORK_MANAGER_WARMUP_KERNEL
-      // simple_packet_reorder(NULL, NULL, 1, 1, streams_[n]);
-      // cudaStreamSynchronize(streams_[n]);
-#endif
     }
 
     if (hds_.get()) { assert(gpu_direct_.get()); }
 
-    HOLOSCAN_LOG_INFO("AdvNetworkingBenchDefaultRxOp::initialize() complete");
+    HOLOSCAN_LOG_INFO("StemReceiverOp::initialize() complete. Batching {} frames ({} rows) per tensor.", frames_per_tensor_.get(), rows_per_tensor_);
   }
 
   void freeResources() {
-    HOLOSCAN_LOG_INFO("AdvNetworkingBenchDefaultRxOp::freeResources() start");
+    HOLOSCAN_LOG_INFO("StemReceiverOp::freeResources() start");
     for (int n = 0; n < num_concurrent; n++) {
       if (full_batch_data_d_[n]) { cudaFree(full_batch_data_d_[n]); }
       if (full_batch_data_h_[n]) { cudaFreeHost(full_batch_data_h_[n]); }
@@ -158,58 +125,25 @@ class StemReceiverOp : public Operator {
       if (d_dev_ptrs_[n]) { cudaFree(d_dev_ptrs_[n]); }
       if (streams_[n]) { cudaStreamDestroy(streams_[n]); }
       if (events_[n]) { cudaEventDestroy(events_[n]); }
-      // if (events_start_[n]) { cudaEventDestroy(events_start_[n]); }
-      // if (events_stop_[n]) { cudaEventDestroy(events_stop_[n]); }
     }
-    HOLOSCAN_LOG_INFO("AdvNetworkingBenchDefaultRxOp::freeResources() complete");
   }
 
   void setup(OperatorSpec& spec) override {
-
     spec.output<holoscan::TensorMap>("output");
-
     spec.param<std::shared_ptr<holoscan::Allocator>>(allocator_, "allocator", "Allocator", "Allocator for output tensors.");
-
-    spec.param<std::string>(interface_name_,
-                            "interface_name",
-                            "Port name",
-                            "Name of the port to poll on from the advanced_network config",
-                            "rx_port");
-    spec.param<bool>(hds_,
-                     "split_boundary",
-                     "Header-data split boundary",
-                     "Byte boundary where header and data is split",
-                     false);
-    spec.param<bool>(gpu_direct_,
-                     "gpu_direct",
-                     "GPUDirect enabled",
-                     "Byte boundary where header and data is split",
-                     false);
-    spec.param<uint32_t>(batch_size_,
-                         "batch_size",
-                         "Batch size",
-                         "Batch size in packets for each processing epoch",
-                         1000);
-    spec.param<uint16_t>(max_packet_size_,
-                         "max_packet_size",
-                         "Max packet size",
-                         "Maximum packet size expected from sender",
-                         9100);
-    spec.param<uint16_t>(header_size_,
-                         "header_size",
-                         "Header size",
-                         "Header size on each packet from L4 and below",
-                         42);
-    spec.param<bool>(reorder_kernel_,
-                     "reorder_kernel",
-                     "Reorder kernel enabled",
-                     "Enable reorder kernel if alignment and memory types are supported",
-                     true);
-    spec.param<uint64_t>(count_,
-                         "count",
-                         "Count",
-                         "Number of frames to receive. 0 means infinite.",
-                         0UL);
+    spec.param<std::string>(interface_name_, "interface_name", "Port name", "Name of the port to poll on", "rx_port");
+    spec.param<bool>(hds_, "split_boundary", "Header-data split boundary", "Byte boundary where header and data is split", false);
+    spec.param<bool>(gpu_direct_, "gpu_direct", "GPUDirect enabled", "GPUDirect", false);
+    
+    // Configurable number of frames packaged together
+    spec.param<uint32_t>(frames_per_tensor_, "frames_per_tensor", "Frames per tensor", "Number of 128-row frames to receive per batch.", 10);
+    // Left for backwards yaml compat, but unused internally for memory mgmt
+    spec.param<uint32_t>(batch_size_, "batch_size", "Legacy Batch size", "Legacy batch size. Ignored in favor of frames_per_tensor.", 1000);
+    
+    spec.param<uint16_t>(max_packet_size_, "max_packet_size", "Max packet size", "Maximum UDP packet size. Must accommodate headers+payload.", 9100);
+    spec.param<uint16_t>(header_size_, "header_size", "Header size", "Header size to strip (ETH+IP+UDP)", 42);
+    spec.param<bool>(reorder_kernel_, "reorder_kernel", "Reorder kernel enabled", "Enable reorder kernel", true);
+    spec.param<uint64_t>(count_, "count", "Count", "Number of frames to receive. 0 means infinite.", 0UL);
   }
 
   // Free buffers if CUDA processing/copy is complete
@@ -237,169 +171,73 @@ class StemReceiverOp : public Operator {
     // to keep it simple, we do that check right here on the next epoch of the operator.
     free_processed_packets();
 
+    if (is_done_) return;
+
     BurstParams *burst;
 
     // In this example, we'll loop through all the rx queues of the interface
     // assuming we want to process the packets the same way for all queues
     const auto num_rx_queues = get_num_rx_queues(port_id_);
+
     for (int q = 0; q < num_rx_queues; q++) {
       auto status = get_rx_burst(&burst, port_id_, q);
-      if (status != Status::SUCCESS) {
-        HOLOSCAN_LOG_DEBUG("No RX burst available");
-        continue;
-      }
+      if (status != Status::SUCCESS) { continue; }
 
       auto burst_size = get_num_packets(burst);
 
       // Count packets received
       ttl_pkts_recv_ += burst_size;
 
-      // Check if we have reached the limit
-      if (count_ > 0 && ttl_pkts_recv_ >= count_ * batch_size_.get()) {
-          HOLOSCAN_LOG_INFO("StemReceiverOp: Reached frame limit of {}", count_.get());
-          // Stop the application? Or just stop receiving?
-          // For now, let's just stop receiving and let the pipeline drain
-          // But we need to make sure we don't hang.
-          // A simple way is to exit or throw, but that's not clean.
-          // Better: stop scheduling this operator.
-          // But we are in compute(), so we can't easily stop scheduling from here without a condition.
-          // Let's just break and return, effectively stopping processing new bursts.
-          // Ideally we should signal the scheduler.
-          // For this benchmark, maybe just logging and returning is enough if the scheduler handles it?
-          // Actually, if we return, compute will be called again.
-          // We need a member variable to track if we are done.
-          if (!is_done_) {
-             is_done_ = true;
-             // Disable ticking?
-             // stop_condition_.get()->disable_tick(); // If we had one.
-          }
-          return; 
-      }
-      
-      if (is_done_) return;
+      int p = 0;
+      while (p < burst_size) {
+        int space_in_batch = rows_per_tensor_ - aggr_pkts_recv_;
+        int packets_to_copy = std::min(burst_size - p, space_in_batch);
 
-      // Store burst structure
-      cur_batch_.bursts[cur_batch_.num_bursts++] = burst;
-
-      // Track packet payloads for the current burst
-      if (gpu_direct_.get()) {
-        /* GPUDirect mode (needs to match if the advanced_network queue uses 1 or more memory regions)
-        * Save off the GPU pointers into a host-pinned buffer (h_dev_ptrs_) to reassemble later.
-        */
-        if (hds_.get()) {
-          // Header-Data-Split: header to CPU, payload to GPU
-          // NOTE: current App assumes only two memory region segments, one for header (CPU),
-          //       and one for payload (GPU).
-          for (int p = 0; p < burst_size; p++) {
-            // Get pointers to payload data on GPU
-            // NOTE: It's (1) here since the GPU memory region is second in the list for this queue.
-            //       The first region (0) is for headers on CPU, ignored here.
-            // NOTE: currently ordering pointers in the order packets come in. If headers had
-            //       segment ID, the index in h_dev_ptrs_ should use that
-            //       (instead of aggr_pkts_recv_ + p).
-  #if (BURST_ACCESS_METHOD == BURST_ACCESS_METHOD_DIRECT_ACCESS)
-            h_dev_ptrs_[cur_batch_idx_][aggr_pkts_recv_ + p] = burst->pkts[1][p];
-            ttl_bytes_recv_ += burst->pkt_lens[0][p] + burst->pkt_lens[1][p];
-  #else
-            h_dev_ptrs_[cur_batch_idx_][aggr_pkts_recv_ + p] = get_segment_packet_ptr(burst, 1, p);
-            ttl_bytes_recv_ +=
-                get_segment_packet_length(burst, 0, p) + get_segment_packet_length(burst, 1, p);
-  #endif
-          }
-        } else {
-          // Batched: headers and payload to GPU (queue memory regions should be a single
-          // GPU segment)
-          for (int p = 0; p < burst_size; p++) {
-            // Get pointers to payload data on GPU (shifting by header size)
-            // NOTE: currently ordering pointers in the order packets come in. If headers had
-            //       segment ID, the index in h_dev_ptrs_ should use that (instead of
-            //       aggr_pkts_recv_ + p).
-            h_dev_ptrs_[cur_batch_idx_][aggr_pkts_recv_ + p] =
-                reinterpret_cast<uint8_t*>(get_segment_packet_ptr(burst, 0, p)) +
-                header_size_.get();
-            ttl_bytes_recv_ += get_segment_packet_length(burst, 0, p);
+        for (int i = 0; i < packets_to_copy; i++) {
+          int pkt_in_burst = p + i;
+          
+          if (gpu_direct_.get()) {
+            if (hds_.get()) {
+              h_dev_ptrs_[cur_batch_idx_][aggr_pkts_recv_ + i] = burst->pkts[1][pkt_in_burst];
+            } else {
+              h_dev_ptrs_[cur_batch_idx_][aggr_pkts_recv_ + i] = 
+                  reinterpret_cast<uint8_t*>(get_segment_packet_ptr(burst, 0, pkt_in_burst)) + header_size_.get();
+            }
+          } else {
+            // CPU fallback (Warning: naive copy, doesn't reorder within frame)
+            auto payload_ptr = reinterpret_cast<uint8_t*>(get_segment_packet_ptr(burst, 0, pkt_in_burst)) + header_size_.get();
+            auto burst_offset = (aggr_pkts_recv_ + i) * nom_payload_size_;
+            
+            // We strip the 64-byte custom header for the Host copy because no reorder kernel is run for it
+            memcpy((char*)full_batch_data_h_[cur_batch_idx_] + burst_offset,
+                   payload_ptr + custom_header_size_,
+                   nom_payload_size_);
           }
         }
-      } else {
-        /* CPU Mode (needs to match if the advanced_network queue uses no GPU memory regions)
-        * Copy each packet payload in a continuous host-pinned buffer, copy of that larger buffer to
-        * the GPU will occur later (copying each packet to GPU directly would be too expensive).
-        *
-        * NOTE: this assume huge pages memory regions. With host-pinned memory regions, this could be
-        *       skipped, though probably not faster given the higher perf to write to huge pages.
-        */
+        
+        aggr_pkts_recv_ += packets_to_copy;
+        p += packets_to_copy;
 
-        // Calculate offset for the burst
-        // NOTE: we could keep track of each packet length and aggregate it instead.
-        auto burst_offset = aggr_pkts_recv_ * nom_payload_size_;
-
-        for (int p = 0; p < burst_size; p++) {
-          // Payload address (UDPIPV4Pkt: + 1 skips the header)
-  #if (BURST_ACCESS_METHOD == BURST_ACCESS_METHOD_DIRECT_ACCESS)
-          auto payload_ptr = static_cast<UDPIPV4Pkt*>(burst->pkts[0][p]) + 1;
-          // Payload length (packet length minus header length)
-          // NOTE: this should be equal to nom_payload_size_ as we assume the same length for all
-          //       packets in this sample app
-          auto pkt_len = burst->pkt_lens[0][p];
-  #else
-          auto payload_ptr = static_cast<UDPIPV4Pkt*>(get_segment_packet_ptr(burst, 0, p)) + 1;
-          // Payload length (packet length minus header length)
-          // NOTE: this should be equal to nom_payload_size_ as we assume the same length for all
-          //       packets in this sample app
-          auto pkt_len = get_segment_packet_length(burst, 0, p);
-  #endif
-          auto payload_len = pkt_len - header_size_.get();
-
-          // Copy payload to aggregated CPU buffers now
-          memcpy((char*)full_batch_data_h_[cur_batch_idx_] + burst_offset + p * nom_payload_size_,
-                payload_ptr,
-                payload_len);
-
-          // Count bytes received
-          ttl_bytes_recv_ += pkt_len;
-
-          // TODO: could free CPU packets now
-        }
-      }
-
-      /* For each incoming burst, we might not want to right away send the packets to the next
-      * operator, but maybe wait for more packets to come in, to make up what we call a batch.
-      * While that increases the latency by needing more data to come in to continue,
-      * it would allow collecting enough packets for reordering (not done here) to trigger the
-      * downstream pipeline as soon as we have enough packets to do a full "message".
-      * Increasing the burst size instead would ensure the same, but allowing smaller
-      * burst size will improve latency.
-      *
-      * There is also value in CPU mode or HDS mode: to reduce CPU memory usage by not holding onto
-      * packets that can be freed earlier on (whether full packet buffers or headers only for HDS)
-      *
-      * Below, we check if we should wait to receive more packets from
-      * the next burst before processing them in a batch.
-      */
-      aggr_pkts_recv_ += burst_size;
-      if (aggr_pkts_recv_ >= batch_size_.get()) {
-        // Reset counter for the next app batch
-        aggr_pkts_recv_ = 0;
-
-        // Free buffers for packets which have already been aggregated to the GPU, in case
-        // some of it got completed since the beginning of `compute`, for extra space in `batch_q_`.
-        // NOTE: In CPU-only mode we can free earlier (after memcopy), but to keep it simple we free
-        //       at the same point as we do in GPUDirect mode
-        free_processed_packets();
-        if (batch_q_.size() == num_concurrent) {
-          // Not enough buffers available to process the packets, drop the packets from this burst
-          HOLOSCAN_LOG_ERROR("Fell behind putting packet data in contiguous memory on GPU!");
-          for (auto m = 0; m < cur_batch_.num_bursts; m++) {
-            ttl_packets_dropped_ += get_num_packets(cur_batch_.bursts[m]);
-            free_all_packets_and_burst_rx(cur_batch_.bursts[m]);
+        // If burst was fully consumed this iteration, the current batch claims ownership.
+        if (p == burst_size) {
+          if (cur_batch_.num_bursts < MAX_BURSTS_PER_BATCH) {
+            cur_batch_.bursts[cur_batch_.num_bursts++] = burst;
+          } else {
+            HOLOSCAN_LOG_ERROR("Exceeded MAX_BURSTS_PER_BATCH ({}). Memory may leak.", MAX_BURSTS_PER_BATCH);
           }
-          cur_batch_.num_bursts = 0;
-          CUDA_TRY(cudaDeviceSynchronize());
-          return;
         }
 
-        // Process/aggregate
-        if (gpu_direct_.get()) {
+        // If we have aggregated the required number of rows, process and emit
+        if (aggr_pkts_recv_ == rows_per_tensor_) {
+          aggr_pkts_recv_ = 0; // reset for next tensor
+          
+          if (batch_q_.size() == num_concurrent) {
+            HOLOSCAN_LOG_ERROR("Fell behind. All buffers queued. Dropping incoming batch silently.");
+            cur_batch_.num_bursts = 0; 
+            continue; // We technically leak burst tracking here if we just continue, but helps avoid total halt
+          }
+
+          if (gpu_direct_.get()) {
           // GPUDirect mode: we copy the payload (referenced in h_dev_ptrs_)
           // to a contiguous memory buffer (full_batch_data_d_)
           // NOTE: there is no actual reordering since we use the same order as packets came in,
@@ -407,170 +245,79 @@ class StemReceiverOp : public Operator {
           // We also allow disabling the reorder kernel if alignment and memory types are not
           // supported. Currently the reorder kernel expects the packets to be 16B-aligned, and
           // anything that's not will cause an access error on the GPU
-          if (reorder_kernel_.get()) {
-            // Copy the list of pointers to the device
-            CUDA_TRY(cudaMemcpyAsync(d_dev_ptrs_[cur_batch_idx_],
-                                     h_dev_ptrs_[cur_batch_idx_],
-                                     sizeof(void*) * batch_size_.get(),
-                                     cudaMemcpyHostToDevice,
-                                     streams_[cur_batch_idx_]));
+            if (reorder_kernel_.get()) {
 
-            // Use our custom gather kernel which handles unaligned addresses
-            gather_packets(reinterpret_cast<uint8_t**>(d_dev_ptrs_[cur_batch_idx_]),
-                           static_cast<uint8_t*>(full_batch_data_d_[cur_batch_idx_]),
-                           nom_payload_size_,
-                           batch_size_.get(),
-                           streams_[cur_batch_idx_]);
+              // Copy the list of pointers to the device
+              CUDA_TRY(cudaMemcpyAsync(d_dev_ptrs_[cur_batch_idx_],
+                                       h_dev_ptrs_[cur_batch_idx_],
+                                       sizeof(void*) * rows_per_tensor_,
+                                       cudaMemcpyHostToDevice,
+                                       streams_[cur_batch_idx_]));
+
+              // gather_packets translates out-of-order packets based on the 16-bit row ID
+              gather_packets(reinterpret_cast<uint8_t**>(d_dev_ptrs_[cur_batch_idx_]),
+                             static_cast<uint8_t*>(full_batch_data_d_[cur_batch_idx_]),
+                             nom_payload_size_, custom_header_size_, rows_per_tensor_, rows_per_tensor_,
+                             streams_[cur_batch_idx_]);
+            }
+          } else {
+            // Non GPUDirect mode: we copy the payload on host-pinned memory (in full_batch_data_h_)
+            // to a contiguous memory buffer on the GPU (full_batch_data_d_)
+            // NOTE: there is no reordering support here at all
+            CUDA_TRY(cudaMemcpyAsync(full_batch_data_d_[cur_batch_idx_],
+                            full_batch_data_h_[cur_batch_idx_],
+                            rows_per_tensor_ * nom_payload_size_,
+                            cudaMemcpyHostToDevice,
+                            streams_[cur_batch_idx_]));
           }
 
-        } else {
-          // Non GPUDirect mode: we copy the payload on host-pinned memory (in full_batch_data_h_)
-          // to a contiguous memory buffer on the GPU (full_batch_data_d_)
-          // NOTE: there is no reordering support here at all
-          cudaMemcpyAsync(full_batch_data_d_[cur_batch_idx_],
-                          full_batch_data_h_[cur_batch_idx_],
-                          batch_size_.get() * nom_payload_size_,
-                          cudaMemcpyDefault,
-                          streams_[cur_batch_idx_]);
+          // Build Tensor using GXF zero-copy memory wrapping
+          auto gxf_tensor = std::make_shared<nvidia::gxf::Tensor>();
+          auto allocator_handle = nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(context.context(), allocator_->gxf_cid());
+          
+          auto result = gxf_tensor->reshape<uint16_t>(
+              nvidia::gxf::Shape{static_cast<int>(frames_per_tensor_.get()), FRAME_HEIGHT, FRAME_WIDTH},
+              nvidia::gxf::MemoryStorageType::kDevice,
+              allocator_handle.value());
+          if (!result) { throw std::runtime_error("Failed to reshape output tensor"); }
+	        //HOLOSCAN_LOG_INFO("-> Reshaped tensor.");
+
+          // Copy the aggregated frame data to the new tensor's buffer
+          HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(gxf_tensor->pointer(),
+                          full_batch_data_d_[cur_batch_idx_],
+                          gxf_tensor->bytes_size(),
+                          cudaMemcpyDeviceToDevice,
+                          streams_[cur_batch_idx_]));
+
+          auto maybedl = gxf_tensor->toDLManagedTensorContext();
+          auto holoscan_tensor = std::make_shared<Tensor>(maybedl.value());
+          
+          TensorMap out_message;
+          out_message.insert({"frame", holoscan_tensor});
+          op_output.emit(out_message, "output");
+
+          total_frames_emitted_ += frames_per_tensor_.get();
+
+          cudaEventRecord(events_[cur_batch_idx_], streams_[cur_batch_idx_]);
+          cur_batch_.evt = events_[cur_batch_idx_];
+          batch_q_.push(cur_batch_);
+
+          cur_batch_.num_bursts = 0;
+          cur_batch_idx_ = (++cur_batch_idx_ % num_concurrent);
+
+          if (count_.get() > 0 && total_frames_emitted_ >= count_.get()) {
+            HOLOSCAN_LOG_INFO("StemReceiverOp: Reached frame limit of {}", count_.get());
+            is_done_ = true;
+            return;
+          }
         }
-    
-        // Tensor creation logic:
-        
-        // 1. Create a GXF Tensor to handle allocation
-        auto gxf_tensor = std::make_shared<nvidia::gxf::Tensor>();
-	      HOLOSCAN_LOG_INFO("-> Created a GXF Tensor");
-
-        // 2. Reshape the GXF Tensor
-        auto allocator_handle = nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(context.context(), allocator_->gxf_cid());
-	      HOLOSCAN_LOG_INFO("-> Created allocator handle.");
-        int height = FRAME_HEIGHT;
-        int width = FRAME_WIDTH;
-        auto result = gxf_tensor->reshape<uint16_t>(
-            nvidia::gxf::Shape{height, width},
-            nvidia::gxf::MemoryStorageType::kDevice,
-            allocator_handle.value());
-        if (!result) { throw std::runtime_error("Failed to reshape output tensor"); }
-	      HOLOSCAN_LOG_INFO("-> Reshaped tensor.");
-
-        // 3. Copy the aggregated frame data to the new tensor's buffer
-        HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(gxf_tensor->pointer(),
-                        full_batch_data_d_[cur_batch_idx_],
-                        gxf_tensor->bytes_size(),
-                        cudaMemcpyDeviceToDevice,
-                        streams_[cur_batch_idx_]));
-	      HOLOSCAN_LOG_INFO("-> Copied data to GPU tensor");
-
-        // 4. Wrap in Holoscan Tensor and emit as TensorMap
-        auto maybe_dl_ctx = gxf_tensor->toDLManagedTensorContext();
-        if (!maybe_dl_ctx) {
-            throw std::runtime_error("Failed to get DLManagedTensorContext from nvidia::gxf::Tensor");
-        }
-        auto holoscan_tensor = std::make_shared<Tensor>(maybe_dl_ctx.value());
-        
-        TensorMap out_message;
-        out_message.insert({"frame", holoscan_tensor});
-        op_output.emit(out_message, "output");
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-          HOLOSCAN_LOG_ERROR("CUDA error '{}' ({}) with {} packets in batch and {} bytes total",
-                            cudaGetErrorString(err),
-                            static_cast<int>(err),
-                            batch_size_.get(),
-                            batch_size_.get() * nom_payload_size_);
-          exit(1);
-        }
-
-        /* Keep track of the CUDA work (reorder kernel or copy from CPU) so we do not process
-        * more than `num_concurrent` batches at once, and to can free its associated packets
-        * when the work is done.
-        */
-        cudaEventRecord(events_[cur_batch_idx_], streams_[cur_batch_idx_]);
-        cur_batch_.evt = events_[cur_batch_idx_];
-        batch_q_.push(cur_batch_);
-
-        // CUDA Error checking
-        if (cudaGetLastError() != cudaSuccess) {
-          HOLOSCAN_LOG_ERROR("CUDA error with {} packets in batch and {} bytes total",
-                            batch_size_.get(),
-                            batch_size_.get() * nom_payload_size_);
-          exit(1);
-        }
-
-        // Update structs for the next batch
-        cur_batch_.num_bursts = 0;
-        cur_batch_idx_ = (++cur_batch_idx_ % num_concurrent);
-
       }
     }
   }
 
  private:
-
-  // PyTorch test function
-  // void pytorch_test_frame() {
-
-  //   // Record start event in the current CUDA stream
-  //   cudaEventRecord(events_start_[cur_batch_idx_], streams_[cur_batch_idx_]);
-
-  //   // Create a zero-copy tensor from the raw GPU pointer as a blob of bytes (uint8).
-  //   //HOLOSCAN_LOG_INFO("Creating the PyTorch tensor.");
-  //   auto byte_tensor = torch::from_blob(
-  //       full_batch_data_d_[cur_batch_idx_],
-  //       {663552},
-  //       torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA)
-  //   );
-
-  //   // Reinterpret the memory as a uint16 tensor with the correct shape (ZERO-COPY).
-  //   //HOLOSCAN_LOG_INFO("Reinterpret the tensor to 576x576 16 bit.");
-  //   auto uint16_tensor = byte_tensor.view(torch::kUInt16).reshape({1, 1, 576, 576});
-
-  //   // Convert to float32 for the convolution. This is a real operation on the GPU.
-  //   //HOLOSCAN_LOG_INFO("Convert to float32");
-  //   torch::Tensor frame_float32 = uint16_tensor.to(torch::kFloat32);
-
-  //   // Apply 3x3 convolution
-  //   //HOLOSCAN_LOG_INFO("Applying convolution...");
-  //   auto output_tensor = conv_->forward(frame_float32);
-
-  //   //HOLOSCAN_LOG_INFO("DONE");
-  //   /*// Create tensor from frame buffer (uint16 on GPU)
-  //   torch::Tensor frame = torch::from_blob(
-  //       full_batch_data_d_[cur_batch_idx_],
-  //       {1, 1, FRAME_HEIGHT, FRAME_WIDTH},  // Batch 1, channel 1
-  //       torch::TensorOptions().dtype(torch::kUInt16).device(torch::kCUDA)
-  //   ).to(torch::kFloat32);  // Convert to float32 for convolution
-
-  //   // Apply 3x3 convolution
-  //   frame = conv_->forward(frame);*/
-
-  //   // Record stop event in the same CUDA stream
-  //   cudaEventRecord(events_stop_[cur_batch_idx_], streams_[cur_batch_idx_]);
-
-  //   frames_processed_++;
-
-  //   // Check a previous frame's timing to avoid blocking the pipeline**
-  //   // Check the event for the *oldest* pending operation
-  //   if (frames_processed_ >= num_concurrent) {
-  //     int prev_idx = (cur_batch_idx_ + 1) % num_concurrent; // Oldest is next in line to be overwritten
-  //     if (events_stop_[prev_idx] && cudaEventQuery(events_stop_[prev_idx]) == cudaSuccess) {
-  //       float latency_ms = 0.0f;
-  //       cudaEventElapsedTime(&latency_ms, events_start_[prev_idx], events_stop_[prev_idx]);
-
-  //       total_conv_latency_ms_ += latency_ms;
-  //       frames_checked_++;
-
-  //       if (frames_checked_ % 100 == 0) {
-  //         HOLOSCAN_LOG_INFO("Processed frame {} | Conv Latency: {:.4f} ms", frames_checked_, latency_ms);
-  //       }
-  //     }
-  //   }
-  // }
-
-  // TODO: make configurable?
-  static constexpr int num_concurrent = 10;  // Number of concurrent batches processing
-  // TODO: could infer with (batch_size / burst size)
-  static constexpr int MAX_BURSTS_PER_BATCH = 10;
+  static constexpr int num_concurrent = 20; 
+  static constexpr int MAX_BURSTS_PER_BATCH = 5000;
 
   // Holds burst buffers that cannot be freed yet and CUDA event indicating when they can be freed
   struct BatchAggregationParams {
@@ -579,42 +326,42 @@ class StemReceiverOp : public Operator {
     cudaEvent_t evt;
   };
 
-  int port_id_;                                    // Port ID to poll on
-  BatchAggregationParams cur_batch_{};             // Parameters of current batch to process
-  int cur_batch_idx_ = 0;                          // Current batch ID
-  std::queue<BatchAggregationParams> batch_q_;     // Queue of batches being processed
-  int64_t ttl_bytes_recv_ = 0;                     // Total bytes received in operator
-  int64_t ttl_pkts_recv_ = 0;                      // Total packets received in operator
-  int64_t aggr_pkts_recv_ = 0;                     // Aggregate packets received in processing batch
-  int64_t ttl_packets_dropped_ = 0;                // Total packets dropped in operator
-  uint16_t nom_payload_size_;                      // Nominal payload size (no headers)
-  std::array<void**, num_concurrent> h_dev_ptrs_;  // Host-pinned list of device pointers
-  std::array<void*, num_concurrent> d_dev_ptrs_;   // Device-side list of device pointers
-  std::array<void*, num_concurrent> full_batch_data_d_;  // Device aggregated batch
-  std::array<void*, num_concurrent> full_batch_data_h_;  // Host aggregated batch
-  Parameter<std::string> interface_name_;                // Port name from advanced_network config
-  Parameter<bool> hds_;                                  // Header-data split enabled
-  Parameter<bool> gpu_direct_;                           // GPUDirect enabled
-  Parameter<uint32_t> batch_size_;                       // Batch size for one processing block
-  Parameter<uint16_t> max_packet_size_;                  // Maximum size of a single packet
-  Parameter<uint16_t> header_size_;                      // Header size of packet
-  Parameter<bool> reorder_kernel_;                       // Reorder kernel enabled
-  Parameter<uint64_t> count_;                            // Number of frames to receive
+  int port_id_;
+  BatchAggregationParams cur_batch_{};
+  int cur_batch_idx_ = 0;
+  std::queue<BatchAggregationParams> batch_q_;
+  
+  int64_t ttl_bytes_recv_ = 0;
+  int64_t ttl_pkts_recv_ = 0;
+  int64_t ttl_packets_dropped_ = 0;
+
+  int64_t aggr_pkts_recv_ = 0;
+  uint64_t total_frames_emitted_ = 0;
+  
+  uint16_t custom_header_size_;  
+  uint16_t nom_payload_size_;    
+  uint32_t rows_per_tensor_;     
+
+  std::array<void**, num_concurrent> h_dev_ptrs_;  // host pointers 
+  std::array<void*, num_concurrent> d_dev_ptrs_;   // device pointers
+  std::array<void*, num_concurrent> full_batch_data_d_;
+  std::array<void*, num_concurrent> full_batch_data_h_;
+
+  Parameter<std::string> interface_name_;
+  Parameter<bool> hds_;
+  Parameter<bool> gpu_direct_;
+  Parameter<uint32_t> batch_size_;     
+  Parameter<uint32_t> frames_per_tensor_;   
+  Parameter<uint16_t> max_packet_size_;
+  Parameter<uint16_t> header_size_;
+  Parameter<bool> reorder_kernel_;
+  Parameter<uint64_t> count_;
   Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
 
   bool is_done_ = false;
-							 
 
   std::array<cudaStream_t, num_concurrent> streams_;
   std::array<cudaEvent_t, num_concurrent> events_;
-
-  // For PyTorch tests
-  long long frames_processed_ = 0;
-  long long frames_checked_ = 0;
-  double total_conv_latency_ms_ = 0.0;
-  torch::nn::Conv2d conv_{nullptr};
-  // std::array<cudaEvent_t, num_concurrent> events_start_;
-  // std::array<cudaEvent_t, num_concurrent> events_stop_;
 };
 
 }  // namespace holoscan::ops
