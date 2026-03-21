@@ -191,7 +191,7 @@ class StemReceiverOp : public Operator {
       int p = 0;
       while (p < burst_size) {
         int space_in_batch = rows_per_tensor_ - aggr_pkts_recv_;
-        int packets_to_copy = std::min(burst_size - p, space_in_batch);
+        int packets_to_copy = std::min(static_cast<int>(burst_size - p), space_in_batch);
 
         for (int i = 0; i < packets_to_copy; i++) {
           int pkt_in_burst = p + i;

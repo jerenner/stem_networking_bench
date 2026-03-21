@@ -51,7 +51,8 @@ void HDF5WriterOp::compute(InputContext& op_input, OutputContext&, ExecutionCont
   int width = shape[width_idx];
 
   H5::DataType h5_type = H5::PredType::NATIVE_FLOAT;
-  if (tensor->element_type() == holoscan::ElementType::kUnsigned16) {
+  auto dtype = tensor->dtype();
+  if (dtype.code == kDLUInt && dtype.bits == 16) {
       h5_type = H5::PredType::NATIVE_UINT16;
   }
 
