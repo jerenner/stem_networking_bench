@@ -129,7 +129,8 @@ class StemReceiverOp : public Operator {
   }
 
   void setup(OperatorSpec& spec) override {
-    spec.output<holoscan::TensorMap>("output");
+    spec.output<holoscan::TensorMap>("output")
+        .connector(holoscan::IOSpec::ConnectorType::kDoubleBuffer, holoscan::Arg("capacity", 200UL));
     spec.param<std::shared_ptr<holoscan::Allocator>>(allocator_, "allocator", "Allocator", "Allocator for output tensors.");
     spec.param<std::string>(interface_name_, "interface_name", "Port name", "Name of the port to poll on", "rx_port");
     spec.param<bool>(hds_, "split_boundary", "Header-data split boundary", "Byte boundary where header and data is split", false);

@@ -8,8 +8,9 @@ namespace holoscan::ops {
 
 void PyTorchProcessorOp::setup(OperatorSpec& spec) {
   spec.input<holoscan::TensorMap>("input")
-	  .connector(holoscan::IOSpec::ConnectorType::kDoubleBuffer,holoscan::Arg("capacity", 100UL));
-  spec.output<holoscan::TensorMap>("output");
+	  .connector(holoscan::IOSpec::ConnectorType::kDoubleBuffer,holoscan::Arg("capacity", 200UL));
+  spec.output<holoscan::TensorMap>("output")
+      .connector(holoscan::IOSpec::ConnectorType::kDoubleBuffer,holoscan::Arg("capacity", 200UL));
 
   // Add an allocator parameter needed for creating the output tensor
   spec.param(allocator_, "allocator", "Allocator", "Allocator for output tensors.");
@@ -90,7 +91,10 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
   }
 
   // === TENSOR EMISSION LOGIC ===
+  // 1. Create a GXF Tensor for the output
   auto gxf_out_tensor = std::make_shared<nvidia::gxf::Tensor>();
+  
+  // 2. Reshape it (allocates memory)
   auto allocator_handle = nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(context.context(), allocator_->gxf_cid());
   nvidia::gxf::Shape out_gxf_shape;
 

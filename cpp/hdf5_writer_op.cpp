@@ -6,7 +6,8 @@
 namespace holoscan::ops {
 
 void HDF5WriterOp::setup(OperatorSpec& spec) {
-  spec.input<holoscan::TensorMap>("input");
+  spec.input<holoscan::TensorMap>("input")
+      .connector(holoscan::IOSpec::ConnectorType::kDoubleBuffer, holoscan::Arg("capacity", 200UL));
 
   spec.param(filepath_, "filepath", "File Path", "Path to the output HDF5 file.");
   spec.param(dataset_name_, "dataset_name", "Dataset Name", "Name of the dataset to write (e.g., '/processed_frames').");
