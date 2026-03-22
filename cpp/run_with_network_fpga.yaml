@@ -24,12 +24,12 @@ advanced_network:
     - name: "Data_RX_GPU_0"
       kind: "device"
       affinity: 0
-      num_bufs: 32768
+      num_bufs: 65536
       buf_size: 9228 
     - name: "Data_RX_GPU_1"
       kind: "device"
       affinity: 0
-      num_bufs: 32768
+      num_bufs: 65536
       buf_size: 9228
       
     interfaces:
@@ -41,7 +41,7 @@ advanced_network:
         - name: "rx_q_0"
           id: 0
           cpu_core: 9
-          batch_size: 740
+          batch_size: 750
           memory_regions:
             - "Data_RX_GPU_0"
         flows:
@@ -60,7 +60,7 @@ advanced_network:
         - name: "rx_q_1"
           id: 0
           cpu_core: 10
-          batch_size: 740
+          batch_size: 750
           memory_regions:
             - "Data_RX_GPU_1"
         flows:
@@ -74,23 +74,23 @@ advanced_network:
             
 receiver0:
   interface_name: "rx_port_0"
-  frames_per_tensor: 10
+  frames_per_tensor: 200
   max_packet_size: 9100
   header_size: 42
   gpu_direct: true
   split_boundary: false
   reorder_kernel: true
-  count: 1000 # Process some number of frames then stop
+  count: 100000 # Process some number of frames then stop
 
 receiver1:
   interface_name: "rx_port_1"
-  frames_per_tensor: 10
+  frames_per_tensor: 200
   max_packet_size: 9100
   header_size: 42
   gpu_direct: true
   split_boundary: false
   reorder_kernel: true
-  count: 1000 # Process some number of frames then stop
+  count: 100000 # Process some number of frames then stop
 
 processor:
   noop: true
