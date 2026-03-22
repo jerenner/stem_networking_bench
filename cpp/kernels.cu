@@ -91,6 +91,7 @@ void populate_packets_from_frame(uint8_t* frame_buf, uint16_t pkt_len, uint32_t 
 }
 
 __global__ void gather_packets_kernel(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t payload_len, uint16_t header_len, uint32_t num_pkts, uint32_t max_rows) {
+
   int pkt_idx = blockIdx.x;
   if (pkt_idx >= num_pkts) return;
 
@@ -105,18 +106,14 @@ __global__ void gather_packets_kernel(uint8_t** src_ptrs, uint8_t* dst_base, uin
   uint8_t* payload_src = src + header_len;
   uint8_t* dst = dst_base + target_row * payload_len;
 
-  // Optimized vectorized copy (7680 bytes is a multiple of 16)
-  if (payload_len % 16 == 0) {
-      uint4* src4 = (uint4*)payload_src;
-      uint4* dst4 = (uint4*)dst;
-      int unroll_len = payload_len / sizeof(uint4);
-      for (int i = threadIdx.x; i < unroll_len; i += blockDim.x) {
-        dst4[i] = src4[i];
-      }
-  } else {
-      for (int i = threadIdx.x; i < payload_len; i += blockDim.x) {
-        dst[i] = payload_src[i];
-      }
+  // Since Eth+IP+UDP header is 42 bytes, the starting addr is usually only 2-byte aligned.
+  // Using uint4 (16-byte) or uint32_t (4-byte) causes a CUDA Misaligned Address exception.
+  // uint16_t is safe.
+  uint16_t* src16 = (uint16_t*)payload_src;
+  uint16_t* dst16 = (uint16_t*)dst;
+  int unroll_len = payload_len / sizeof(uint16_t);
+  for (int i = threadIdx.x; i < unroll_len; i += blockDim.x) {
+    dst16[i] = src16[i];
   }
 }
 
