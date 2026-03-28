@@ -313,7 +313,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN if [ "$(uname -m)" = "aarch64" ]; then \
         if ! python3 -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then \
             echo "Building PyTorch with CUDA from source..." && \
-            apt-get update && apt-get install -y --no-install-recommends libopenblas-dev cuda-nvml-dev-12-6 && \
+            apt-get update && apt-get install -y --no-install-recommends libopenblas-dev cuda-nvml-dev-12-6 cuda-profiler-api-12-6 cuda-nvtx-12-6 cuda-cupti-dev-12-6 && \
             python3 -m pip install --break-system-packages --no-cache-dir pyyaml typing_extensions sympy ninja setuptools pybind11 && \
             git clone --recursive --branch v2.5.1 https://github.com/pytorch/pytorch.git /tmp/pytorch && \
             cd /tmp/pytorch && \
