@@ -24,12 +24,12 @@ advanced_network:
     - name: "Data_RX_GPU_0"
       kind: "device"
       affinity: 0
-      num_bufs: 1048576
+      num_bufs: 262144
       buf_size: 9228 
     - name: "Data_RX_GPU_1"
       kind: "device"
       affinity: 0
-      num_bufs: 1048576
+      num_bufs: 262144
       buf_size: 9228
       
     interfaces:

@@ -312,10 +312,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN if [ "$(uname -m)" = "aarch64" ]; then \
         if ! python3 -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then \
-            # Use the NVIDIA PyPi index which contains aarch64 + CUDA wheels for Python 3.12
-            python3 -m pip install --break-system-packages --no-cache-dir \
-                --extra-index-url https://pypi.nvidia.com \
-                torch torchvision; \
+            echo "Building PyTorch with CUDA from source..." && \
+            apt-get update && apt-get install -y --no-install-recommends libopenblas-dev && \
+            python3 -m pip install --break-system-packages --no-cache-dir pyyaml typing_extensions sympy cmake ninja setuptools pybind11 && \
+            git clone --recursive --branch v2.5.1 https://github.com/pytorch/pytorch.git /tmp/pytorch && \
+            cd /tmp/pytorch && \
+            python3 -m pip install --break-system-packages -r requirements.txt && \
+            export USE_CUDA=1 && \
+            export USE_CUDNN=1 && \
+            export USE_DISTRIBUTED=0 && \
+            export USE_NCCL=0 && \
+            export TORCH_CUDA_ARCH_LIST="8.7" && \
+            python3 -m pip install --break-system-packages --no-build-isolation -v -e . && \
+            cmake --install build --prefix /usr/local/libtorch && \
+            cd / && rm -rf /tmp/pytorch ; \
         fi \
     else \
         # (Your existing x86 logic)
