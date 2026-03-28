@@ -8,9 +8,9 @@ namespace holoscan::ops {
 
 void PyTorchProcessorOp::setup(OperatorSpec& spec) {
   spec.input<holoscan::TensorMap>("input")
-	  .connector(holoscan::IOSpec::ConnectorType::kDoubleBuffer,holoscan::Arg("capacity", 200UL));
+	  .connector(holoscan::IOSpec::ConnectorType::kDoubleBuffer,holoscan::Arg("capacity", 4UL));
   spec.output<holoscan::TensorMap>("output")
-      .connector(holoscan::IOSpec::ConnectorType::kDoubleBuffer,holoscan::Arg("capacity", 200UL));
+      .connector(holoscan::IOSpec::ConnectorType::kDoubleBuffer,holoscan::Arg("capacity", 4UL));
 
   // Add an allocator parameter needed for creating the output tensor
   spec.param(allocator_, "allocator", "Allocator", "Allocator for output tensors.");

@@ -24,12 +24,12 @@ advanced_network:
     - name: "Data_RX_GPU_0"
       kind: "device"
       affinity: 0
-      num_bufs: 65536
+      num_bufs: 1048576
       buf_size: 9228 
     - name: "Data_RX_GPU_1"
       kind: "device"
       affinity: 0
-      num_bufs: 65536
+      num_bufs: 1048576
       buf_size: 9228
       
     interfaces:
@@ -41,7 +41,7 @@ advanced_network:
         - name: "rx_q_0"
           id: 0
           cpu_core: 9
-          batch_size: 750
+          batch_size: 16384
           memory_regions:
             - "Data_RX_GPU_0"
         flows:
@@ -60,7 +60,7 @@ advanced_network:
         - name: "rx_q_1"
           id: 0
           cpu_core: 10
-          batch_size: 750
+          batch_size: 16384
           memory_regions:
             - "Data_RX_GPU_1"
         flows:
@@ -93,7 +93,7 @@ receiver1:
   count: 100000 # Process some number of frames then stop
 
 processor:
-  noop: false
+  noop: true
   # Add any parameters for your processor op here
 
 writer:
