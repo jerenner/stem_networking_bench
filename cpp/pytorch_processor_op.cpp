@@ -70,17 +70,10 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
 
       torch::Tensor pt_tensor = torch::from_blob(gpu_data_ptr, pt_sizes, options);
       
-      torch::Tensor reshaped_tensor;
-      if (shape.size() == 3) {
-          // Assume [Batch, Height, Width], reshape to [Batch, 1, Height, Width]
-          reshaped_tensor = pt_tensor.reshape({(long)shape[0], 1, (long)shape[1], (long)shape[2]});
-      } else {
-          reshaped_tensor = pt_tensor;
-      }
-      
-      torch::Tensor frame_float32 = reshaped_tensor.to(torch::kFloat32);
-
-      output_tensor = conv_->forward(frame_float32);
+      // We expect [128, 1024, 3840].
+      // Sum all frames into a single 1024-row frame: [Batch, H, W] -> [H, W]
+      // We convert to float32 first to prevent uint16_t overflow during summation.
+      output_tensor = pt_tensor.to(torch::kFloat32).sum(0, /*keepdim=*/false);
       out_tensor_data_ptr = output_tensor.data_ptr();
       is_float = true;
   } else {
@@ -99,11 +92,21 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
   nvidia::gxf::Shape out_gxf_shape;
 
   if (is_float) {
-      auto out_shape = output_tensor.sizes(); // shape is [N, C, H, W]
-      out_gxf_shape = nvidia::gxf::Shape{static_cast<int32_t>(out_shape[0]), 
-                                         static_cast<int32_t>(out_shape[1]), 
-                                         static_cast<int32_t>(out_shape[2]), 
-                                         static_cast<int32_t>(out_shape[3])};
+      auto out_shape = output_tensor.sizes(); 
+      if (out_shape.size() == 2) {
+          out_gxf_shape = nvidia::gxf::Shape{static_cast<int32_t>(out_shape[0]),
+                                             static_cast<int32_t>(out_shape[1])};
+      } else if (out_shape.size() == 3) {
+          out_gxf_shape = nvidia::gxf::Shape{static_cast<int32_t>(out_shape[0]), 
+                                             static_cast<int32_t>(out_shape[1]),
+                                             static_cast<int32_t>(out_shape[2])};
+      } else {
+          out_gxf_shape = nvidia::gxf::Shape{static_cast<int32_t>(out_shape[0]), 
+                                             static_cast<int32_t>(out_shape[1]), 
+                                             static_cast<int32_t>(out_shape[2]), 
+                                             static_cast<int32_t>(out_shape[3])};
+      }
+      
       auto result = gxf_out_tensor->reshape<float>(
           out_gxf_shape,
           nvidia::gxf::MemoryStorageType::kDevice,

@@ -38,18 +38,22 @@ void HDF5WriterOp::compute(InputContext& op_input, OutputContext&, ExecutionCont
   auto tensor = in_message.at("processed_frame");
 
   auto shape = tensor->shape();
-  int batch_idx = 0;
-  int height_idx = 1;
-  int width_idx = 2;
+  int batch_frames = 1;
+  int height = 0;
+  int width = 0;
   
-  if (shape.size() == 4) { // NCHW
-      height_idx = 2;
-      width_idx = 3;
+  if (shape.size() == 2) { // Reduced 2D [H, W] from PyTorch
+      height = shape[0];
+      width = shape[1];
+  } else if (shape.size() == 4) { // NCHW
+      batch_frames = shape[0];
+      height = shape[2];
+      width = shape[3];
+  } else { // default to 3 (Batch, H, W)
+      batch_frames = shape[0];
+      height = shape[1];
+      width = shape[2];
   }
-  
-  int batch_frames = shape[batch_idx];
-  int height = shape[height_idx];
-  int width = shape[width_idx];
 
   H5::DataType h5_type = H5::PredType::NATIVE_FLOAT;
   auto dtype = tensor->dtype();

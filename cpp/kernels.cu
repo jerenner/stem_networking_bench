@@ -90,21 +90,52 @@ void populate_packets_from_frame(uint8_t* frame_buf, uint16_t pkt_len, uint32_t 
   populate_packets_from_frame_kernel<<<num_pkts, 256, 0, stream>>>(frame_buf, pkt_len, num_pkts, offset);
 }
 
-__global__ void gather_packets_kernel(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t payload_len, uint16_t header_len, uint32_t num_pkts, uint32_t max_rows) {
+__global__ void gather_packets_kernel(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t payload_len, uint16_t header_len, uint32_t num_pkts, uint32_t max_rows, uint64_t base_absolute_row) {
 
   int pkt_idx = blockIdx.x;
   if (pkt_idx >= num_pkts) return;
 
   uint8_t* src = src_ptrs[pkt_idx];
   
-  // Extract row number from bytes 4 and 5 of the custom header (little-endian)
+  // Extract 16-bit row number from custom header (which wraps every 16384 rows)
   uint16_t row_number = ((uint16_t)src[5] << 8) | (uint16_t)src[4];
   
-  // Map row to the correct offset within the output tensor
-  uint32_t target_row = row_number % max_rows;
+  // Reconstruct chronological index to handle exact wrapping
+  uint64_t expected_abs = pkt_idx;
+  int64_t diff = (int64_t)row_number - (int64_t)(expected_abs % 16384);
+  
+  if (diff > 8192) diff -= 16384;
+  if (diff < -8192) diff += 16384;
+  
+  int64_t absolute_idx = (int64_t)expected_abs + diff;
+  if (absolute_idx < 0) return;
+  
+  uint64_t bunch_idx = absolute_idx / 131072;
+  uint64_t in_bunch_idx = absolute_idx % 131072;
+  
+  uint32_t source_id = in_bunch_idx / 16384;
+  uint32_t local_seq = in_bunch_idx % 16384;
+  
+  uint32_t frame_idx = local_seq / 128;
+  uint32_t row_offset = local_seq % 128;
+  
+  uint32_t global_row = 0;
+  if (source_id == 0) global_row = row_offset;
+  else if (source_id == 1) global_row = 128 + row_offset;
+  else if (source_id == 2) global_row = 256 + row_offset;
+  else if (source_id == 3) global_row = 384 + row_offset;
+  else if (source_id == 4) global_row = 1023 - row_offset;
+  else if (source_id == 5) global_row = 895 - row_offset;
+  else if (source_id == 6) global_row = 767 - row_offset;
+  else if (source_id == 7) global_row = 639 - row_offset;
+  
+  uint64_t global_frame_idx = bunch_idx * 128 + frame_idx;
+  uint64_t target_row_1d = global_frame_idx * 1024 + global_row;
+  
+  if (target_row_1d >= max_rows) return;
 
   uint8_t* payload_src = src + header_len;
-  uint8_t* dst = dst_base + target_row * payload_len;
+  uint8_t* dst = dst_base + target_row_1d * payload_len;
 
   // Since Eth+IP+UDP header is 42 bytes, the starting addr is usually only 2-byte aligned.
   // Using uint4 (16-byte) or uint32_t (4-byte) causes a CUDA Misaligned Address exception.
@@ -117,6 +148,6 @@ __global__ void gather_packets_kernel(uint8_t** src_ptrs, uint8_t* dst_base, uin
   }
 }
 
-void gather_packets(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t payload_len, uint16_t header_len, uint32_t num_pkts, uint32_t max_rows, cudaStream_t stream) {
-  gather_packets_kernel<<<num_pkts, 256, 0, stream>>>(src_ptrs, dst_base, payload_len, header_len, num_pkts, max_rows);
+void gather_packets(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t payload_len, uint16_t header_len, uint32_t num_pkts, uint32_t max_rows, uint64_t base_absolute_row, cudaStream_t stream) {
+  gather_packets_kernel<<<num_pkts, 256, 0, stream>>>(src_ptrs, dst_base, payload_len, header_len, num_pkts, max_rows, base_absolute_row);
 }

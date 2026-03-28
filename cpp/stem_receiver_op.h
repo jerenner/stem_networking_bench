@@ -39,7 +39,7 @@
 
 // New Frame Geometry
 #define FRAME_WIDTH 3840
-#define FRAME_HEIGHT 128
+#define FRAME_HEIGHT 1024
 #define FRAME_SIZE_BYTES (FRAME_WIDTH * FRAME_HEIGHT * sizeof(uint16_t))
 
 using namespace holoscan::advanced_network;
@@ -255,10 +255,13 @@ class StemReceiverOp : public Operator {
                                        cudaMemcpyHostToDevice,
                                        streams_[cur_batch_idx_]));
 
+              uint64_t base_absolute_row = static_cast<uint64_t>(total_frames_emitted_) * 128ULL;
+
               // gather_packets translates out-of-order packets based on the 16-bit row ID
               gather_packets(reinterpret_cast<uint8_t**>(d_dev_ptrs_[cur_batch_idx_]),
                              static_cast<uint8_t*>(full_batch_data_d_[cur_batch_idx_]),
                              nom_payload_size_, custom_header_size_, rows_per_tensor_, rows_per_tensor_,
+                             base_absolute_row,
                              streams_[cur_batch_idx_]);
             }
           } else {
@@ -317,7 +320,7 @@ class StemReceiverOp : public Operator {
   }
 
  private:
-  static constexpr int num_concurrent = 20; 
+  static constexpr int num_concurrent = 4;
   static constexpr int MAX_BURSTS_PER_BATCH = 5000;
 
   // Holds burst buffers that cannot be freed yet and CUDA event indicating when they can be freed

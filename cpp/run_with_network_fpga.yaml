@@ -74,7 +74,7 @@ advanced_network:
             
 receiver0:
   interface_name: "rx_port_0"
-  frames_per_tensor: 200
+  frames_per_tensor: 128
   max_packet_size: 9100
   header_size: 42
   gpu_direct: true
@@ -84,7 +84,7 @@ receiver0:
 
 receiver1:
   interface_name: "rx_port_1"
-  frames_per_tensor: 200
+  frames_per_tensor: 128
   max_packet_size: 9100
   header_size: 42
   gpu_direct: true
@@ -93,7 +93,7 @@ receiver1:
   count: 100000 # Process some number of frames then stop
 
 processor:
-  noop: true
+  noop: false
   # Add any parameters for your processor op here
 
 writer:
