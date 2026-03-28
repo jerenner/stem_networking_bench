@@ -96,7 +96,7 @@ class StemReceiverOp : public Operator {
     nom_payload_size_ = 7680;   // 120 words of actual frame row data
 
     // Derived from user params
-    rows_per_tensor_ = frames_per_tensor_.get() * 128; // 128 rows per frame
+    rows_per_tensor_ = frames_per_tensor_.get() * FRAME_HEIGHT; // FRAME_HEIGHT rows per frame
 
     for (int n = 0; n < num_concurrent; n++) {
       CUDA_TRY(cudaMalloc(&full_batch_data_d_[n], rows_per_tensor_ * nom_payload_size_));
@@ -255,7 +255,7 @@ class StemReceiverOp : public Operator {
                                        cudaMemcpyHostToDevice,
                                        streams_[cur_batch_idx_]));
 
-              uint64_t base_absolute_row = static_cast<uint64_t>(total_frames_emitted_) * 128ULL;
+              uint64_t base_absolute_row = static_cast<uint64_t>(total_frames_emitted_) * static_cast<uint64_t>(FRAME_HEIGHT);
 
               // gather_packets translates out-of-order packets based on the 16-bit row ID
               gather_packets(reinterpret_cast<uint8_t**>(d_dev_ptrs_[cur_batch_idx_]),
