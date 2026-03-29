@@ -335,5 +335,12 @@ RUN if [ "$(uname -m)" = "aarch64" ]; then \
         rm libtorch.zip; \
     fi
 
+# Workaround: Editable pip installs miss placing libc10.so natively inside the dist-packages directory. 
+# CMake config relies on the egg-link, so we must manually place libc10 in the directory CMake looks in.
+RUN if [ "$(uname -m)" = "aarch64" ]; then \
+        mkdir -p /usr/local/lib/python3.12/dist-packages/torch/lib && \
+        ln -sf /usr/local/libtorch/lib/* /usr/local/lib/python3.12/dist-packages/torch/lib/ ; \
+    fi
+
 # Include paths for LibTorch (x86) and Python Torch (ARM/Python 3.10/3.12)
 ENV CMAKE_PREFIX_PATH="/usr/local/libtorch/share/cmake:/usr/local/lib/python3.12/dist-packages/torch/share/cmake:/usr/local/lib/python3.10/dist-packages/torch/share/cmake:${CMAKE_PREFIX_PATH}"
