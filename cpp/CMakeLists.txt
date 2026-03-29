@@ -22,7 +22,8 @@ find_package(holoscan 2.6 REQUIRED CONFIG
 
 # Torch is found via CMAKE_PREFIX_PATH set in the Dockerfile
 # (On x86 this points to LibTorch CXX11, on ARM this points to Pip Torch)
-find_package(Torch REQUIRED PATHS "/home/jrenner/local/software/libtorch")
+find_package(Torch REQUIRED PATHS "/home/jrenner/local/software/libtorch" "/usr/local/libtorch")
+link_directories(/usr/local/libtorch/lib)
 
 # FIX ABI MISMATCH caused by PyTorch defaulting to ABI=0
 # Strip the flag from global flags
