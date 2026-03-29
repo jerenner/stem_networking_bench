@@ -62,7 +62,7 @@ FetchContent_MakeAvailable(MatX)
 find_package(CUDAToolkit REQUIRED)
 
 # Global variables
-set(CMAKE_CUDA_ARCHITECTURES "70;80;90")
+set(CMAKE_CUDA_ARCHITECTURES "70;80;86;89;90;90-virtual")
 
 # Create the executable
 add_executable(stem_networking_bench

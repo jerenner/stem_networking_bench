@@ -322,15 +322,15 @@ RUN if [ "$(uname -m)" = "aarch64" ]; then \
             export USE_CUDNN=0 && \
             export USE_DISTRIBUTED=0 && \
             export USE_NCCL=0 && \
-            export TORCH_CUDA_ARCH_LIST="8.7" && \
+            export TORCH_CUDA_ARCH_LIST="8.6;8.7" && \
             python3 -m pip install --break-system-packages --no-build-isolation -v -e . && \
             cmake --install build --prefix /usr/local/libtorch && \
             cd / && rm -rf /tmp/pytorch ; \
         fi \
     else \
         # (Your existing x86 logic)
-        python3 -m pip install --break-system-packages --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121; \
-        curl -L -o libtorch.zip https://download.pytorch.org/libtorch/cu121/libtorch-cxx11-abi-shared-with-deps-2.5.1%2Bcu121.zip && \
+        python3 -m pip install --break-system-packages --no-cache-dir torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124; \
+        curl -L -o libtorch.zip https://download.pytorch.org/libtorch/cu124/libtorch-cxx11-abi-shared-with-deps-2.6.0%2Bcu124.zip && \
         unzip libtorch.zip -d /usr/local && \
         rm libtorch.zip; \
     fi
