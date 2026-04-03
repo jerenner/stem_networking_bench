@@ -100,24 +100,11 @@ __global__ void gather_packets_kernel(uint8_t** src_ptrs, uint8_t* dst_base, uin
   // Extract 16-bit row number from custom header (which wraps every 16384 rows)
   uint16_t row_number = ((uint16_t)src[5] << 8) | (uint16_t)src[4];
   
-  // Reconstruct chronological index to handle exact wrapping
-  uint64_t expected_abs = pkt_idx;
-  int64_t diff = (int64_t)row_number - (int64_t)(expected_abs % 16384);
+  uint32_t source_id = ((uint16_t)src[7] << 8) | (uint16_t)src[6];
   
-  if (diff > 8192) diff -= 16384;
-  if (diff < -8192) diff += 16384;
-  
-  int64_t absolute_idx = (int64_t)expected_abs + diff;
-  if (absolute_idx < 0) return;
-  
-  uint64_t bunch_idx = absolute_idx / 131072;
-  uint64_t in_bunch_idx = absolute_idx % 131072;
-  
-  uint32_t source_id = in_bunch_idx / 16384;
-  uint32_t local_seq = in_bunch_idx % 16384;
-  
-  uint32_t frame_idx = local_seq / 128;
-  uint32_t row_offset = local_seq % 128;
+  // row_number wraps every 16384 rows, giving 128 frames (since each frame is 128 rows per source)
+  uint32_t frame_idx = row_number / 128;
+  uint32_t row_offset = row_number % 128;
   
   uint32_t global_row = 0;
   if (source_id == 0) global_row = row_offset;
@@ -128,11 +115,18 @@ __global__ void gather_packets_kernel(uint8_t** src_ptrs, uint8_t* dst_base, uin
   else if (source_id == 5) global_row = 895 - row_offset;
   else if (source_id == 6) global_row = 767 - row_offset;
   else if (source_id == 7) global_row = 639 - row_offset;
+  else return; // Ignore invalid source_id
   
-  uint64_t global_frame_idx = bunch_idx * 128 + frame_idx;
-  uint64_t target_row_1d = global_frame_idx * 1024 + global_row;
+  // Calculate relative frame position
+  uint64_t base_frame = base_absolute_row / 1024;
+  int64_t diff_frames = (int64_t)frame_idx - (int64_t)(base_frame % 128);
   
-  if (target_row_1d >= max_rows) return;
+  if (diff_frames > 64) diff_frames -= 128;
+  if (diff_frames < -64) diff_frames += 128;
+  
+  int64_t target_row_1d = diff_frames * 1024 + global_row;
+  
+  if (target_row_1d < 0 || target_row_1d >= max_rows) return;
 
   uint8_t* payload_src = src + header_len;
   uint8_t* dst = dst_base + target_row_1d * payload_len;
