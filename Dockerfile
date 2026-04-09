@@ -344,3 +344,28 @@ RUN if [ "$(uname -m)" = "aarch64" ]; then \
 
 # Include paths for LibTorch (x86) and Python Torch (ARM/Python 3.10/3.12)
 ENV CMAKE_PREFIX_PATH="/usr/local/libtorch/share/cmake:/usr/local/lib/python3.12/dist-packages/torch/share/cmake:/usr/local/lib/python3.10/dist-packages/torch/share/cmake:${CMAKE_PREFIX_PATH}"
+
+# Optional profiling tools for Nsight Systems inside the runtime container.
+# This is intentionally placed after the expensive PyTorch layer so Docker can
+# reuse the existing cache for torch/libtorch when only profiling support changes.
+ARG INSTALL_PROFILING_TOOLS=1
+ARG NSYS_VERSION=2025.3.1
+
+RUN if [ "${INSTALL_PROFILING_TOOLS}" = "1" ]; then \
+        CUDA_MAJOR_MINOR=$(echo "${CUDA_VERSION}" | cut -d. -f1-2 --output-delimiter="-") && \
+        UBUNTU_RELEASE=$(. /etc/os-release && echo "${VERSION_ID}" | tr -d '.') && \
+        ARCH_STRING=$(dpkg --print-architecture) && \
+        DEVTOOLS_REPO_URL="https://developer.download.nvidia.com/devtools/repos/ubuntu${UBUNTU_RELEASE}/${ARCH_STRING}" && \
+        apt-get update && \
+        apt-get install -y --no-install-recommends gnupg && \
+        curl -fsSL "${DEVTOOLS_REPO_URL}/nvidia.pub" | gpg --dearmor -o /usr/share/keyrings/nvidia-devtools.gpg && \
+        echo "deb [signed-by=/usr/share/keyrings/nvidia-devtools.gpg] ${DEVTOOLS_REPO_URL} /" > /etc/apt/sources.list.d/nvidia-devtools.list && \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            cuda-cupti-${CUDA_MAJOR_MINOR} \
+            cuda-profiler-api-${CUDA_MAJOR_MINOR} \
+            nsight-systems-cli-${NSYS_VERSION} && \
+        nsys_path=$(find /opt/nvidia -path '*/bin/nsys' -type f | head -n 1 || true) && \
+        if [ -n "${nsys_path}" ]; then ln -sf "${nsys_path}" /usr/local/bin/nsys; fi && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
