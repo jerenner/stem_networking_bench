@@ -21,12 +21,16 @@
 #include "advanced_network/common.h"
 #include "advanced_network/kernels.h"
 #include "kernels.cuh"
+#include "nvtx_ranges.hpp"
 #include "holoscan/holoscan.hpp"
 #include "holoscan/core/domain/tensor.hpp"
 #include "holoscan/utils/cuda_macros.hpp"
-#include <queue>
+#include <algorithm>
+#include <array>
 #include <arpa/inet.h>
 #include <assert.h>
+#include <cstring>
+#include <queue>
 #include <sys/time.h>
 
 #include <torch/torch.h>
@@ -63,7 +67,16 @@ namespace holoscan::ops {
 
 class StemReceiverOp : public Operator {
  public:
+  static constexpr int num_concurrent = 4;
+  static constexpr int MAX_BURSTS_PER_BATCH = 5000;
+
   HOLOSCAN_OPERATOR_FORWARD_ARGS(StemReceiverOp)
+
+  struct BatchAggregationParams {
+    std::array<BurstParams*, MAX_BURSTS_PER_BATCH> bursts;
+    int num_bursts;
+    cudaEvent_t evt;
+  };
 
   StemReceiverOp() = default;
 
@@ -165,12 +178,47 @@ class StemReceiverOp : public Operator {
     }
   }
 
+  void release_batch_bursts(BatchAggregationParams& batch) {
+    for (int m = 0; m < batch.num_bursts; m++) {
+      if (batch.bursts[m]) {
+        free_all_packets_and_burst_rx(batch.bursts[m]);
+        batch.bursts[m] = nullptr;
+      }
+    }
+    batch.num_bursts = 0;
+  }
+
+  void drop_current_batch(const char* reason) {
+    profiling::ScopedRange drop_range("receiver/drop-batch", profiling::color::kBackpressure);
+
+    int64_t freed_packets = 0;
+    for (int m = 0; m < cur_batch_.num_bursts; m++) {
+      if (cur_batch_.bursts[m]) {
+        freed_packets += get_num_packets(cur_batch_.bursts[m]);
+      }
+    }
+
+    release_batch_bursts(cur_batch_);
+    ttl_packets_dropped_ += rows_per_tensor_;
+
+    HOLOSCAN_LOG_ERROR(
+        "{} Dropped one logical batch ({} packets). Freed {} fully-owned packets immediately.",
+        reason,
+        rows_per_tensor_,
+        freed_packets);
+  }
+
   void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override {
+    profiling::ScopedRange compute_range("receiver/compute", profiling::color::kReceiver);
+
     // If we processed a batch of packets in a previous compute call, that was done asynchronously,
     // and we'll need to free the packets eventually so the NIC can have space for the next bursts.
     // Ideally, we'd free the packets on a callback from CUDA, but that is slow. For that reason and
     // to keep it simple, we do that check right here on the next epoch of the operator.
-    free_processed_packets();
+    {
+      profiling::ScopedRange reclaim_range("receiver/reclaim-completed", profiling::color::kIo);
+      free_processed_packets();
+    }
 
     if (is_done_) return;
 
@@ -181,7 +229,11 @@ class StemReceiverOp : public Operator {
     const auto num_rx_queues = get_num_rx_queues(port_id_);
 
     for (int q = 0; q < num_rx_queues; q++) {
-      auto status = get_rx_burst(&burst, port_id_, q);
+      auto status = Status::SUCCESS;
+      {
+        profiling::ScopedRange rx_burst_range("receiver/get-rx-burst", profiling::color::kIo);
+        status = get_rx_burst(&burst, port_id_, q);
+      }
       if (status != Status::SUCCESS) { continue; }
 
       auto burst_size = get_num_packets(burst);
@@ -194,25 +246,31 @@ class StemReceiverOp : public Operator {
         int space_in_batch = rows_per_tensor_ - aggr_pkts_recv_;
         int packets_to_copy = std::min(static_cast<int>(burst_size - p), space_in_batch);
 
-        for (int i = 0; i < packets_to_copy; i++) {
-          int pkt_in_burst = p + i;
-          
-          if (gpu_direct_.get()) {
-            if (hds_.get()) {
-              h_dev_ptrs_[cur_batch_idx_][aggr_pkts_recv_ + i] = burst->pkts[1][pkt_in_burst];
-            } else {
-              h_dev_ptrs_[cur_batch_idx_][aggr_pkts_recv_ + i] = 
-                  reinterpret_cast<uint8_t*>(get_segment_packet_ptr(burst, 0, pkt_in_burst)) + header_size_.get();
-            }
-          } else {
-            // CPU fallback (Warning: naive copy, doesn't reorder within frame)
-            auto payload_ptr = reinterpret_cast<uint8_t*>(get_segment_packet_ptr(burst, 0, pkt_in_burst)) + header_size_.get();
-            auto burst_offset = (aggr_pkts_recv_ + i) * nom_payload_size_;
+        {
+          profiling::ScopedRange aggregate_range("receiver/aggregate-burst", profiling::color::kReceiver);
+          for (int i = 0; i < packets_to_copy; i++) {
+            int pkt_in_burst = p + i;
             
-            // We strip the 64-byte custom header for the Host copy because no reorder kernel is run for it
-            memcpy((char*)full_batch_data_h_[cur_batch_idx_] + burst_offset,
-                   payload_ptr + custom_header_size_,
-                   nom_payload_size_);
+            if (gpu_direct_.get()) {
+              if (hds_.get()) {
+                h_dev_ptrs_[cur_batch_idx_][aggr_pkts_recv_ + i] = burst->pkts[1][pkt_in_burst];
+              } else {
+                h_dev_ptrs_[cur_batch_idx_][aggr_pkts_recv_ + i] =
+                    reinterpret_cast<uint8_t*>(get_segment_packet_ptr(burst, 0, pkt_in_burst)) +
+                    header_size_.get();
+              }
+            } else {
+              // CPU fallback (Warning: naive copy, doesn't reorder within frame)
+              auto payload_ptr =
+                  reinterpret_cast<uint8_t*>(get_segment_packet_ptr(burst, 0, pkt_in_burst)) +
+                  header_size_.get();
+              auto burst_offset = (aggr_pkts_recv_ + i) * nom_payload_size_;
+
+              // We strip the 64-byte custom header for the Host copy because no reorder kernel is run for it
+              memcpy((char*)full_batch_data_h_[cur_batch_idx_] + burst_offset,
+                     payload_ptr + custom_header_size_,
+                     nom_payload_size_);
+            }
           }
         }
         
@@ -231,11 +289,14 @@ class StemReceiverOp : public Operator {
         // If we have aggregated the required number of rows, process and emit
         if (aggr_pkts_recv_ == rows_per_tensor_) {
           aggr_pkts_recv_ = 0; // reset for next tensor
-          
-          if (batch_q_.size() == num_concurrent) {
-            HOLOSCAN_LOG_ERROR("Fell behind. All buffers queued. Dropping incoming batch silently.");
-            cur_batch_.num_bursts = 0; 
-            continue; // We technically leak burst tracking here if we just continue, but helps avoid total halt
+
+          {
+            profiling::ScopedRange reclaim_range("receiver/reclaim-before-queue-check", profiling::color::kIo);
+            free_processed_packets();
+          }
+          if (batch_q_.size() >= num_concurrent) {
+            drop_current_batch("Fell behind. All buffers queued.");
+            continue;
           }
 
           if (gpu_direct_.get()) {
@@ -247,32 +308,44 @@ class StemReceiverOp : public Operator {
           // supported. Currently the reorder kernel expects the packets to be 16B-aligned, and
           // anything that's not will cause an access error on the GPU
             if (reorder_kernel_.get()) {
-
-              // Copy the list of pointers to the device
-              CUDA_TRY(cudaMemcpyAsync(d_dev_ptrs_[cur_batch_idx_],
-                                       h_dev_ptrs_[cur_batch_idx_],
-                                       sizeof(void*) * rows_per_tensor_,
-                                       cudaMemcpyHostToDevice,
-                                       streams_[cur_batch_idx_]));
+              {
+                profiling::ScopedRange ptr_copy_range("receiver/pointer-list-h2d", profiling::color::kCopy);
+                CUDA_TRY(cudaMemcpyAsync(d_dev_ptrs_[cur_batch_idx_],
+                                         h_dev_ptrs_[cur_batch_idx_],
+                                         sizeof(void*) * rows_per_tensor_,
+                                         cudaMemcpyHostToDevice,
+                                         streams_[cur_batch_idx_]));
+              }
 
               uint64_t base_absolute_row = static_cast<uint64_t>(total_frames_emitted_) * static_cast<uint64_t>(FRAME_HEIGHT);
 
               // gather_packets translates out-of-order packets based on the 16-bit row ID
-              gather_packets(reinterpret_cast<uint8_t**>(d_dev_ptrs_[cur_batch_idx_]),
-                             static_cast<uint8_t*>(full_batch_data_d_[cur_batch_idx_]),
-                             nom_payload_size_, custom_header_size_, rows_per_tensor_, rows_per_tensor_,
-                             base_absolute_row,
-                             streams_[cur_batch_idx_]);
+              {
+                profiling::ScopedRange gather_range("receiver/gather-packets", profiling::color::kCompute);
+                gather_packets(reinterpret_cast<uint8_t**>(d_dev_ptrs_[cur_batch_idx_]),
+                               static_cast<uint8_t*>(full_batch_data_d_[cur_batch_idx_]),
+                               nom_payload_size_, custom_header_size_, rows_per_tensor_, rows_per_tensor_,
+                               base_absolute_row,
+                               streams_[cur_batch_idx_]);
+              }
+            } else {
+              profiling::ScopedRange reorder_range("receiver/reorder-in-arrival-order", profiling::color::kCompute);
+              simple_packet_reorder(static_cast<uint8_t*>(full_batch_data_d_[cur_batch_idx_]),
+                                    reinterpret_cast<const void* const*>(h_dev_ptrs_[cur_batch_idx_]),
+                                    nom_payload_size_,
+                                    rows_per_tensor_,
+                                    streams_[cur_batch_idx_]);
             }
           } else {
             // Non GPUDirect mode: we copy the payload on host-pinned memory (in full_batch_data_h_)
             // to a contiguous memory buffer on the GPU (full_batch_data_d_)
             // NOTE: there is no reordering support here at all
+            profiling::ScopedRange host_copy_range("receiver/host-batch-h2d", profiling::color::kCopy);
             CUDA_TRY(cudaMemcpyAsync(full_batch_data_d_[cur_batch_idx_],
-                            full_batch_data_h_[cur_batch_idx_],
-                            rows_per_tensor_ * nom_payload_size_,
-                            cudaMemcpyHostToDevice,
-                            streams_[cur_batch_idx_]));
+                                     full_batch_data_h_[cur_batch_idx_],
+                                     rows_per_tensor_ * nom_payload_size_,
+                                     cudaMemcpyHostToDevice,
+                                     streams_[cur_batch_idx_]));
           }
 
           // Build Tensor using GXF zero-copy memory wrapping
@@ -287,18 +360,24 @@ class StemReceiverOp : public Operator {
 	        //HOLOSCAN_LOG_INFO("-> Reshaped tensor.");
 
           // Copy the aggregated frame data to the new tensor's buffer
-          HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(gxf_tensor->pointer(),
-                          full_batch_data_d_[cur_batch_idx_],
-                          gxf_tensor->bytes_size(),
-                          cudaMemcpyDeviceToDevice,
-                          streams_[cur_batch_idx_]));
+          {
+            profiling::ScopedRange tensor_copy_range("receiver/batch-d2d-copy", profiling::color::kCopy);
+            HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(gxf_tensor->pointer(),
+                            full_batch_data_d_[cur_batch_idx_],
+                            gxf_tensor->bytes_size(),
+                            cudaMemcpyDeviceToDevice,
+                            streams_[cur_batch_idx_]));
+          }
 
           auto maybedl = gxf_tensor->toDLManagedTensorContext();
           auto holoscan_tensor = std::make_shared<Tensor>(maybedl.value());
           
           TensorMap out_message;
           out_message.insert({"frame", holoscan_tensor});
-          op_output.emit(out_message, "output");
+          {
+            profiling::ScopedRange emit_range("receiver/emit", profiling::color::kIo);
+            op_output.emit(out_message, "output");
+          }
 
           total_frames_emitted_ += frames_per_tensor_.get();
 
@@ -320,16 +399,6 @@ class StemReceiverOp : public Operator {
   }
 
  private:
-  static constexpr int num_concurrent = 4;
-  static constexpr int MAX_BURSTS_PER_BATCH = 5000;
-
-  // Holds burst buffers that cannot be freed yet and CUDA event indicating when they can be freed
-  struct BatchAggregationParams {
-    std::array<BurstParams*, MAX_BURSTS_PER_BATCH> bursts;
-    int num_bursts;
-    cudaEvent_t evt;
-  };
-
   int port_id_;
   BatchAggregationParams cur_batch_{};
   int cur_batch_idx_ = 0;

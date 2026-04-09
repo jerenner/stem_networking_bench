@@ -1,5 +1,6 @@
 // hdf5_writer_op.cpp
 #include "hdf5_writer_op.h"
+#include "nvtx_ranges.hpp"
 #include "holoscan/core/domain/tensor.hpp"
 #include "holoscan/utils/cuda_macros.hpp"
 
@@ -29,6 +30,7 @@ void HDF5WriterOp::initialize() {
 }
 
 void HDF5WriterOp::compute(InputContext& op_input, OutputContext&, ExecutionContext&) {
+  profiling::ScopedRange compute_range("writer/compute", profiling::color::kWriter);
   auto in_message = op_input.receive<TensorMap>("input").value();
   
   if (noop_.get()) {
@@ -106,10 +108,14 @@ void HDF5WriterOp::compute(InputContext& op_input, OutputContext&, ExecutionCont
 
   // Copy data from GPU to host buffer
   host_buffer_.resize(tensor->nbytes());
-  HOLOSCAN_CUDA_CALL(cudaMemcpy(host_buffer_.data(), tensor->data(), tensor->nbytes(), cudaMemcpyDeviceToHost));
+  {
+    profiling::ScopedRange dtoh_range("writer/device-to-host", profiling::color::kCopy);
+    HOLOSCAN_CUDA_CALL(cudaMemcpy(host_buffer_.data(), tensor->data(), tensor->nbytes(), cudaMemcpyDeviceToHost));
+  }
 
   // Write the data
   try {
+    profiling::ScopedRange write_range("writer/hdf5-write", profiling::color::kIo);
     dataset_->write(host_buffer_.data(), h5_type, memspace, *filespace_);
   } catch (H5::Exception& e) {
     HOLOSCAN_LOG_ERROR("HDF5 error in compute (write): {}", e.getCDetailMsg());

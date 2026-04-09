@@ -21,7 +21,21 @@
 #include "advanced_network/kernels.h"
 #include "holoscan/holoscan.hpp"
 #include <assert.h>
+#include <cstdlib>
 #include <sys/time.h>
+#include <string_view>
+
+namespace {
+
+bool env_flag_enabled(const char* name) {
+  const char* raw_value = std::getenv(name);
+  if (raw_value == nullptr) { return false; }
+
+  std::string_view value(raw_value);
+  return !value.empty() && value != "0" && value != "false" && value != "FALSE";
+}
+
+}  // namespace
 
 class App : public holoscan::Application {
  public:
@@ -76,6 +90,9 @@ int main(int argc, char** argv) {
     config_path = std::filesystem::canonical(argv[0]).parent_path() / config_path;
   }
   app->config(config_path);
+  if (env_flag_enabled("HOLOSCAN_ENABLE_PROFILE")) {
+    app->track();
+  }
   app->scheduler(app->make_scheduler<MultiThreadScheduler>("multithread-scheduler",
                                                            app->from_config("scheduler")));
   app->run();
