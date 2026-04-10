@@ -88,6 +88,13 @@ class StemReceiverOp : public Operator {
   }
 
   void initialize() override {
+    auto has_stop_condition = std::find_if(args().begin(), args().end(), [](const auto& arg) {
+      return (arg.name() == "stop_condition");
+    });
+    if (has_stop_condition == args().end()) {
+      auto stop_cond = fragment()->make_condition<BooleanCondition>(name() + "_stop_condition");
+      add_arg(Arg("stop_condition", stop_cond));
+    }
 
     // Add a default UnboundedAllocator if no allocator was provided.
     if (!allocator_.has_value()) {
@@ -158,6 +165,10 @@ class StemReceiverOp : public Operator {
     spec.param<uint16_t>(header_size_, "header_size", "Header size", "Header size to strip (ETH+IP+UDP)", 42);
     spec.param<bool>(reorder_kernel_, "reorder_kernel", "Reorder kernel enabled", "Enable reorder kernel", true);
     spec.param<uint64_t>(count_, "count", "Count", "Number of frames to receive. 0 means infinite.", 0UL);
+    spec.param<std::shared_ptr<holoscan::BooleanCondition>>(stop_condition_,
+                                                            "stop_condition",
+                                                            "Stop Condition",
+                                                            "Boolean condition to stop execution.");
   }
 
   // Free buffers if CUDA processing/copy is complete
@@ -391,6 +402,7 @@ class StemReceiverOp : public Operator {
           if (count_.get() > 0 && total_frames_emitted_ >= count_.get()) {
             HOLOSCAN_LOG_INFO("StemReceiverOp: Reached frame limit of {}", count_.get());
             is_done_ = true;
+            stop_condition_.get()->disable_tick();
             return;
           }
         }
@@ -429,6 +441,7 @@ class StemReceiverOp : public Operator {
   Parameter<uint16_t> header_size_;
   Parameter<bool> reorder_kernel_;
   Parameter<uint64_t> count_;
+  Parameter<std::shared_ptr<holoscan::BooleanCondition>> stop_condition_;
   Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
 
   bool is_done_ = false;
