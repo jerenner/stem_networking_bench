@@ -82,7 +82,7 @@ receiver0:
   reorder_kernel: true
   count: 100000 # Process some number of frames then stop
   # packet_debug: true
-  # packet_debug_output_prefix: "/tmp/receiver0_packet_debug"
+  # packet_debug_output_prefix: "/workspace/holohub/build/stem_networking_bench/applications/stem_networking_bench/cpp/recv0_packet_debug"
   # packet_debug_max_batches: 2
 
 receiver1:
@@ -95,7 +95,7 @@ receiver1:
   reorder_kernel: true
   count: 100000 # Process some number of frames then stop
   # packet_debug: true
-  # packet_debug_output_prefix: "/tmp/receiver1_packet_debug"
+  # packet_debug_output_prefix: "/workspace/holohub/build/stem_networking_bench/applications/stem_networking_bench/cpp/recv1_packet_debug"
   # packet_debug_max_batches: 2
 
 processor:
