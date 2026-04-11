@@ -81,6 +81,9 @@ receiver0:
   split_boundary: false
   reorder_kernel: true
   count: 100000 # Process some number of frames then stop
+  # packet_debug: true
+  # packet_debug_output_prefix: "/tmp/receiver0_packet_debug"
+  # packet_debug_max_batches: 2
 
 receiver1:
   interface_name: "rx_port_1"
@@ -91,6 +94,9 @@ receiver1:
   split_boundary: false
   reorder_kernel: true
   count: 100000 # Process some number of frames then stop
+  # packet_debug: true
+  # packet_debug_output_prefix: "/tmp/receiver1_packet_debug"
+  # packet_debug_max_batches: 2
 
 processor:
   noop: true

@@ -29,9 +29,13 @@
 #include <array>
 #include <arpa/inet.h>
 #include <assert.h>
+#include <fstream>
+#include <limits>
 #include <cstring>
 #include <queue>
+#include <string>
 #include <sys/time.h>
+#include <vector>
 
 #include <torch/torch.h>
 #include <torch/nn.h>
@@ -83,6 +87,7 @@ class StemReceiverOp : public Operator {
   ~StemReceiverOp() {
     HOLOSCAN_LOG_INFO("Finished receiver with {}/{} bytes/packets received and {} packets dropped",
                       ttl_bytes_recv_, ttl_pkts_recv_, ttl_packets_dropped_);
+    flush_packet_debug_outputs();
     HOLOSCAN_LOG_INFO("StemReceiverOp shutting down");
     freeResources();
   }
@@ -133,11 +138,14 @@ class StemReceiverOp : public Operator {
 
     if (hds_.get()) { assert(gpu_direct_.get()); }
 
+    initialize_packet_debug();
+
     HOLOSCAN_LOG_INFO("StemReceiverOp::initialize() complete. Batching {} frames ({} rows) per tensor.", frames_per_tensor_.get(), rows_per_tensor_);
   }
 
   void freeResources() {
     HOLOSCAN_LOG_INFO("StemReceiverOp::freeResources() start");
+    cleanup_packet_debug();
     for (int n = 0; n < num_concurrent; n++) {
       if (full_batch_data_d_[n]) { cudaFree(full_batch_data_d_[n]); }
       if (full_batch_data_h_[n]) { cudaFreeHost(full_batch_data_h_[n]); }
@@ -165,6 +173,21 @@ class StemReceiverOp : public Operator {
     spec.param<uint16_t>(header_size_, "header_size", "Header size", "Header size to strip (ETH+IP+UDP)", 42);
     spec.param<bool>(reorder_kernel_, "reorder_kernel", "Reorder kernel enabled", "Enable reorder kernel", true);
     spec.param<uint64_t>(count_, "count", "Count", "Number of frames to receive. 0 means infinite.", 0UL);
+    spec.param<bool>(packet_debug_,
+                     "packet_debug",
+                     "Packet Debug",
+                     "If true, capture packet-level debug summaries to CSV/text files.",
+                     false);
+    spec.param<std::string>(packet_debug_output_prefix_,
+                            "packet_debug_output_prefix",
+                            "Packet Debug Output Prefix",
+                            "Prefix for receiver packet-debug outputs. Defaults to /tmp/<name>_<interface>_packet_debug.",
+                            std::string(""));
+    spec.param<uint32_t>(packet_debug_max_batches_,
+                         "packet_debug_max_batches",
+                         "Packet Debug Max Batches",
+                         "Maximum number of full tensors to summarize. 0 means unlimited.",
+                         0U);
     spec.param<std::shared_ptr<holoscan::BooleanCondition>>(stop_condition_,
                                                             "stop_condition",
                                                             "Stop Condition",
@@ -217,6 +240,190 @@ class StemReceiverOp : public Operator {
         reason,
         rows_per_tensor_,
         freed_packets);
+  }
+
+  void initialize_packet_debug() {
+    if (!packet_debug_.get()) { return; }
+
+    if (!gpu_direct_.get()) {
+      HOLOSCAN_LOG_WARN("Packet debug requested for {} but requires gpu_direct: true. Disabling packet debug.",
+                        name());
+      return;
+    }
+    if (hds_.get()) {
+      HOLOSCAN_LOG_WARN(
+          "Packet debug requested for {} but does not yet support split_boundary: true. Disabling packet debug.",
+          name());
+      return;
+    }
+
+    packet_debug_summary_capacity_ = rows_per_tensor_;
+    CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&packet_debug_summaries_d_),
+                        sizeof(PacketDebugSummary) * packet_debug_summary_capacity_));
+    CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&packet_debug_summaries_h_),
+                            sizeof(PacketDebugSummary) * packet_debug_summary_capacity_));
+
+    packet_debug_column_histogram_.assign(FRAME_WIDTH, 0);
+    packet_debug_output_prefix_resolved_ = packet_debug_output_prefix_.get().empty()
+        ? (std::string("/tmp/") + name() + "_" + interface_name_.get() + "_packet_debug")
+        : packet_debug_output_prefix_.get();
+    packet_debug_csv_path_ = packet_debug_output_prefix_resolved_ + ".csv";
+    packet_debug_summary_path_ = packet_debug_output_prefix_resolved_ + ".summary.txt";
+    packet_debug_histogram_path_ = packet_debug_output_prefix_resolved_ + ".columns.csv";
+
+    packet_debug_csv_.open(packet_debug_csv_path_, std::ios::out | std::ios::trunc);
+    if (!packet_debug_csv_.is_open()) {
+      HOLOSCAN_LOG_ERROR("Failed to open packet debug CSV output '{}'. Disabling packet debug.",
+                         packet_debug_csv_path_);
+      cleanup_packet_debug();
+      return;
+    }
+
+    packet_debug_csv_
+        << "receiver,interface,batch_index,packet_index,row_number,eth_id,frame_index,global_row,"
+           "nonzero_count,first_nonzero_col,first_nonzero_value,second_nonzero_col,"
+           "second_nonzero_value,max_value_col,max_value\n";
+    packet_debug_csv_.flush();
+
+    packet_debug_enabled_ = true;
+    HOLOSCAN_LOG_INFO("Packet debug enabled for {}. Writing packet records to '{}' (max batches: {}).",
+                      name(),
+                      packet_debug_csv_path_,
+                      packet_debug_max_batches_.get());
+  }
+
+  void cleanup_packet_debug() {
+    if (packet_debug_csv_.is_open()) {
+      packet_debug_csv_.flush();
+      packet_debug_csv_.close();
+    }
+    if (packet_debug_summaries_d_) {
+      cudaFree(packet_debug_summaries_d_);
+      packet_debug_summaries_d_ = nullptr;
+    }
+    if (packet_debug_summaries_h_) {
+      cudaFreeHost(packet_debug_summaries_h_);
+      packet_debug_summaries_h_ = nullptr;
+    }
+    packet_debug_summary_capacity_ = 0;
+    packet_debug_enabled_ = false;
+  }
+
+  void flush_packet_debug_outputs() {
+    if (!packet_debug_enabled_ && packet_debug_batches_captured_ == 0) { return; }
+
+    if (packet_debug_csv_.is_open()) { packet_debug_csv_.flush(); }
+
+    if (!packet_debug_summary_path_.empty()) {
+      std::ofstream summary_stream(packet_debug_summary_path_, std::ios::out | std::ios::trunc);
+      if (summary_stream.is_open()) {
+        summary_stream << "receiver=" << name() << "\n";
+        summary_stream << "interface=" << interface_name_.get() << "\n";
+        summary_stream << "batches_captured=" << packet_debug_batches_captured_ << "\n";
+        summary_stream << "packets_captured=" << packet_debug_packets_captured_ << "\n";
+        summary_stream << "invalid_source_id_packets=" << packet_debug_invalid_source_packets_ << "\n";
+        summary_stream << "nonzero_count_histogram:\n";
+        summary_stream << "  0=" << packet_debug_nonzero_histogram_[0] << "\n";
+        summary_stream << "  1=" << packet_debug_nonzero_histogram_[1] << "\n";
+        summary_stream << "  2=" << packet_debug_nonzero_histogram_[2] << "\n";
+        summary_stream << "  >=3=" << packet_debug_nonzero_histogram_[3] << "\n";
+        summary_stream << "source_id_counts:\n";
+        for (size_t source_id = 0; source_id < packet_debug_source_histogram_.size(); ++source_id) {
+          summary_stream << "  " << source_id << "=" << packet_debug_source_histogram_[source_id] << "\n";
+        }
+      }
+    }
+
+    if (!packet_debug_histogram_path_.empty()) {
+      std::ofstream histogram_stream(packet_debug_histogram_path_, std::ios::out | std::ios::trunc);
+      if (histogram_stream.is_open()) {
+        histogram_stream << "column,count\n";
+        for (size_t col = 0; col < packet_debug_column_histogram_.size(); ++col) {
+          if (packet_debug_column_histogram_[col] == 0) { continue; }
+          histogram_stream << col << "," << packet_debug_column_histogram_[col] << "\n";
+        }
+      }
+    }
+  }
+
+  bool should_capture_packet_debug() const {
+    return packet_debug_enabled_ &&
+           (packet_debug_max_batches_.get() == 0 ||
+            packet_debug_batches_captured_ < packet_debug_max_batches_.get());
+  }
+
+  static int packet_debug_optional_value(uint16_t value) {
+    return (value == std::numeric_limits<uint16_t>::max()) ? -1 : static_cast<int>(value);
+  }
+
+  void capture_packet_debug_batch(int slot_idx) {
+    if (!should_capture_packet_debug()) { return; }
+
+    profiling::ScopedRange debug_range("receiver/packet-debug-summary", profiling::color::kCompute);
+
+    summarize_packets(reinterpret_cast<uint8_t**>(d_dev_ptrs_[slot_idx]),
+                      packet_debug_summaries_d_,
+                      nom_payload_size_,
+                      custom_header_size_,
+                      rows_per_tensor_,
+                      streams_[slot_idx]);
+    CUDA_TRY(cudaMemcpyAsync(packet_debug_summaries_h_,
+                             packet_debug_summaries_d_,
+                             sizeof(PacketDebugSummary) * rows_per_tensor_,
+                             cudaMemcpyDeviceToHost,
+                             streams_[slot_idx]));
+    CUDA_TRY(cudaStreamSynchronize(streams_[slot_idx]));
+
+    for (uint32_t packet_idx = 0; packet_idx < rows_per_tensor_; ++packet_idx) {
+      const auto& summary = packet_debug_summaries_h_[packet_idx];
+
+      packet_debug_packets_captured_++;
+      if (summary.source_id < packet_debug_source_histogram_.size()) {
+        packet_debug_source_histogram_[summary.source_id]++;
+      } else {
+        packet_debug_invalid_source_packets_++;
+      }
+
+      const size_t nonzero_bucket = (summary.nonzero_count >= 3) ? 3 : summary.nonzero_count;
+      packet_debug_nonzero_histogram_[nonzero_bucket]++;
+      if (summary.first_nonzero_col != std::numeric_limits<uint16_t>::max()) {
+        packet_debug_column_histogram_[summary.first_nonzero_col]++;
+      }
+      if (summary.second_nonzero_col != std::numeric_limits<uint16_t>::max()) {
+        packet_debug_column_histogram_[summary.second_nonzero_col]++;
+      }
+
+      if (packet_debug_csv_.is_open()) {
+        packet_debug_csv_ << name() << "," << interface_name_.get() << "," << packet_debug_batches_captured_
+                          << "," << packet_idx << "," << summary.row_number << "," << summary.source_id
+                          << "," << summary.frame_index << "," << summary.global_row << ","
+                          << summary.nonzero_count << ","
+                          << packet_debug_optional_value(summary.first_nonzero_col) << ","
+                          << summary.first_nonzero_value << ","
+                          << packet_debug_optional_value(summary.second_nonzero_col) << ","
+                          << summary.second_nonzero_value << ","
+                          << packet_debug_optional_value(summary.max_value_col) << ","
+                          << summary.max_value << "\n";
+      }
+    }
+
+    if (packet_debug_csv_.is_open()) { packet_debug_csv_.flush(); }
+
+    packet_debug_batches_captured_++;
+    flush_packet_debug_outputs();
+
+    HOLOSCAN_LOG_INFO(
+        "Packet debug captured batch {} for {} ({} packet summaries written to '{}').",
+        packet_debug_batches_captured_,
+        name(),
+        rows_per_tensor_,
+        packet_debug_csv_path_);
+    if (packet_debug_max_batches_.get() > 0 &&
+        packet_debug_batches_captured_ >= packet_debug_max_batches_.get()) {
+      HOLOSCAN_LOG_INFO("Packet debug reached max batches ({}) for {}. Further packet capture disabled.",
+                        packet_debug_max_batches_.get(),
+                        name());
+    }
   }
 
   void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override {
@@ -299,6 +506,7 @@ class StemReceiverOp : public Operator {
 
         // If we have aggregated the required number of rows, process and emit
         if (aggr_pkts_recv_ == rows_per_tensor_) {
+          const bool capture_packet_debug = should_capture_packet_debug();
           aggr_pkts_recv_ = 0; // reset for next tensor
 
           {
@@ -318,7 +526,7 @@ class StemReceiverOp : public Operator {
           // We also allow disabling the reorder kernel if alignment and memory types are not
           // supported. Currently the reorder kernel expects the packets to be 16B-aligned, and
           // anything that's not will cause an access error on the GPU
-            if (reorder_kernel_.get()) {
+            if (reorder_kernel_.get() || capture_packet_debug) {
               {
                 profiling::ScopedRange ptr_copy_range("receiver/pointer-list-h2d", profiling::color::kCopy);
                 CUDA_TRY(cudaMemcpyAsync(d_dev_ptrs_[cur_batch_idx_],
@@ -327,7 +535,11 @@ class StemReceiverOp : public Operator {
                                          cudaMemcpyHostToDevice,
                                          streams_[cur_batch_idx_]));
               }
+            }
 
+            if (capture_packet_debug) { capture_packet_debug_batch(cur_batch_idx_); }
+
+            if (reorder_kernel_.get()) {
               uint64_t base_absolute_row = static_cast<uint64_t>(total_frames_emitted_) * static_cast<uint64_t>(FRAME_HEIGHT);
 
               // gather_packets translates out-of-order packets based on the 16-bit row ID
@@ -441,10 +653,29 @@ class StemReceiverOp : public Operator {
   Parameter<uint16_t> header_size_;
   Parameter<bool> reorder_kernel_;
   Parameter<uint64_t> count_;
+  Parameter<bool> packet_debug_;
+  Parameter<std::string> packet_debug_output_prefix_;
+  Parameter<uint32_t> packet_debug_max_batches_;
   Parameter<std::shared_ptr<holoscan::BooleanCondition>> stop_condition_;
   Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
 
   bool is_done_ = false;
+
+  bool packet_debug_enabled_ = false;
+  uint32_t packet_debug_summary_capacity_ = 0;
+  PacketDebugSummary* packet_debug_summaries_d_ = nullptr;
+  PacketDebugSummary* packet_debug_summaries_h_ = nullptr;
+  std::ofstream packet_debug_csv_;
+  std::string packet_debug_output_prefix_resolved_;
+  std::string packet_debug_csv_path_;
+  std::string packet_debug_summary_path_;
+  std::string packet_debug_histogram_path_;
+  uint64_t packet_debug_batches_captured_ = 0;
+  uint64_t packet_debug_packets_captured_ = 0;
+  uint64_t packet_debug_invalid_source_packets_ = 0;
+  std::array<uint64_t, 8> packet_debug_source_histogram_{};
+  std::array<uint64_t, 4> packet_debug_nonzero_histogram_{};
+  std::vector<uint64_t> packet_debug_column_histogram_{};
 
   std::array<cudaStream_t, num_concurrent> streams_;
   std::array<cudaEvent_t, num_concurrent> events_;

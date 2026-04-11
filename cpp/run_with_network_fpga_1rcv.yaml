@@ -57,6 +57,9 @@ receiver:
   split_boundary: false
   reorder_kernel: true
   count: 1000000 # Process some number of frames then stop
+  # packet_debug: true
+  # packet_debug_output_prefix: "/tmp/receiver_packet_debug"
+  # packet_debug_max_batches: 2
 
 processor:
   noop: true

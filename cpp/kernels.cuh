@@ -15,9 +15,24 @@
  * limitations under the License.
  */
 
+#include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda/std/complex>
+
+struct PacketDebugSummary {
+  uint16_t row_number;
+  uint16_t source_id;
+  uint16_t frame_index;
+  int16_t global_row;
+  uint16_t nonzero_count;
+  uint16_t first_nonzero_col;
+  uint16_t first_nonzero_value;
+  uint16_t second_nonzero_col;
+  uint16_t second_nonzero_value;
+  uint16_t max_value_col;
+  uint16_t max_value;
+};
 
 void populate_packets(uint8_t** gpu_bufs, uint16_t pkt_len, uint32_t num_pkts, uint16_t offset,
                       cudaStream_t stream);
@@ -29,3 +44,10 @@ void populate_packets_from_frame(uint8_t* frame_buf, uint16_t pkt_len, uint32_t 
                                  cudaStream_t stream);
 
 void gather_packets(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t payload_len, uint16_t header_len, uint32_t num_pkts, uint32_t max_rows, uint64_t base_absolute_row, cudaStream_t stream);
+
+void summarize_packets(uint8_t** src_ptrs,
+                       PacketDebugSummary* summaries,
+                       uint16_t payload_len,
+                       uint16_t header_len,
+                       uint32_t num_pkts,
+                       cudaStream_t stream);
