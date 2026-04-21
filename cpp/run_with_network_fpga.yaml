@@ -80,7 +80,7 @@ receiver0:
   gpu_direct: true
   split_boundary: false
   reorder_kernel: true
-  count: 100000 # Process some number of frames then stop
+  count: 128 # Process some number of frames then stop
   # packet_debug: true
   # packet_debug_output_prefix: "/workspace/holohub/build/stem_networking_bench/applications/stem_networking_bench/cpp/recv0_packet_debug"
   # packet_debug_max_batches: 2
@@ -93,7 +93,7 @@ receiver1:
   gpu_direct: true
   split_boundary: false
   reorder_kernel: true
-  count: 100000 # Process some number of frames then stop
+  count: 128 # Process some number of frames then stop
   # packet_debug: true
   # packet_debug_output_prefix: "/workspace/holohub/build/stem_networking_bench/applications/stem_networking_bench/cpp/recv1_packet_debug"
   # packet_debug_max_batches: 2
@@ -103,7 +103,7 @@ processor:
   # Add any parameters for your processor op here
 
 writer:
-  filepath: "/home/daquser/jrenner/sparse_frames_out_net.h5"
+  filepath: "/workspace/holohub/build/stem_networking_bench/applications/stem_networking_bench/cpp/sparse_frames_out_net.h5"
   dataset_name: "/processed"
   noop: true
 
