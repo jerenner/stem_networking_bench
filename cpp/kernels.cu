@@ -91,14 +91,13 @@ void populate_packets_from_frame(uint8_t* frame_buf, uint16_t pkt_len, uint32_t 
 }
 
 __device__ __forceinline__ int32_t source_id_to_global_row(uint32_t source_id, uint32_t row_offset) {
-  if (source_id == 0) return row_offset;
-  if (source_id == 1) return 128 + row_offset;
-  if (source_id == 2) return 256 + row_offset;
-  if (source_id == 3) return 384 + row_offset;
-  if (source_id == 4) return 1023 - row_offset;
-  if (source_id == 5) return 895 - row_offset;
-  if (source_id == 6) return 767 - row_offset;
-  if (source_id == 7) return 639 - row_offset;
+  // Layout rows from the center of the frame outward:
+  // - source IDs 0..3 fill rows 511..0 in interleaved groups of 4
+  //   ordered as (3, 2, 1, 0) when read from top to bottom.
+  // - source IDs 4..7 fill rows 512..1023 in interleaved groups of 4
+  //   ordered as (4, 5, 6, 7) when read from top to bottom.
+  if (source_id < 4) { return 511 - static_cast<int32_t>(row_offset * 4 + source_id); }
+  if (source_id < 8) { return 512 + static_cast<int32_t>(row_offset * 4 + (source_id - 4)); }
   return -1;
 }
 
