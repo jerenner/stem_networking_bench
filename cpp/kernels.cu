@@ -120,14 +120,18 @@ __global__ void gather_packets_kernel(uint8_t** src_ptrs, uint8_t* dst_base, uin
   int32_t global_row = source_id_to_global_row(source_id, row_offset);
   if (global_row < 0) return; // Ignore invalid source_id
   
-  // Calculate relative frame position
-  uint64_t base_frame = base_absolute_row / 1024;
-  int64_t diff_frames = (int64_t)frame_idx - (int64_t)(base_frame % 128);
-  
-  if (diff_frames > 64) diff_frames -= 128;
-  if (diff_frames < -64) diff_frames += 128;
-  
-  int64_t target_row_1d = diff_frames * 1024 + global_row;
+  // Map the modulo-128 frame counter into the current output batch window.
+  // The previous "nearest signed distance" logic dropped the second half of a
+  // full 128-frame tensor because frames 65..127 were wrapped to negative
+  // offsets. Here we keep a forward modulo offset from the batch start and
+  // discard only packets that lie outside the configured batch length.
+  const uint32_t base_frame_mod = static_cast<uint32_t>((base_absolute_row / 1024) % 128);
+  const uint32_t batch_frames = max_rows / 1024;
+  const uint32_t relative_frame = (frame_idx + 128 - base_frame_mod) % 128;
+
+  if (relative_frame >= batch_frames) return;
+
+  int64_t target_row_1d = static_cast<int64_t>(relative_frame) * 1024 + global_row;
 
   if (target_row_1d < 0 || target_row_1d >= max_rows) return;
 
