@@ -79,9 +79,9 @@ def generate_composite_plot(file_path, output_plot, start_frame=0, frames_to_plo
         if num_to_plot == 0:
             raise ValueError("No frames available for the requested start/count range")
 
-        cols = 2
-        rows = (num_to_plot + cols - 1) // cols
-        fig, axes = plt.subplots(rows, cols, figsize=(20, 6 * rows))
+        cols = 1
+        rows = num_to_plot
+        fig, axes = plt.subplots(rows, cols, figsize=(20, 5.5 * rows))
         axes = np.atleast_1d(axes).flatten()
 
         for local_idx in range(num_to_plot):
