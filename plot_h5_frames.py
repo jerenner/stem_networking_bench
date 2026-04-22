@@ -152,6 +152,51 @@ def export_individual_frames(
     return exported_paths
 
 
+def dump_frames_to_text(file_path, output_text, start_frame=0, frames_to_dump=4):
+    """Write selected frames to a text file with simple metadata and row data."""
+    h5py, _, np = get_plot_modules()
+    file_path = validate_input(file_path)
+    output_text = Path(output_text)
+    output_text.parent.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(file_path, "r") as f:
+        if "processed" not in f:
+            raise KeyError("'processed' dataset not found in HDF5")
+
+        data = f["processed"]
+        num_frames = data.shape[0]
+        start_frame = max(0, min(start_frame, num_frames))
+        num_to_dump = min(frames_to_dump, max(0, num_frames - start_frame))
+
+        if num_to_dump == 0:
+            raise ValueError("No frames available for the requested start/count range")
+
+        with output_text.open("w", encoding="utf-8") as out:
+            out.write(f"source_file: {file_path}\n")
+            out.write("dataset: processed\n")
+            out.write(f"dataset_shape: {tuple(data.shape)}\n")
+            out.write(f"start_frame: {start_frame}\n")
+            out.write(f"frames_dumped: {num_to_dump}\n")
+            out.write("\n")
+
+            for local_idx in range(num_to_dump):
+                frame_index = start_frame + local_idx
+                frame = data[frame_index][:]
+                out.write(f"frame_index: {frame_index}\n")
+                out.write(f"frame_shape: {tuple(frame.shape)}\n")
+                out.write(
+                    "frame_stats: "
+                    f"min={np.min(frame)}, max={np.max(frame)}, mean={float(np.mean(frame)):.6f}\n"
+                )
+                for row_idx, row in enumerate(frame):
+                    row_text = " ".join(str(value) for value in row.tolist())
+                    out.write(f"row{row_idx}: {row_text}\n")
+                if local_idx != num_to_dump - 1:
+                    out.write("\n")
+
+    print(f"Dumped {num_to_dump} frames to text file {output_text}")
+
+
 def create_zip_archive(files, zip_path):
     """Pack exported frame images into a zip file."""
     zip_path = Path(zip_path)
@@ -183,6 +228,11 @@ def main():
         "--output-dir",
         type=str,
         help="If set, export one file per frame into this directory",
+    )
+    parser.add_argument(
+        "--text-output",
+        type=str,
+        help="If set, dump selected frames as numeric rows into this text file",
     )
     parser.add_argument(
         "--zip-output",
@@ -222,7 +272,14 @@ def main():
 
     args = parser.parse_args()
 
-    if args.output_dir:
+    if args.text_output:
+        dump_frames_to_text(
+            file_path=args.file,
+            output_text=args.text_output,
+            start_frame=args.start_frame,
+            frames_to_dump=args.frames,
+        )
+    elif args.output_dir:
         exported = export_individual_frames(
             file_path=args.file,
             output_dir=args.output_dir,
