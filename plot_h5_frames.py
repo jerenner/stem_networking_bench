@@ -172,25 +172,24 @@ def dump_frames_to_text(file_path, output_text, start_frame=0, frames_to_dump=4)
             raise ValueError("No frames available for the requested start/count range")
 
         with output_text.open("w", encoding="utf-8") as out:
-            out.write(f"source_file: {file_path}\n")
-            out.write("dataset: processed\n")
-            out.write(f"dataset_shape: {tuple(data.shape)}\n")
-            out.write(f"start_frame: {start_frame}\n")
-            out.write(f"frames_dumped: {num_to_dump}\n")
-            out.write("\n")
+            out.write(f"#source_file: {file_path}\n")
+            out.write("#dataset: processed\n")
+            out.write(f"#dataset_shape: {tuple(data.shape)}\n")
+            out.write(f"#start_frame: {start_frame}\n")
+            out.write(f"#frames_dumped: {num_to_dump}\n")
 
             for local_idx in range(num_to_dump):
                 frame_index = start_frame + local_idx
                 frame = data[frame_index][:]
-                out.write(f"frame_index: {frame_index}\n")
-                out.write(f"frame_shape: {tuple(frame.shape)}\n")
+                out.write(f"#frame_index: {frame_index}\n")
+                out.write(f"#frame_shape: {tuple(frame.shape)}\n")
                 out.write(
-                    "frame_stats: "
+                    "#frame_stats: "
                     f"min={np.min(frame)}, max={np.max(frame)}, mean={float(np.mean(frame)):.6f}\n"
                 )
                 for row_idx, row in enumerate(frame):
                     row_text = " ".join(str(value) for value in row.tolist())
-                    out.write(f"row{row_idx}: {row_text}\n")
+                    out.write(f"{row_text}\n")
                 if local_idx != num_to_dump - 1:
                     out.write("\n")
 
