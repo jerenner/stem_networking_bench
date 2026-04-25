@@ -153,6 +153,81 @@ void gather_packets(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t payload_len,
   gather_packets_kernel<<<num_pkts, 256, 0, stream>>>(src_ptrs, dst_base, payload_len, header_len, num_pkts, max_rows, base_absolute_row);
 }
 
+__global__ void extract_packet_headers_kernel(uint8_t** src_ptrs,
+                                              PacketHeaderInfo* headers,
+                                              uint32_t num_pkts) {
+  const uint32_t pkt_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pkt_idx >= num_pkts) return;
+
+  PacketHeaderInfo header{};
+  header.source_id = 0xFFFF;
+  header.global_row = -1;
+
+  uint8_t* src = src_ptrs[pkt_idx];
+  if (src != nullptr) {
+    header.row_number = ((uint16_t)src[5] << 8) | (uint16_t)src[4];
+    header.source_id = ((uint16_t)src[7] << 8) | (uint16_t)src[6];
+    header.frame_index = header.row_number / 128;
+    header.row_offset = header.row_number % 128;
+    header.global_row = static_cast<int16_t>(
+        source_id_to_global_row(header.source_id, header.row_offset));
+  }
+
+  headers[pkt_idx] = header;
+}
+
+void extract_packet_headers(uint8_t** src_ptrs,
+                            PacketHeaderInfo* headers,
+                            uint32_t num_pkts,
+                            cudaStream_t stream) {
+  const uint32_t threads = 256;
+  const uint32_t blocks = (num_pkts + threads - 1) / threads;
+  extract_packet_headers_kernel<<<blocks, threads, 0, stream>>>(src_ptrs, headers, num_pkts);
+}
+
+__global__ void gather_packets_by_placement_kernel(uint8_t** src_ptrs,
+                                                   const PacketPlacement* placements,
+                                                   uint8_t* dst_base,
+                                                   uint16_t payload_len,
+                                                   uint16_t header_len,
+                                                   uint32_t num_pkts,
+                                                   uint32_t max_rows) {
+  const uint32_t pkt_idx = blockIdx.x;
+  if (pkt_idx >= num_pkts) return;
+
+  const PacketPlacement placement = placements[pkt_idx];
+  if (!placement.valid || placement.global_row < 0) return;
+
+  const int64_t target_row_1d =
+      static_cast<int64_t>(placement.relative_frame) * 1024 + placement.global_row;
+  if (target_row_1d < 0 || target_row_1d >= max_rows) return;
+
+  uint8_t* src = src_ptrs[pkt_idx];
+  if (src == nullptr) return;
+
+  uint8_t* payload_src = src + header_len;
+  uint8_t* dst = dst_base + target_row_1d * payload_len;
+
+  const uint16_t* src16 = reinterpret_cast<const uint16_t*>(payload_src);
+  uint16_t* dst16 = reinterpret_cast<uint16_t*>(dst);
+  const int unroll_len = payload_len / sizeof(uint16_t);
+  for (int i = threadIdx.x; i < unroll_len; i += blockDim.x) {
+    dst16[i] = src16[i];
+  }
+}
+
+void gather_packets_by_placement(uint8_t** src_ptrs,
+                                 const PacketPlacement* placements,
+                                 uint8_t* dst_base,
+                                 uint16_t payload_len,
+                                 uint16_t header_len,
+                                 uint32_t num_pkts,
+                                 uint32_t max_rows,
+                                 cudaStream_t stream) {
+  gather_packets_by_placement_kernel<<<num_pkts, 256, 0, stream>>>(
+      src_ptrs, placements, dst_base, payload_len, header_len, num_pkts, max_rows);
+}
+
 __global__ void summarize_packets_kernel(uint8_t** src_ptrs,
                                          PacketDebugSummary* summaries,
                                          uint16_t payload_len,

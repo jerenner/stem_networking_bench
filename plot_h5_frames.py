@@ -48,7 +48,7 @@ def plot_single_frame(frame, frame_index, output_path, dpi=150):
         frame,
         cmap="magma",
         aspect="auto",
-        interpolation="nearest",
+        interpolation="none",
         vmin=vmin,
         vmax=vmax,
     )
@@ -92,7 +92,7 @@ def generate_composite_plot(file_path, output_plot, start_frame=0, frames_to_plo
                 frame,
                 cmap="magma",
                 aspect="auto",
-                interpolation="nearest",
+                interpolation="none",
                 vmin=vmin,
                 vmax=vmax,
             )
@@ -117,7 +117,7 @@ def export_individual_frames(
     output_dir,
     start_frame=0,
     frames_to_plot=4,
-    image_format="png",
+    image_format="tiff",
     dpi=150,
     prefix="frame",
 ):
@@ -252,8 +252,8 @@ def main():
     )
     parser.add_argument(
         "--format",
-        choices=("png", "pdf"),
-        default="png",
+        choices=("png", "pdf", "tiff"),
+        default="tiff",
         help="Image format for individual frame export",
     )
     parser.add_argument(

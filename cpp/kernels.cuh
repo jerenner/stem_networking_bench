@@ -34,6 +34,20 @@ struct PacketDebugSummary {
   uint16_t max_value;
 };
 
+struct PacketHeaderInfo {
+  uint16_t row_number;
+  uint16_t source_id;
+  uint16_t frame_index;
+  uint16_t row_offset;
+  int16_t global_row;
+};
+
+struct PacketPlacement {
+  uint16_t relative_frame;
+  int16_t global_row;
+  uint16_t valid;
+};
+
 void populate_packets(uint8_t** gpu_bufs, uint16_t pkt_len, uint32_t num_pkts, uint16_t offset,
                       cudaStream_t stream);
 
@@ -44,6 +58,20 @@ void populate_packets_from_frame(uint8_t* frame_buf, uint16_t pkt_len, uint32_t 
                                  cudaStream_t stream);
 
 void gather_packets(uint8_t** src_ptrs, uint8_t* dst_base, uint16_t payload_len, uint16_t header_len, uint32_t num_pkts, uint32_t max_rows, uint64_t base_absolute_row, cudaStream_t stream);
+
+void extract_packet_headers(uint8_t** src_ptrs,
+                            PacketHeaderInfo* headers,
+                            uint32_t num_pkts,
+                            cudaStream_t stream);
+
+void gather_packets_by_placement(uint8_t** src_ptrs,
+                                 const PacketPlacement* placements,
+                                 uint8_t* dst_base,
+                                 uint16_t payload_len,
+                                 uint16_t header_len,
+                                 uint32_t num_pkts,
+                                 uint32_t max_rows,
+                                 cudaStream_t stream);
 
 void summarize_packets(uint8_t** src_ptrs,
                        PacketDebugSummary* summaries,

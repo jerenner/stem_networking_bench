@@ -80,6 +80,7 @@ receiver0:
   gpu_direct: true
   split_boundary: false
   reorder_kernel: true
+  batch_close_slack_packets: 512
   count: 128 # Process some number of frames then stop
   # packet_debug: true
   # packet_debug_output_prefix: "/workspace/holohub/build/stem_networking_bench/applications/stem_networking_bench/cpp/recv0_packet_debug"
@@ -93,6 +94,7 @@ receiver1:
   gpu_direct: true
   split_boundary: false
   reorder_kernel: true
+  batch_close_slack_packets: 512
   count: 128 # Process some number of frames then stop
   # packet_debug: true
   # packet_debug_output_prefix: "/workspace/holohub/build/stem_networking_bench/applications/stem_networking_bench/cpp/recv1_packet_debug"

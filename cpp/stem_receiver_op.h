@@ -29,11 +29,15 @@
 #include <array>
 #include <arpa/inet.h>
 #include <assert.h>
+#include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <cstring>
 #include <queue>
 #include <string>
+#include <unordered_set>
 #include <sys/time.h>
 #include <vector>
 
@@ -80,6 +84,34 @@ class StemReceiverOp : public Operator {
     std::array<BurstParams*, MAX_BURSTS_PER_BATCH> bursts;
     int num_bursts;
     cudaEvent_t evt;
+  };
+
+  struct BurstHolder {
+    explicit BurstHolder(BurstParams* burst_in) : burst(burst_in) {}
+    ~BurstHolder() {
+      if (burst) { free_all_packets_and_burst_rx(burst); }
+    }
+
+    BurstHolder(const BurstHolder&) = delete;
+    BurstHolder& operator=(const BurstHolder&) = delete;
+
+    BurstParams* burst = nullptr;
+  };
+
+  struct PacketEntry {
+    void* packet_ptr = nullptr;
+    uint64_t abs_frame = 0;
+    int16_t global_row = -1;
+    uint16_t row_number = 0;
+    uint16_t source_id = 0;
+    std::shared_ptr<BurstHolder> holder;
+  };
+
+  struct AssembledBatch {
+    std::vector<std::shared_ptr<BurstHolder>> holders;
+    cudaEvent_t evt = nullptr;
+    uint32_t packets_used = 0;
+    uint32_t missing_packets = 0;
   };
 
   StemReceiverOp() = default;
@@ -131,14 +163,39 @@ class StemReceiverOp : public Operator {
       } else {
         CUDA_TRY(cudaMallocHost((void**)&h_dev_ptrs_[n], sizeof(void*) * rows_per_tensor_));
         CUDA_TRY(cudaMalloc(&d_dev_ptrs_[n], sizeof(void*) * rows_per_tensor_));
+        CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&h_packet_placements_[n]),
+                                sizeof(PacketPlacement) * rows_per_tensor_));
+        CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_packet_placements_[n]),
+                            sizeof(PacketPlacement) * rows_per_tensor_));
       }
       cudaStreamCreate(&streams_[n]);
       cudaEventCreate(&events_[n]);
     }
 
+    if (gpu_direct_.get()) {
+      CUDA_TRY(cudaMallocHost((void**)&h_header_dev_ptrs_, sizeof(void*) * rows_per_tensor_));
+      CUDA_TRY(cudaMalloc(&d_header_dev_ptrs_, sizeof(void*) * rows_per_tensor_));
+      CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&packet_headers_h_),
+                              sizeof(PacketHeaderInfo) * rows_per_tensor_));
+      CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&packet_headers_d_),
+                          sizeof(PacketHeaderInfo) * rows_per_tensor_));
+      cudaStreamCreate(&header_stream_);
+    }
+
+    current_batch_occupied_.assign(rows_per_tensor_, 0);
+
     if (hds_.get()) { assert(gpu_direct_.get()); }
 
     initialize_packet_debug();
+
+    if (use_assembled_batching()) {
+      HOLOSCAN_LOG_INFO(
+          "StemReceiverOp::initialize() using header-aware batch assembly with {} slack packets.",
+          batch_close_slack_packets_.get());
+    } else {
+      HOLOSCAN_LOG_INFO(
+          "StemReceiverOp::initialize() using legacy arrival-count batching for this configuration.");
+    }
 
     HOLOSCAN_LOG_INFO("StemReceiverOp::initialize() complete. Batching {} frames ({} rows) per tensor.", frames_per_tensor_.get(), rows_per_tensor_);
   }
@@ -146,14 +203,26 @@ class StemReceiverOp : public Operator {
   void freeResources() {
     HOLOSCAN_LOG_INFO("StemReceiverOp::freeResources() start");
     cleanup_packet_debug();
+    while (!assembled_batch_q_.empty()) {
+      if (assembled_batch_q_.front().evt) { cudaEventSynchronize(assembled_batch_q_.front().evt); }
+      assembled_batch_q_.pop();
+    }
+    pending_packets_.clear();
     for (int n = 0; n < num_concurrent; n++) {
       if (full_batch_data_d_[n]) { cudaFree(full_batch_data_d_[n]); }
       if (full_batch_data_h_[n]) { cudaFreeHost(full_batch_data_h_[n]); }
       if (h_dev_ptrs_[n]) { cudaFreeHost(h_dev_ptrs_[n]); }
       if (d_dev_ptrs_[n]) { cudaFree(d_dev_ptrs_[n]); }
+      if (h_packet_placements_[n]) { cudaFreeHost(h_packet_placements_[n]); }
+      if (d_packet_placements_[n]) { cudaFree(d_packet_placements_[n]); }
       if (streams_[n]) { cudaStreamDestroy(streams_[n]); }
       if (events_[n]) { cudaEventDestroy(events_[n]); }
     }
+    if (h_header_dev_ptrs_) { cudaFreeHost(h_header_dev_ptrs_); }
+    if (d_header_dev_ptrs_) { cudaFree(d_header_dev_ptrs_); }
+    if (packet_headers_h_) { cudaFreeHost(packet_headers_h_); }
+    if (packet_headers_d_) { cudaFree(packet_headers_d_); }
+    if (header_stream_) { cudaStreamDestroy(header_stream_); }
   }
 
   void setup(OperatorSpec& spec) override {
@@ -188,6 +257,11 @@ class StemReceiverOp : public Operator {
                          "Packet Debug Max Batches",
                          "Maximum number of full tensors to summarize. 0 means unlimited.",
                          0U);
+    spec.param<uint32_t>(batch_close_slack_packets_,
+                         "batch_close_slack_packets",
+                         "Batch Close Slack Packets",
+                         "Future-batch packet count used to close a partially missing batch.",
+                         512U);
     spec.param<std::shared_ptr<holoscan::BooleanCondition>>(stop_condition_,
                                                             "stop_condition",
                                                             "Stop Condition",
@@ -356,8 +430,15 @@ class StemReceiverOp : public Operator {
     return (value == std::numeric_limits<uint16_t>::max()) ? -1 : static_cast<int>(value);
   }
 
-  void capture_packet_debug_batch(int slot_idx) {
+  void capture_packet_debug_batch(int slot_idx, uint32_t num_packets) {
     if (!should_capture_packet_debug()) { return; }
+    if (num_packets == 0) { return; }
+    if (num_packets > packet_debug_summary_capacity_) {
+      HOLOSCAN_LOG_WARN("Packet debug requested {} summaries but capacity is {}. Skipping batch.",
+                        num_packets,
+                        packet_debug_summary_capacity_);
+      return;
+    }
 
     profiling::ScopedRange debug_range("receiver/packet-debug-summary", profiling::color::kCompute);
 
@@ -365,16 +446,16 @@ class StemReceiverOp : public Operator {
                       packet_debug_summaries_d_,
                       nom_payload_size_,
                       custom_header_size_,
-                      rows_per_tensor_,
+                      num_packets,
                       streams_[slot_idx]);
     CUDA_TRY(cudaMemcpyAsync(packet_debug_summaries_h_,
                              packet_debug_summaries_d_,
-                             sizeof(PacketDebugSummary) * rows_per_tensor_,
+                             sizeof(PacketDebugSummary) * num_packets,
                              cudaMemcpyDeviceToHost,
                              streams_[slot_idx]));
     CUDA_TRY(cudaStreamSynchronize(streams_[slot_idx]));
 
-    for (uint32_t packet_idx = 0; packet_idx < rows_per_tensor_; ++packet_idx) {
+    for (uint32_t packet_idx = 0; packet_idx < num_packets; ++packet_idx) {
       const auto& summary = packet_debug_summaries_h_[packet_idx];
 
       packet_debug_packets_captured_++;
@@ -416,7 +497,7 @@ class StemReceiverOp : public Operator {
         "Packet debug captured batch {} for {} ({} packet summaries written to '{}').",
         packet_debug_batches_captured_,
         name(),
-        rows_per_tensor_,
+        num_packets,
         packet_debug_csv_path_);
     if (packet_debug_max_batches_.get() > 0 &&
         packet_debug_batches_captured_ >= packet_debug_max_batches_.get()) {
@@ -426,8 +507,360 @@ class StemReceiverOp : public Operator {
     }
   }
 
+  void capture_packet_debug_batch(int slot_idx) {
+    capture_packet_debug_batch(slot_idx, rows_per_tensor_);
+  }
+
+  bool use_assembled_batching() const {
+    return gpu_direct_.get() && reorder_kernel_.get() && !hds_.get();
+  }
+
+  void free_processed_assembled_batches() {
+    while (!assembled_batch_q_.empty()) {
+      auto& batch = assembled_batch_q_.front();
+      if (cudaEventQuery(batch.evt) == cudaSuccess) {
+        assembled_batch_q_.pop();
+      } else {
+        break;
+      }
+    }
+  }
+
+  static int32_t source_id_to_global_row_host(uint32_t source_id, uint32_t row_offset) {
+    if (source_id < 4) { return 511 - static_cast<int32_t>(row_offset * 4 + source_id); }
+    if (source_id < 8) { return 512 + static_cast<int32_t>(row_offset * 4 + (source_id - 4)); }
+    return -1;
+  }
+
+  int64_t unwrap_frame_index(uint32_t frame_idx) {
+    const int64_t ref_cycle = static_cast<int64_t>(frame_unwrap_ref_ / 128);
+    int64_t best_frame = static_cast<int64_t>(frame_idx) + ref_cycle * 128;
+    int64_t best_dist = std::llabs(best_frame - static_cast<int64_t>(frame_unwrap_ref_));
+
+    for (int64_t delta = -1; delta <= 1; ++delta) {
+      const int64_t cycle = ref_cycle + delta;
+      const int64_t candidate = static_cast<int64_t>(frame_idx) + cycle * 128;
+      const int64_t dist = std::llabs(candidate - static_cast<int64_t>(frame_unwrap_ref_));
+      if (dist < best_dist || (dist == best_dist && candidate <= static_cast<int64_t>(frame_unwrap_ref_))) {
+        best_frame = candidate;
+        best_dist = dist;
+      }
+    }
+
+    if (best_frame >= 0 && best_frame > static_cast<int64_t>(frame_unwrap_ref_)) {
+      frame_unwrap_ref_ = static_cast<uint64_t>(best_frame);
+    }
+
+    return best_frame;
+  }
+
+  void rebuild_current_batch_state() {
+    std::fill(current_batch_occupied_.begin(), current_batch_occupied_.end(), 0);
+    current_batch_unique_packets_ = 0;
+    future_packet_count_ = 0;
+
+    const uint64_t batch_end = current_batch_start_abs_frame_ + frames_per_tensor_.get();
+    for (const auto& entry : pending_packets_) {
+      if (entry.abs_frame < current_batch_start_abs_frame_) { continue; }
+      if (entry.abs_frame >= batch_end) {
+        future_packet_count_++;
+        continue;
+      }
+
+      const uint64_t relative_frame = entry.abs_frame - current_batch_start_abs_frame_;
+      const uint64_t cell = relative_frame * FRAME_HEIGHT + static_cast<uint64_t>(entry.global_row);
+      if (cell < current_batch_occupied_.size() && !current_batch_occupied_[cell]) {
+        current_batch_occupied_[cell] = 1;
+        current_batch_unique_packets_++;
+      }
+    }
+  }
+
+  void add_pending_packet(void* packet_ptr,
+                          const PacketHeaderInfo& header,
+                          std::shared_ptr<BurstHolder> holder) {
+    if (header.source_id >= 8 || header.global_row < 0) {
+      ttl_packets_dropped_++;
+      return;
+    }
+
+    if (!stream_synced_) {
+      if (header.row_number != 0) {
+        ttl_packets_dropped_++;
+        return;
+      }
+
+      stream_synced_ = true;
+      frame_unwrap_ref_ = 0;
+      current_batch_start_abs_frame_ = 0;
+      HOLOSCAN_LOG_INFO(
+          "StemReceiverOp {} synchronized stream on row_number=0, source_id={}.",
+          name(),
+          header.source_id);
+    }
+
+    const int64_t abs_frame_signed = unwrap_frame_index(header.frame_index);
+    if (abs_frame_signed < 0 ||
+        static_cast<uint64_t>(abs_frame_signed) < current_batch_start_abs_frame_) {
+      ttl_packets_dropped_++;
+      return;
+    }
+    const uint64_t abs_frame = static_cast<uint64_t>(abs_frame_signed);
+
+    PacketEntry entry;
+    entry.packet_ptr = packet_ptr;
+    entry.abs_frame = abs_frame;
+    entry.global_row = header.global_row;
+    entry.row_number = header.row_number;
+    entry.source_id = header.source_id;
+    entry.holder = std::move(holder);
+    pending_packets_.push_back(std::move(entry));
+
+    const uint64_t batch_end = current_batch_start_abs_frame_ + frames_per_tensor_.get();
+    if (abs_frame >= batch_end) {
+      future_packet_count_++;
+      return;
+    }
+
+    const uint64_t relative_frame = abs_frame - current_batch_start_abs_frame_;
+    const uint64_t cell = relative_frame * FRAME_HEIGHT + static_cast<uint64_t>(header.global_row);
+    if (cell < current_batch_occupied_.size() && !current_batch_occupied_[cell]) {
+      current_batch_occupied_[cell] = 1;
+      current_batch_unique_packets_++;
+    }
+  }
+
+  bool should_close_current_assembled_batch() const {
+    if (!stream_synced_) { return false; }
+    if (current_batch_unique_packets_ >= rows_per_tensor_) { return true; }
+    return current_batch_unique_packets_ > 0 &&
+           future_packet_count_ >= batch_close_slack_packets_.get();
+  }
+
+  bool emit_current_assembled_batch(OutputContext& op_output, ExecutionContext& context) {
+    profiling::ScopedRange emit_batch_range("receiver/emit-assembled-batch", profiling::color::kReceiver);
+
+    free_processed_assembled_batches();
+    if (assembled_batch_q_.size() >= num_concurrent) {
+      HOLOSCAN_LOG_ERROR("Fell behind. All assembled batch buffers queued; holding pending packets.");
+      return false;
+    }
+
+    const uint64_t batch_end = current_batch_start_abs_frame_ + frames_per_tensor_.get();
+    std::vector<uint8_t> emitted_cells(rows_per_tensor_, 0);
+    std::unordered_set<BurstHolder*> holder_seen;
+    std::vector<std::shared_ptr<BurstHolder>> batch_holders;
+
+    uint32_t packets_to_gather = 0;
+    for (const auto& entry : pending_packets_) {
+      if (entry.abs_frame < current_batch_start_abs_frame_ || entry.abs_frame >= batch_end) {
+        continue;
+      }
+
+      const uint64_t relative_frame = entry.abs_frame - current_batch_start_abs_frame_;
+      const uint64_t cell = relative_frame * FRAME_HEIGHT + static_cast<uint64_t>(entry.global_row);
+      if (cell >= emitted_cells.size() || emitted_cells[cell]) { continue; }
+
+      emitted_cells[cell] = 1;
+      h_dev_ptrs_[assembled_cur_batch_idx_][packets_to_gather] = entry.packet_ptr;
+      h_packet_placements_[assembled_cur_batch_idx_][packets_to_gather] = PacketPlacement{
+          static_cast<uint16_t>(relative_frame), entry.global_row, 1};
+
+      if (entry.holder && holder_seen.insert(entry.holder.get()).second) {
+        batch_holders.push_back(entry.holder);
+      }
+      packets_to_gather++;
+    }
+
+    const uint32_t missing_packets = rows_per_tensor_ - packets_to_gather;
+    if (missing_packets > 0) {
+      HOLOSCAN_LOG_WARN(
+          "Emitting incomplete batch starting at absolute frame {}: {} / {} rows present, {} missing.",
+          current_batch_start_abs_frame_,
+          packets_to_gather,
+          rows_per_tensor_,
+          missing_packets);
+    }
+
+    CUDA_TRY(cudaMemsetAsync(full_batch_data_d_[assembled_cur_batch_idx_],
+                             0,
+                             rows_per_tensor_ * nom_payload_size_,
+                             streams_[assembled_cur_batch_idx_]));
+
+    if (packets_to_gather > 0) {
+      {
+        profiling::ScopedRange ptr_copy_range("receiver/pointer-list-h2d", profiling::color::kCopy);
+        CUDA_TRY(cudaMemcpyAsync(d_dev_ptrs_[assembled_cur_batch_idx_],
+                                 h_dev_ptrs_[assembled_cur_batch_idx_],
+                                 sizeof(void*) * packets_to_gather,
+                                 cudaMemcpyHostToDevice,
+                                 streams_[assembled_cur_batch_idx_]));
+        CUDA_TRY(cudaMemcpyAsync(d_packet_placements_[assembled_cur_batch_idx_],
+                                 h_packet_placements_[assembled_cur_batch_idx_],
+                                 sizeof(PacketPlacement) * packets_to_gather,
+                                 cudaMemcpyHostToDevice,
+                                 streams_[assembled_cur_batch_idx_]));
+      }
+
+      if (should_capture_packet_debug()) {
+        capture_packet_debug_batch(assembled_cur_batch_idx_, packets_to_gather);
+      }
+
+      {
+        profiling::ScopedRange gather_range("receiver/gather-packets", profiling::color::kCompute);
+        gather_packets_by_placement(reinterpret_cast<uint8_t**>(d_dev_ptrs_[assembled_cur_batch_idx_]),
+                                    d_packet_placements_[assembled_cur_batch_idx_],
+                                    static_cast<uint8_t*>(full_batch_data_d_[assembled_cur_batch_idx_]),
+                                    nom_payload_size_,
+                                    custom_header_size_,
+                                    packets_to_gather,
+                                    rows_per_tensor_,
+                                    streams_[assembled_cur_batch_idx_]);
+      }
+    }
+
+    auto gxf_tensor = std::make_shared<nvidia::gxf::Tensor>();
+    auto allocator_handle =
+        nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(context.context(), allocator_->gxf_cid());
+
+    auto result = gxf_tensor->reshape<uint16_t>(
+        nvidia::gxf::Shape{static_cast<int>(frames_per_tensor_.get()), FRAME_HEIGHT, FRAME_WIDTH},
+        nvidia::gxf::MemoryStorageType::kDevice,
+        allocator_handle.value());
+    if (!result) { throw std::runtime_error("Failed to reshape output tensor"); }
+
+    {
+      profiling::ScopedRange tensor_copy_range("receiver/batch-d2d-copy", profiling::color::kCopy);
+      HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(gxf_tensor->pointer(),
+                                         full_batch_data_d_[assembled_cur_batch_idx_],
+                                         gxf_tensor->bytes_size(),
+                                         cudaMemcpyDeviceToDevice,
+                                         streams_[assembled_cur_batch_idx_]));
+    }
+
+    auto maybedl = gxf_tensor->toDLManagedTensorContext();
+    auto holoscan_tensor = std::make_shared<Tensor>(maybedl.value());
+
+    TensorMap out_message;
+    out_message.insert({"frame", holoscan_tensor});
+    {
+      profiling::ScopedRange emit_range("receiver/emit", profiling::color::kIo);
+      op_output.emit(out_message, "output");
+    }
+
+    cudaEventRecord(events_[assembled_cur_batch_idx_], streams_[assembled_cur_batch_idx_]);
+    assembled_batch_q_.push(AssembledBatch{
+        std::move(batch_holders), events_[assembled_cur_batch_idx_], packets_to_gather, missing_packets});
+
+    pending_packets_.erase(
+        std::remove_if(pending_packets_.begin(),
+                       pending_packets_.end(),
+                       [batch_end](const PacketEntry& entry) { return entry.abs_frame < batch_end; }),
+        pending_packets_.end());
+
+    total_frames_emitted_ += frames_per_tensor_.get();
+    current_batch_start_abs_frame_ += frames_per_tensor_.get();
+    assembled_cur_batch_idx_ = (++assembled_cur_batch_idx_ % num_concurrent);
+    rebuild_current_batch_state();
+
+    if (count_.get() > 0 && total_frames_emitted_ >= count_.get()) {
+      HOLOSCAN_LOG_INFO("StemReceiverOp: Reached frame limit of {}", count_.get());
+      is_done_ = true;
+      stop_condition_.get()->disable_tick();
+    }
+
+    return true;
+  }
+
+  void try_emit_assembled_batches(OutputContext& op_output, ExecutionContext& context) {
+    while (!is_done_ && should_close_current_assembled_batch()) {
+      if (!emit_current_assembled_batch(op_output, context)) { break; }
+    }
+  }
+
+  void process_assembled_burst(BurstParams* burst,
+                               OutputContext& op_output,
+                               ExecutionContext& context) {
+    const auto burst_size = static_cast<uint32_t>(get_num_packets(burst));
+    if (burst_size == 0) {
+      free_all_packets_and_burst_rx(burst);
+      return;
+    }
+    if (burst_size > rows_per_tensor_) {
+      HOLOSCAN_LOG_ERROR("Burst has {} packets but header extraction capacity is {}. Dropping burst.",
+                         burst_size,
+                         rows_per_tensor_);
+      ttl_packets_dropped_ += burst_size;
+      free_all_packets_and_burst_rx(burst);
+      return;
+    }
+
+    auto holder = std::make_shared<BurstHolder>(burst);
+    for (uint32_t pkt_idx = 0; pkt_idx < burst_size; ++pkt_idx) {
+      h_header_dev_ptrs_[pkt_idx] =
+          reinterpret_cast<uint8_t*>(get_segment_packet_ptr(burst, 0, pkt_idx)) + header_size_.get();
+    }
+
+    {
+      profiling::ScopedRange header_range("receiver/extract-packet-headers", profiling::color::kCompute);
+      CUDA_TRY(cudaMemcpyAsync(d_header_dev_ptrs_,
+                               h_header_dev_ptrs_,
+                               sizeof(void*) * burst_size,
+                               cudaMemcpyHostToDevice,
+                               header_stream_));
+      extract_packet_headers(reinterpret_cast<uint8_t**>(d_header_dev_ptrs_),
+                             packet_headers_d_,
+                             burst_size,
+                             header_stream_);
+      CUDA_TRY(cudaMemcpyAsync(packet_headers_h_,
+                               packet_headers_d_,
+                               sizeof(PacketHeaderInfo) * burst_size,
+                               cudaMemcpyDeviceToHost,
+                               header_stream_));
+      CUDA_TRY(cudaStreamSynchronize(header_stream_));
+    }
+
+    for (uint32_t pkt_idx = 0; pkt_idx < burst_size; ++pkt_idx) {
+      add_pending_packet(h_header_dev_ptrs_[pkt_idx], packet_headers_h_[pkt_idx], holder);
+    }
+
+    try_emit_assembled_batches(op_output, context);
+  }
+
+  void compute_assembled(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) {
+    (void)op_input;
+
+    {
+      profiling::ScopedRange reclaim_range("receiver/reclaim-completed", profiling::color::kIo);
+      free_processed_assembled_batches();
+    }
+
+    if (is_done_) return;
+
+    BurstParams* burst = nullptr;
+    const auto num_rx_queues = get_num_rx_queues(port_id_);
+    for (int q = 0; q < num_rx_queues; q++) {
+      auto status = Status::SUCCESS;
+      {
+        profiling::ScopedRange rx_burst_range("receiver/get-rx-burst", profiling::color::kIo);
+        status = get_rx_burst(&burst, port_id_, q);
+      }
+      if (status != Status::SUCCESS) { continue; }
+
+      const auto burst_size = get_num_packets(burst);
+      ttl_pkts_recv_ += burst_size;
+      process_assembled_burst(burst, op_output, context);
+      if (is_done_) { return; }
+    }
+  }
+
   void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override {
     profiling::ScopedRange compute_range("receiver/compute", profiling::color::kReceiver);
+
+    if (use_assembled_batching()) {
+      compute_assembled(op_input, op_output, context);
+      return;
+    }
 
     // If we processed a batch of packets in a previous compute call, that was done asynchronously,
     // and we'll need to free the packets eventually so the NIC can have space for the next bursts.
@@ -656,6 +1089,7 @@ class StemReceiverOp : public Operator {
   Parameter<bool> packet_debug_;
   Parameter<std::string> packet_debug_output_prefix_;
   Parameter<uint32_t> packet_debug_max_batches_;
+  Parameter<uint32_t> batch_close_slack_packets_;
   Parameter<std::shared_ptr<holoscan::BooleanCondition>> stop_condition_;
   Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
 
@@ -676,6 +1110,24 @@ class StemReceiverOp : public Operator {
   std::array<uint64_t, 8> packet_debug_source_histogram_{};
   std::array<uint64_t, 4> packet_debug_nonzero_histogram_{};
   std::vector<uint64_t> packet_debug_column_histogram_{};
+
+  std::deque<PacketEntry> pending_packets_;
+  std::queue<AssembledBatch> assembled_batch_q_;
+  std::vector<uint8_t> current_batch_occupied_;
+  uint64_t current_batch_start_abs_frame_ = 0;
+  uint64_t frame_unwrap_ref_ = 0;
+  uint32_t current_batch_unique_packets_ = 0;
+  uint32_t future_packet_count_ = 0;
+  int assembled_cur_batch_idx_ = 0;
+  bool stream_synced_ = false;
+
+  void** h_header_dev_ptrs_ = nullptr;
+  void* d_header_dev_ptrs_ = nullptr;
+  PacketHeaderInfo* packet_headers_h_ = nullptr;
+  PacketHeaderInfo* packet_headers_d_ = nullptr;
+  cudaStream_t header_stream_ = nullptr;
+  std::array<PacketPlacement*, num_concurrent> h_packet_placements_{};
+  std::array<PacketPlacement*, num_concurrent> d_packet_placements_{};
 
   std::array<cudaStream_t, num_concurrent> streams_;
   std::array<cudaEvent_t, num_concurrent> events_;
