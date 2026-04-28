@@ -77,6 +77,7 @@ class StemReceiverOp : public Operator {
  public:
   static constexpr int num_concurrent = 4;
   static constexpr int MAX_BURSTS_PER_BATCH = 5000;
+  static constexpr uint32_t ROWS_PER_SOURCE = 128;
 
   HOLOSCAN_OPERATOR_FORWARD_ARGS(StemReceiverOp)
 
@@ -117,8 +118,13 @@ class StemReceiverOp : public Operator {
   StemReceiverOp() = default;
 
   ~StemReceiverOp() {
-    HOLOSCAN_LOG_INFO("Finished receiver with {}/{} bytes/packets received and {} packets dropped",
-                      ttl_bytes_recv_, ttl_pkts_recv_, ttl_packets_dropped_);
+    HOLOSCAN_LOG_INFO(
+        "Finished receiver with {}/{} bytes/packets received, {} packets dropped, and {} packets "
+        "ignored from unexpected source IDs",
+        ttl_bytes_recv_,
+        ttl_pkts_recv_,
+        ttl_packets_dropped_,
+        ttl_packets_ignored_unexpected_source_);
     flush_packet_debug_outputs();
     HOLOSCAN_LOG_INFO("StemReceiverOp shutting down");
     freeResources();
@@ -154,6 +160,13 @@ class StemReceiverOp : public Operator {
 
     // Derived from user params
     rows_per_tensor_ = frames_per_tensor_.get() * FRAME_HEIGHT; // FRAME_HEIGHT rows per frame
+    expected_source_mask_value_ = expected_source_mask_.get() & 0xFFU;
+    expected_source_count_ = count_sources_in_mask(expected_source_mask_value_);
+    if (expected_source_count_ == 0) {
+      HOLOSCAN_LOG_ERROR("expected_source_mask must include at least one source ID.");
+      exit(1);
+    }
+    expected_rows_per_tensor_ = frames_per_tensor_.get() * expected_source_count_ * ROWS_PER_SOURCE;
 
     for (int n = 0; n < num_concurrent; n++) {
       CUDA_TRY(cudaMalloc(&full_batch_data_d_[n], rows_per_tensor_ * nom_payload_size_));
@@ -190,8 +203,12 @@ class StemReceiverOp : public Operator {
 
     if (use_assembled_batching()) {
       HOLOSCAN_LOG_INFO(
-          "StemReceiverOp::initialize() using header-aware batch assembly with {} slack packets.",
-          batch_close_slack_packets_.get());
+          "StemReceiverOp::initialize() using header-aware batch assembly with {} slack packets, "
+          "expected source mask 0x{:02x} ({} sources, {} expected rows/tensor).",
+          batch_close_slack_packets_.get(),
+          expected_source_mask_value_,
+          expected_source_count_,
+          expected_rows_per_tensor_);
     } else {
       HOLOSCAN_LOG_INFO(
           "StemReceiverOp::initialize() using legacy arrival-count batching for this configuration.");
@@ -262,6 +279,11 @@ class StemReceiverOp : public Operator {
                          "Batch Close Slack Packets",
                          "Future-batch packet count used to close a partially missing batch.",
                          512U);
+    spec.param<uint32_t>(expected_source_mask_,
+                         "expected_source_mask",
+                         "Expected Source Mask",
+                         "Bit mask of eth source IDs expected to contribute rows. Default 255 expects IDs 0-7.",
+                         0xFFU);
     spec.param<std::shared_ptr<holoscan::BooleanCondition>>(stop_condition_,
                                                             "stop_condition",
                                                             "Stop Condition",
@@ -515,6 +537,19 @@ class StemReceiverOp : public Operator {
     return gpu_direct_.get() && reorder_kernel_.get() && !hds_.get();
   }
 
+  static uint32_t count_sources_in_mask(uint32_t source_mask) {
+    uint32_t count = 0;
+    source_mask &= 0xFFU;
+    for (uint32_t source_id = 0; source_id < 8; ++source_id) {
+      if ((source_mask & (1U << source_id)) != 0U) { count++; }
+    }
+    return count;
+  }
+
+  bool source_expected(uint16_t source_id) const {
+    return source_id < 8 && (expected_source_mask_value_ & (1U << source_id)) != 0U;
+  }
+
   void free_processed_assembled_batches() {
     while (!assembled_batch_q_.empty()) {
       auto& batch = assembled_batch_q_.front();
@@ -583,6 +618,10 @@ class StemReceiverOp : public Operator {
       ttl_packets_dropped_++;
       return;
     }
+    if (!source_expected(header.source_id)) {
+      ttl_packets_ignored_unexpected_source_++;
+      return;
+    }
 
     if (!stream_synced_) {
       if (header.row_number != 0) {
@@ -632,7 +671,7 @@ class StemReceiverOp : public Operator {
 
   bool should_close_current_assembled_batch() const {
     if (!stream_synced_) { return false; }
-    if (current_batch_unique_packets_ >= rows_per_tensor_) { return true; }
+    if (current_batch_unique_packets_ >= expected_rows_per_tensor_) { return true; }
     return current_batch_unique_packets_ > 0 &&
            future_packet_count_ >= batch_close_slack_packets_.get();
   }
@@ -672,13 +711,15 @@ class StemReceiverOp : public Operator {
       packets_to_gather++;
     }
 
-    const uint32_t missing_packets = rows_per_tensor_ - packets_to_gather;
+    const uint32_t missing_packets =
+        (packets_to_gather >= expected_rows_per_tensor_) ? 0 : expected_rows_per_tensor_ - packets_to_gather;
     if (missing_packets > 0) {
       HOLOSCAN_LOG_WARN(
-          "Emitting incomplete batch starting at absolute frame {}: {} / {} rows present, {} missing.",
+          "Emitting incomplete batch starting at absolute frame {}: {} / {} expected rows present, "
+          "{} expected rows missing.",
           current_batch_start_abs_frame_,
           packets_to_gather,
-          rows_per_tensor_,
+          expected_rows_per_tensor_,
           missing_packets);
     }
 
@@ -1064,6 +1105,7 @@ class StemReceiverOp : public Operator {
   int64_t ttl_bytes_recv_ = 0;
   int64_t ttl_pkts_recv_ = 0;
   int64_t ttl_packets_dropped_ = 0;
+  int64_t ttl_packets_ignored_unexpected_source_ = 0;
 
   int64_t aggr_pkts_recv_ = 0;
   uint64_t total_frames_emitted_ = 0;
@@ -1071,6 +1113,9 @@ class StemReceiverOp : public Operator {
   uint16_t custom_header_size_;  
   uint16_t nom_payload_size_;    
   uint32_t rows_per_tensor_;     
+  uint32_t expected_rows_per_tensor_ = 0;
+  uint32_t expected_source_mask_value_ = 0xFFU;
+  uint32_t expected_source_count_ = 8;
 
   std::array<void**, num_concurrent> h_dev_ptrs_;  // host pointers 
   std::array<void*, num_concurrent> d_dev_ptrs_;   // device pointers
@@ -1090,6 +1135,7 @@ class StemReceiverOp : public Operator {
   Parameter<std::string> packet_debug_output_prefix_;
   Parameter<uint32_t> packet_debug_max_batches_;
   Parameter<uint32_t> batch_close_slack_packets_;
+  Parameter<uint32_t> expected_source_mask_;
   Parameter<std::shared_ptr<holoscan::BooleanCondition>> stop_condition_;
   Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
 
