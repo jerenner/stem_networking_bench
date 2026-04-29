@@ -284,6 +284,16 @@ class StemReceiverOp : public Operator {
                          "Expected Source Mask",
                          "Bit mask of eth source IDs expected to contribute rows. Default 255 expects IDs 0-7.",
                          0xFFU);
+    spec.param<uint32_t>(incomplete_batch_log_interval_,
+                         "incomplete_batch_log_interval",
+                         "Incomplete Batch Log Interval",
+                         "Emit one incomplete-batch summary every N incomplete batches. 0 disables summaries.",
+                         100U);
+    spec.param<uint32_t>(incomplete_batch_warn_missing_threshold_,
+                         "incomplete_batch_warn_missing_threshold",
+                         "Incomplete Batch Warning Threshold",
+                         "Warn immediately when an incomplete batch is missing at least this many expected rows.",
+                         1024U);
     spec.param<std::shared_ptr<holoscan::BooleanCondition>>(stop_condition_,
                                                             "stop_condition",
                                                             "Stop Condition",
@@ -714,13 +724,35 @@ class StemReceiverOp : public Operator {
     const uint32_t missing_packets =
         (packets_to_gather >= expected_rows_per_tensor_) ? 0 : expected_rows_per_tensor_ - packets_to_gather;
     if (missing_packets > 0) {
-      HOLOSCAN_LOG_WARN(
-          "Emitting incomplete batch starting at absolute frame {}: {} / {} expected rows present, "
-          "{} expected rows missing.",
-          current_batch_start_abs_frame_,
-          packets_to_gather,
-          expected_rows_per_tensor_,
-          missing_packets);
+      incomplete_batches_emitted_++;
+      incomplete_rows_missing_total_ += missing_packets;
+      incomplete_rows_missing_max_ = std::max<uint32_t>(incomplete_rows_missing_max_, missing_packets);
+
+      const bool warn_now = missing_packets >= incomplete_batch_warn_missing_threshold_.get();
+      const bool summarize_now = incomplete_batch_log_interval_.get() > 0 &&
+                                 incomplete_batches_emitted_ % incomplete_batch_log_interval_.get() == 0;
+      if (warn_now) {
+        HOLOSCAN_LOG_WARN(
+            "Emitting incomplete batch starting at absolute frame {}: {} / {} expected rows present, "
+            "{} expected rows missing.",
+            current_batch_start_abs_frame_,
+            packets_to_gather,
+            expected_rows_per_tensor_,
+            missing_packets);
+      } else if (summarize_now) {
+        const double avg_missing =
+            static_cast<double>(incomplete_rows_missing_total_) /
+            static_cast<double>(incomplete_batches_emitted_);
+        HOLOSCAN_LOG_INFO(
+            "Incomplete batch summary for {}: {} incomplete batches, avg {:.1f} missing rows, "
+            "max {} missing rows. Latest batch started at absolute frame {} with {} missing rows.",
+            name(),
+            incomplete_batches_emitted_,
+            avg_missing,
+            incomplete_rows_missing_max_,
+            current_batch_start_abs_frame_,
+            missing_packets);
+      }
     }
 
     CUDA_TRY(cudaMemsetAsync(full_batch_data_d_[assembled_cur_batch_idx_],
@@ -1136,6 +1168,8 @@ class StemReceiverOp : public Operator {
   Parameter<uint32_t> packet_debug_max_batches_;
   Parameter<uint32_t> batch_close_slack_packets_;
   Parameter<uint32_t> expected_source_mask_;
+  Parameter<uint32_t> incomplete_batch_log_interval_;
+  Parameter<uint32_t> incomplete_batch_warn_missing_threshold_;
   Parameter<std::shared_ptr<holoscan::BooleanCondition>> stop_condition_;
   Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
 
@@ -1164,6 +1198,9 @@ class StemReceiverOp : public Operator {
   uint64_t frame_unwrap_ref_ = 0;
   uint32_t current_batch_unique_packets_ = 0;
   uint32_t future_packet_count_ = 0;
+  uint64_t incomplete_batches_emitted_ = 0;
+  uint64_t incomplete_rows_missing_total_ = 0;
+  uint32_t incomplete_rows_missing_max_ = 0;
   int assembled_cur_batch_idx_ = 0;
   bool stream_synced_ = false;
 
