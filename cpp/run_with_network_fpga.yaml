@@ -21,26 +21,16 @@ advanced_network:
     log_level: "info"
     
     memory_regions:
-    - name: "Header_RX_CPU_0"
-      kind: "huge"
-      affinity: 0
-      num_bufs: 262144
-      buf_size: 106 # Ethernet + IP + UDP + 64-byte FPGA custom header
     - name: "Data_RX_GPU_0"
       kind: "device"
       affinity: 0
       num_bufs: 262144
-      buf_size: 7680
-    - name: "Header_RX_CPU_1"
-      kind: "huge"
-      affinity: 0
-      num_bufs: 262144
-      buf_size: 106 # Ethernet + IP + UDP + 64-byte FPGA custom header
+      buf_size: 9228
     - name: "Data_RX_GPU_1"
       kind: "device"
       affinity: 0
       num_bufs: 262144
-      buf_size: 7680
+      buf_size: 9228
       
     interfaces:
     - name: "rx_port_0"
@@ -53,7 +43,6 @@ advanced_network:
           cpu_core: 9
           batch_size: 16384
           memory_regions:
-            - "Header_RX_CPU_0"
             - "Data_RX_GPU_0"
         flows:
         - name: "flow_0"
@@ -73,7 +62,6 @@ advanced_network:
           cpu_core: 10
           batch_size: 16384
           memory_regions:
-            - "Header_RX_CPU_1"
             - "Data_RX_GPU_1"
         flows:
         - name: "flow_1"
@@ -90,7 +78,7 @@ receiver0:
   max_packet_size: 9100
   header_size: 42
   gpu_direct: true
-  split_boundary: true
+  split_boundary: false
   reorder_kernel: true
   expected_source_mask: 15 # eth IDs 0-3 active; use 255 for all 8 sources
   batch_close_slack_packets: 512
@@ -109,7 +97,7 @@ receiver1:
   max_packet_size: 9100
   header_size: 42
   gpu_direct: true
-  split_boundary: true
+  split_boundary: false
   reorder_kernel: true
   expected_source_mask: 15 # eth IDs 0-3 active; use 255 for all 8 sources
   batch_close_slack_packets: 512

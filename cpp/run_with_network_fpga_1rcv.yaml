@@ -21,16 +21,11 @@ advanced_network:
     log_level: "info"
     
     memory_regions:
-    - name: "Header_RX_CPU"
-      kind: "huge"
-      affinity: 0
-      num_bufs: 32768
-      buf_size: 106 # Ethernet + IP + UDP + 64-byte FPGA custom header
     - name: "Data_RX_GPU"
       kind: "device"
       affinity: 0
       num_bufs: 32768
-      buf_size: 7680
+      buf_size: 9500
       
     interfaces:
     - name: "rx_port"
@@ -43,7 +38,6 @@ advanced_network:
           cpu_core: 9
           batch_size: 740
           memory_regions:
-            - "Header_RX_CPU"
             - "Data_RX_GPU"
         flows:
         - name: "flow_0"
@@ -57,10 +51,10 @@ advanced_network:
 receiver:
   interface_name: "rx_port"
   batch_size: 740
-  max_packet_size: 9100
-  header_size: 42
+  max_packet_size: 9500
+  header_size: 8
   gpu_direct: true
-  split_boundary: true
+  split_boundary: false
   reorder_kernel: true
   expected_source_mask: 15 # eth IDs 0-3 active; use 255 for all 8 sources
   batch_close_slack_packets: 512

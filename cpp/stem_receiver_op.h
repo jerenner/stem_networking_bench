@@ -37,7 +37,6 @@
 #include <cstring>
 #include <queue>
 #include <string>
-#include <unordered_set>
 #include <sys/time.h>
 #include <vector>
 
@@ -78,6 +77,7 @@ class StemReceiverOp : public Operator {
   static constexpr int num_concurrent = 4;
   static constexpr int MAX_BURSTS_PER_BATCH = 5000;
   static constexpr uint32_t ROWS_PER_SOURCE = 128;
+  static constexpr uint32_t INVALID_HOLDER_INDEX = std::numeric_limits<uint32_t>::max();
 
   HOLOSCAN_OPERATOR_FORWARD_ARGS(StemReceiverOp)
 
@@ -105,7 +105,7 @@ class StemReceiverOp : public Operator {
     int16_t global_row = -1;
     uint16_t row_number = 0;
     uint16_t source_id = 0;
-    std::shared_ptr<BurstHolder> holder;
+    uint32_t holder_index = INVALID_HOLDER_INDEX;
   };
 
   struct AssembledBatch {
@@ -113,6 +113,12 @@ class StemReceiverOp : public Operator {
     cudaEvent_t evt = nullptr;
     uint32_t packets_used = 0;
     uint32_t missing_packets = 0;
+  };
+
+  struct PendingHolder {
+    std::shared_ptr<BurstHolder> holder;
+    uint32_t pending_packets = 0;
+    uint32_t emit_generation = 0;
   };
 
   struct HeaderBatchSlot {
@@ -226,6 +232,9 @@ class StemReceiverOp : public Operator {
     }
 
     current_batch_occupied_.assign(rows_per_tensor_, 0);
+    emit_cell_generation_.assign(rows_per_tensor_, 0);
+    pending_packets_.reserve(rows_per_tensor_ + batch_close_slack_packets_.get() + 4096);
+    pending_holders_.reserve(256);
 
     if (hds_.get()) { assert(gpu_direct_.get()); }
 
@@ -282,6 +291,8 @@ class StemReceiverOp : public Operator {
       assembled_batch_q_.pop();
     }
     pending_packets_.clear();
+    pending_holders_.clear();
+    free_pending_holder_indices_.clear();
     for (int n = 0; n < num_concurrent; n++) {
       if (full_batch_data_d_[n]) { cudaFree(full_batch_data_d_[n]); }
       if (full_batch_data_h_[n]) { cudaFreeHost(full_batch_data_h_[n]); }
@@ -622,6 +633,55 @@ class StemReceiverOp : public Operator {
     return source_id < 8 && (expected_source_mask_value_ & (1U << source_id)) != 0U;
   }
 
+  uint32_t register_pending_holder(std::shared_ptr<BurstHolder> holder) {
+    if (!holder) { return INVALID_HOLDER_INDEX; }
+
+    if (!free_pending_holder_indices_.empty()) {
+      const uint32_t index = free_pending_holder_indices_.back();
+      free_pending_holder_indices_.pop_back();
+      pending_holders_[index] = PendingHolder{std::move(holder), 0, 0};
+      return index;
+    }
+
+    const uint32_t index = static_cast<uint32_t>(pending_holders_.size());
+    pending_holders_.push_back(PendingHolder{std::move(holder), 0, 0});
+    return index;
+  }
+
+  void retain_pending_holder(uint32_t holder_index) {
+    if (holder_index == INVALID_HOLDER_INDEX || holder_index >= pending_holders_.size()) { return; }
+    pending_holders_[holder_index].pending_packets++;
+  }
+
+  void free_pending_holder_slot(uint32_t holder_index) {
+    if (holder_index == INVALID_HOLDER_INDEX || holder_index >= pending_holders_.size()) { return; }
+    auto& pending_holder = pending_holders_[holder_index];
+    if (!pending_holder.holder) { return; }
+
+    pending_holder.holder.reset();
+    pending_holder.pending_packets = 0;
+    pending_holder.emit_generation = 0;
+    free_pending_holder_indices_.push_back(holder_index);
+  }
+
+  void release_pending_holder(uint32_t holder_index) {
+    if (holder_index == INVALID_HOLDER_INDEX || holder_index >= pending_holders_.size()) { return; }
+    auto& pending_holder = pending_holders_[holder_index];
+    if (!pending_holder.holder || pending_holder.pending_packets == 0) { return; }
+
+    pending_holder.pending_packets--;
+    if (pending_holder.pending_packets == 0) { free_pending_holder_slot(holder_index); }
+  }
+
+  void begin_emit_generation() {
+    emit_generation_++;
+    if (emit_generation_ != 0) { return; }
+
+    std::fill(emit_cell_generation_.begin(), emit_cell_generation_.end(), 0);
+    for (auto& pending_holder : pending_holders_) { pending_holder.emit_generation = 0; }
+    emit_generation_ = 1;
+  }
+
   void reset_header_slot(HeaderBatchSlot& slot) {
     slot.packet_count = 0;
     slot.in_flight = false;
@@ -689,9 +749,23 @@ class StemReceiverOp : public Operator {
 
     {
       profiling::ScopedRange process_range("receiver/process-header-batch", profiling::color::kReceiver);
+      std::vector<uint32_t> holder_indices;
+      holder_indices.reserve(slot.holders.size());
+      for (const auto& holder : slot.holders) {
+        holder_indices.push_back(register_pending_holder(holder));
+      }
+
       for (uint32_t pkt_idx = 0; pkt_idx < slot.packet_count; ++pkt_idx) {
         const uint32_t holder_idx = slot.packet_holder_indices[pkt_idx];
-        add_pending_packet(slot.h_dev_ptrs[pkt_idx], slot.headers_h[pkt_idx], slot.holders[holder_idx]);
+        add_pending_packet(slot.h_dev_ptrs[pkt_idx], slot.headers_h[pkt_idx], holder_indices[holder_idx]);
+      }
+
+      for (const uint32_t holder_index : holder_indices) {
+        if (holder_index != INVALID_HOLDER_INDEX &&
+            holder_index < pending_holders_.size() &&
+            pending_holders_[holder_index].pending_packets == 0) {
+          free_pending_holder_slot(holder_index);
+        }
       }
     }
 
@@ -834,7 +908,7 @@ class StemReceiverOp : public Operator {
 
   void add_pending_packet(void* packet_ptr,
                           const PacketHeaderInfo& header,
-                          std::shared_ptr<BurstHolder> holder) {
+                          uint32_t holder_index) {
     if (header.source_id >= 8 || header.global_row < 0) {
       ttl_packets_dropped_++;
       return;
@@ -873,7 +947,8 @@ class StemReceiverOp : public Operator {
     entry.global_row = header.global_row;
     entry.row_number = header.row_number;
     entry.source_id = header.source_id;
-    entry.holder = std::move(holder);
+    entry.holder_index = holder_index;
+    retain_pending_holder(holder_index);
     pending_packets_.push_back(std::move(entry));
 
     const uint64_t batch_end = current_batch_start_abs_frame_ + frames_per_tensor_.get();
@@ -907,9 +982,8 @@ class StemReceiverOp : public Operator {
     }
 
     const uint64_t batch_end = current_batch_start_abs_frame_ + frames_per_tensor_.get();
-    std::vector<uint8_t> emitted_cells(rows_per_tensor_, 0);
-    std::unordered_set<BurstHolder*> holder_seen;
     std::vector<std::shared_ptr<BurstHolder>> batch_holders;
+    begin_emit_generation();
 
     uint32_t packets_to_gather = 0;
     for (const auto& entry : pending_packets_) {
@@ -919,15 +993,22 @@ class StemReceiverOp : public Operator {
 
       const uint64_t relative_frame = entry.abs_frame - current_batch_start_abs_frame_;
       const uint64_t cell = relative_frame * FRAME_HEIGHT + static_cast<uint64_t>(entry.global_row);
-      if (cell >= emitted_cells.size() || emitted_cells[cell]) { continue; }
+      if (cell >= emit_cell_generation_.size() || emit_cell_generation_[cell] == emit_generation_) {
+        continue;
+      }
 
-      emitted_cells[cell] = 1;
+      emit_cell_generation_[cell] = emit_generation_;
       h_dev_ptrs_[assembled_cur_batch_idx_][packets_to_gather] = entry.packet_ptr;
       h_packet_placements_[assembled_cur_batch_idx_][packets_to_gather] = PacketPlacement{
           static_cast<uint16_t>(relative_frame), entry.global_row, 1};
 
-      if (entry.holder && holder_seen.insert(entry.holder.get()).second) {
-        batch_holders.push_back(entry.holder);
+      if (entry.holder_index != INVALID_HOLDER_INDEX &&
+          entry.holder_index < pending_holders_.size()) {
+        auto& pending_holder = pending_holders_[entry.holder_index];
+        if (pending_holder.holder && pending_holder.emit_generation != emit_generation_) {
+          pending_holder.emit_generation = emit_generation_;
+          batch_holders.push_back(pending_holder.holder);
+        }
       }
       packets_to_gather++;
     }
@@ -1037,11 +1118,17 @@ class StemReceiverOp : public Operator {
     assembled_batch_q_.push(AssembledBatch{
         std::move(batch_holders), events_[assembled_cur_batch_idx_], packets_to_gather, missing_packets});
 
-    pending_packets_.erase(
-        std::remove_if(pending_packets_.begin(),
-                       pending_packets_.end(),
-                       [batch_end](const PacketEntry& entry) { return entry.abs_frame < batch_end; }),
-        pending_packets_.end());
+    auto write_it = pending_packets_.begin();
+    for (auto read_it = pending_packets_.begin(); read_it != pending_packets_.end(); ++read_it) {
+      if (read_it->abs_frame < batch_end) {
+        release_pending_holder(read_it->holder_index);
+        continue;
+      }
+
+      if (write_it != read_it) { *write_it = std::move(*read_it); }
+      ++write_it;
+    }
+    pending_packets_.erase(write_it, pending_packets_.end());
 
     total_frames_emitted_ += frames_per_tensor_.get();
     current_batch_start_abs_frame_ += frames_per_tensor_.get();
@@ -1085,6 +1172,7 @@ class StemReceiverOp : public Operator {
       }
 
       auto holder = std::make_shared<BurstHolder>(burst);
+      const uint32_t holder_index = register_pending_holder(holder);
       {
         profiling::ScopedRange parse_range("receiver/parse-hds-headers", profiling::color::kReceiver);
         for (uint32_t pkt_idx = 0; pkt_idx < burst_size; ++pkt_idx) {
@@ -1092,8 +1180,13 @@ class StemReceiverOp : public Operator {
               reinterpret_cast<const uint8_t*>(get_segment_packet_ptr(burst, 0, pkt_idx)) +
               header_size_.get();
           auto* payload = get_segment_packet_ptr(burst, 1, pkt_idx);
-          add_pending_packet(payload, parse_packet_header_host(custom_header), holder);
+          add_pending_packet(payload, parse_packet_header_host(custom_header), holder_index);
         }
+      }
+      if (holder_index != INVALID_HOLDER_INDEX &&
+          holder_index < pending_holders_.size() &&
+          pending_holders_[holder_index].pending_packets == 0) {
+        free_pending_holder_slot(holder_index);
       }
 
       try_emit_assembled_batches(op_output, context);
@@ -1446,13 +1539,17 @@ class StemReceiverOp : public Operator {
   std::array<uint64_t, 4> packet_debug_nonzero_histogram_{};
   std::vector<uint64_t> packet_debug_column_histogram_{};
 
-  std::deque<PacketEntry> pending_packets_;
+  std::vector<PacketEntry> pending_packets_;
+  std::vector<PendingHolder> pending_holders_;
+  std::vector<uint32_t> free_pending_holder_indices_;
   std::queue<AssembledBatch> assembled_batch_q_;
   std::vector<uint8_t> current_batch_occupied_;
+  std::vector<uint32_t> emit_cell_generation_;
   uint64_t current_batch_start_abs_frame_ = 0;
   uint64_t frame_unwrap_ref_ = 0;
   uint32_t current_batch_unique_packets_ = 0;
   uint32_t future_packet_count_ = 0;
+  uint32_t emit_generation_ = 0;
   uint64_t incomplete_batches_emitted_ = 0;
   uint64_t incomplete_rows_missing_total_ = 0;
   uint32_t incomplete_rows_missing_max_ = 0;
