@@ -264,6 +264,7 @@ class StemReceiverOp : public Operator {
       if (slot.event) { cudaEventDestroy(slot.event); }
     }
     header_slots_.clear();
+    header_inflight_order_.clear();
     header_fill_slot_idx_ = -1;
     while (!assembled_batch_q_.empty()) {
       if (assembled_batch_q_.front().evt) { cudaEventSynchronize(assembled_batch_q_.front().evt); }
@@ -338,12 +339,12 @@ class StemReceiverOp : public Operator {
                          "header_batch_packets",
                          "Header Batch Packets",
                          "Number of packet headers to extract per asynchronous header-transfer chunk.",
-                         32768U);
+                         8192U);
     spec.param<uint32_t>(header_batch_slots_,
                          "header_batch_slots",
                          "Header Batch Slots",
                          "Number of asynchronous header-transfer chunks that can be in flight or filling.",
-                         3U);
+                         4U);
     spec.param<std::shared_ptr<holoscan::BooleanCondition>>(stop_condition_,
                                                             "stop_condition",
                                                             "Stop Condition",
@@ -653,6 +654,7 @@ class StemReceiverOp : public Operator {
     }
 
     slot.in_flight = true;
+    header_inflight_order_.push_back(slot_idx);
     header_batches_launched_++;
     return true;
   }
@@ -689,15 +691,19 @@ class StemReceiverOp : public Operator {
   }
 
   void process_ready_header_slots(OutputContext& op_output, ExecutionContext& context) {
-    for (size_t slot_idx = 0; slot_idx < header_slots_.size(); ++slot_idx) {
+    while (!header_inflight_order_.empty()) {
+      const int slot_idx = header_inflight_order_.front();
       auto& slot = header_slots_[slot_idx];
-      if (!slot.in_flight) { continue; }
 
       const cudaError_t status = cudaEventQuery(slot.event);
       if (status == cudaSuccess) {
-        process_header_slot(static_cast<int>(slot_idx), op_output, context);
+        header_inflight_order_.pop_front();
+        process_header_slot(slot_idx, op_output, context);
       } else if (status != cudaErrorNotReady) {
         CUDA_TRY(status);
+        break;
+      } else {
+        break;
       }
     }
   }
@@ -723,13 +729,13 @@ class StemReceiverOp : public Operator {
           header_slot_full_waits_);
     }
 
-    for (size_t wait_idx = 0; wait_idx < header_slots_.size(); ++wait_idx) {
+    if (!header_inflight_order_.empty()) {
+      const int wait_idx = header_inflight_order_.front();
       auto& slot = header_slots_[wait_idx];
-      if (!slot.in_flight) { continue; }
-
       CUDA_TRY(cudaEventSynchronize(slot.event));
-      process_header_slot(static_cast<int>(wait_idx), op_output, context);
-      header_fill_slot_idx_ = static_cast<int>(wait_idx);
+      header_inflight_order_.pop_front();
+      process_header_slot(wait_idx, op_output, context);
+      header_fill_slot_idx_ = wait_idx;
       return header_fill_slot_idx_;
     }
 
@@ -1336,8 +1342,8 @@ class StemReceiverOp : public Operator {
   uint32_t expected_rows_per_tensor_ = 0;
   uint32_t expected_source_mask_value_ = 0xFFU;
   uint32_t expected_source_count_ = 8;
-  uint32_t header_batch_packets_value_ = 32768;
-  uint32_t header_batch_slots_value_ = 3;
+  uint32_t header_batch_packets_value_ = 8192;
+  uint32_t header_batch_slots_value_ = 4;
 
   std::array<void**, num_concurrent> h_dev_ptrs_;  // host pointers 
   std::array<void*, num_concurrent> d_dev_ptrs_;   // device pointers
@@ -1401,6 +1407,7 @@ class StemReceiverOp : public Operator {
   bool stream_synced_ = false;
 
   std::vector<HeaderBatchSlot> header_slots_;
+  std::deque<int> header_inflight_order_;
   std::array<PacketPlacement*, num_concurrent> h_packet_placements_{};
   std::array<PacketPlacement*, num_concurrent> d_packet_placements_{};
 
