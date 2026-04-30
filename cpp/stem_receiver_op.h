@@ -115,16 +115,32 @@ class StemReceiverOp : public Operator {
     uint32_t missing_packets = 0;
   };
 
+  struct HeaderBatchSlot {
+    void** h_dev_ptrs = nullptr;
+    void* d_dev_ptrs = nullptr;
+    PacketHeaderInfo* headers_h = nullptr;
+    PacketHeaderInfo* headers_d = nullptr;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t event = nullptr;
+    uint32_t packet_count = 0;
+    bool in_flight = false;
+    std::vector<std::shared_ptr<BurstHolder>> holders;
+    std::vector<uint32_t> packet_holder_indices;
+  };
+
   StemReceiverOp() = default;
 
   ~StemReceiverOp() {
     HOLOSCAN_LOG_INFO(
         "Finished receiver with {}/{} bytes/packets received, {} packets dropped, and {} packets "
-        "ignored from unexpected source IDs",
+        "ignored from unexpected source IDs. Header batches launched/completed: {}/{}; full-slot waits: {}",
         ttl_bytes_recv_,
         ttl_pkts_recv_,
         ttl_packets_dropped_,
-        ttl_packets_ignored_unexpected_source_);
+        ttl_packets_ignored_unexpected_source_,
+        header_batches_launched_,
+        header_batches_completed_,
+        header_slot_full_waits_);
     flush_packet_debug_outputs();
     HOLOSCAN_LOG_INFO("StemReceiverOp shutting down");
     freeResources();
@@ -167,6 +183,13 @@ class StemReceiverOp : public Operator {
       exit(1);
     }
     expected_rows_per_tensor_ = frames_per_tensor_.get() * expected_source_count_ * ROWS_PER_SOURCE;
+    header_batch_packets_value_ = header_batch_packets_.get();
+    header_batch_slots_value_ = header_batch_slots_.get();
+    if (use_assembled_batching() &&
+        (header_batch_packets_value_ == 0 || header_batch_slots_value_ == 0)) {
+      HOLOSCAN_LOG_ERROR("header_batch_packets and header_batch_slots must both be greater than 0.");
+      exit(1);
+    }
 
     for (int n = 0; n < num_concurrent; n++) {
       CUDA_TRY(cudaMalloc(&full_batch_data_d_[n], rows_per_tensor_ * nom_payload_size_));
@@ -185,14 +208,21 @@ class StemReceiverOp : public Operator {
       cudaEventCreate(&events_[n]);
     }
 
-    if (gpu_direct_.get()) {
-      CUDA_TRY(cudaMallocHost((void**)&h_header_dev_ptrs_, sizeof(void*) * rows_per_tensor_));
-      CUDA_TRY(cudaMalloc(&d_header_dev_ptrs_, sizeof(void*) * rows_per_tensor_));
-      CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&packet_headers_h_),
-                              sizeof(PacketHeaderInfo) * rows_per_tensor_));
-      CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&packet_headers_d_),
-                          sizeof(PacketHeaderInfo) * rows_per_tensor_));
-      cudaStreamCreate(&header_stream_);
+    if (use_assembled_batching()) {
+      header_slots_.resize(header_batch_slots_value_);
+      for (auto& slot : header_slots_) {
+        CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&slot.h_dev_ptrs),
+                                sizeof(void*) * header_batch_packets_value_));
+        CUDA_TRY(cudaMalloc(&slot.d_dev_ptrs, sizeof(void*) * header_batch_packets_value_));
+        CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&slot.headers_h),
+                                sizeof(PacketHeaderInfo) * header_batch_packets_value_));
+        CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&slot.headers_d),
+                            sizeof(PacketHeaderInfo) * header_batch_packets_value_));
+        CUDA_TRY(cudaStreamCreateWithFlags(&slot.stream, cudaStreamNonBlocking));
+        CUDA_TRY(cudaEventCreateWithFlags(&slot.event, cudaEventDisableTiming));
+        slot.holders.reserve(64);
+        slot.packet_holder_indices.reserve(header_batch_packets_value_);
+      }
     }
 
     current_batch_occupied_.assign(rows_per_tensor_, 0);
@@ -204,11 +234,14 @@ class StemReceiverOp : public Operator {
     if (use_assembled_batching()) {
       HOLOSCAN_LOG_INFO(
           "StemReceiverOp::initialize() using header-aware batch assembly with {} slack packets, "
-          "expected source mask 0x{:02x} ({} sources, {} expected rows/tensor).",
+          "expected source mask 0x{:02x} ({} sources, {} expected rows/tensor), "
+          "{} async header slots of {} packets each.",
           batch_close_slack_packets_.get(),
           expected_source_mask_value_,
           expected_source_count_,
-          expected_rows_per_tensor_);
+          expected_rows_per_tensor_,
+          header_batch_slots_value_,
+          header_batch_packets_value_);
     } else {
       HOLOSCAN_LOG_INFO(
           "StemReceiverOp::initialize() using legacy arrival-count batching for this configuration.");
@@ -220,6 +253,18 @@ class StemReceiverOp : public Operator {
   void freeResources() {
     HOLOSCAN_LOG_INFO("StemReceiverOp::freeResources() start");
     cleanup_packet_debug();
+    for (auto& slot : header_slots_) {
+      if (slot.in_flight && slot.event) { cudaEventSynchronize(slot.event); }
+      reset_header_slot(slot);
+      if (slot.h_dev_ptrs) { cudaFreeHost(slot.h_dev_ptrs); }
+      if (slot.d_dev_ptrs) { cudaFree(slot.d_dev_ptrs); }
+      if (slot.headers_h) { cudaFreeHost(slot.headers_h); }
+      if (slot.headers_d) { cudaFree(slot.headers_d); }
+      if (slot.stream) { cudaStreamDestroy(slot.stream); }
+      if (slot.event) { cudaEventDestroy(slot.event); }
+    }
+    header_slots_.clear();
+    header_fill_slot_idx_ = -1;
     while (!assembled_batch_q_.empty()) {
       if (assembled_batch_q_.front().evt) { cudaEventSynchronize(assembled_batch_q_.front().evt); }
       assembled_batch_q_.pop();
@@ -235,11 +280,6 @@ class StemReceiverOp : public Operator {
       if (streams_[n]) { cudaStreamDestroy(streams_[n]); }
       if (events_[n]) { cudaEventDestroy(events_[n]); }
     }
-    if (h_header_dev_ptrs_) { cudaFreeHost(h_header_dev_ptrs_); }
-    if (d_header_dev_ptrs_) { cudaFree(d_header_dev_ptrs_); }
-    if (packet_headers_h_) { cudaFreeHost(packet_headers_h_); }
-    if (packet_headers_d_) { cudaFree(packet_headers_d_); }
-    if (header_stream_) { cudaStreamDestroy(header_stream_); }
   }
 
   void setup(OperatorSpec& spec) override {
@@ -294,6 +334,16 @@ class StemReceiverOp : public Operator {
                          "Incomplete Batch Warning Threshold",
                          "Warn immediately when an incomplete batch is missing at least this many expected rows.",
                          1024U);
+    spec.param<uint32_t>(header_batch_packets_,
+                         "header_batch_packets",
+                         "Header Batch Packets",
+                         "Number of packet headers to extract per asynchronous header-transfer chunk.",
+                         32768U);
+    spec.param<uint32_t>(header_batch_slots_,
+                         "header_batch_slots",
+                         "Header Batch Slots",
+                         "Number of asynchronous header-transfer chunks that can be in flight or filling.",
+                         3U);
     spec.param<std::shared_ptr<holoscan::BooleanCondition>>(stop_condition_,
                                                             "stop_condition",
                                                             "Stop Condition",
@@ -558,6 +608,133 @@ class StemReceiverOp : public Operator {
 
   bool source_expected(uint16_t source_id) const {
     return source_id < 8 && (expected_source_mask_value_ & (1U << source_id)) != 0U;
+  }
+
+  void reset_header_slot(HeaderBatchSlot& slot) {
+    slot.packet_count = 0;
+    slot.in_flight = false;
+    slot.holders.clear();
+    slot.packet_holder_indices.clear();
+  }
+
+  int find_free_header_slot() const {
+    for (size_t slot_idx = 0; slot_idx < header_slots_.size(); ++slot_idx) {
+      const auto& slot = header_slots_[slot_idx];
+      if (!slot.in_flight && slot.packet_count == 0) { return static_cast<int>(slot_idx); }
+    }
+    return -1;
+  }
+
+  bool launch_header_slot(int slot_idx) {
+    auto& slot = header_slots_[slot_idx];
+    if (slot.packet_count == 0) { return true; }
+
+    {
+      profiling::ScopedRange header_range("receiver/launch-header-batch", profiling::color::kCompute);
+      if (CUDA_TRY(cudaMemcpyAsync(slot.d_dev_ptrs,
+                                   slot.h_dev_ptrs,
+                                   sizeof(void*) * slot.packet_count,
+                                   cudaMemcpyHostToDevice,
+                                   slot.stream)) != cudaSuccess) {
+        return false;
+      }
+      extract_packet_headers(reinterpret_cast<uint8_t**>(slot.d_dev_ptrs),
+                             slot.headers_d,
+                             slot.packet_count,
+                             slot.stream);
+      if (CUDA_TRY(cudaMemcpyAsync(slot.headers_h,
+                                   slot.headers_d,
+                                   sizeof(PacketHeaderInfo) * slot.packet_count,
+                                   cudaMemcpyDeviceToHost,
+                                   slot.stream)) != cudaSuccess) {
+        return false;
+      }
+      if (CUDA_TRY(cudaEventRecord(slot.event, slot.stream)) != cudaSuccess) { return false; }
+    }
+
+    slot.in_flight = true;
+    header_batches_launched_++;
+    return true;
+  }
+
+  bool launch_header_fill_slot() {
+    if (header_fill_slot_idx_ < 0) { return true; }
+
+    const int slot_idx = header_fill_slot_idx_;
+    header_fill_slot_idx_ = -1;
+    if (!launch_header_slot(slot_idx)) {
+      ttl_packets_dropped_ += header_slots_[slot_idx].packet_count;
+      reset_header_slot(header_slots_[slot_idx]);
+      return false;
+    }
+    return true;
+  }
+
+  bool process_header_slot(int slot_idx, OutputContext& op_output, ExecutionContext& context) {
+    auto& slot = header_slots_[slot_idx];
+    if (!slot.in_flight) { return false; }
+
+    {
+      profiling::ScopedRange process_range("receiver/process-header-batch", profiling::color::kReceiver);
+      for (uint32_t pkt_idx = 0; pkt_idx < slot.packet_count; ++pkt_idx) {
+        const uint32_t holder_idx = slot.packet_holder_indices[pkt_idx];
+        add_pending_packet(slot.h_dev_ptrs[pkt_idx], slot.headers_h[pkt_idx], slot.holders[holder_idx]);
+      }
+    }
+
+    header_batches_completed_++;
+    reset_header_slot(slot);
+    try_emit_assembled_batches(op_output, context);
+    return true;
+  }
+
+  void process_ready_header_slots(OutputContext& op_output, ExecutionContext& context) {
+    for (size_t slot_idx = 0; slot_idx < header_slots_.size(); ++slot_idx) {
+      auto& slot = header_slots_[slot_idx];
+      if (!slot.in_flight) { continue; }
+
+      const cudaError_t status = cudaEventQuery(slot.event);
+      if (status == cudaSuccess) {
+        process_header_slot(static_cast<int>(slot_idx), op_output, context);
+      } else if (status != cudaErrorNotReady) {
+        CUDA_TRY(status);
+      }
+    }
+  }
+
+  int acquire_header_fill_slot(OutputContext& op_output, ExecutionContext& context) {
+    if (header_fill_slot_idx_ >= 0) { return header_fill_slot_idx_; }
+
+    process_ready_header_slots(op_output, context);
+
+    int slot_idx = find_free_header_slot();
+    if (slot_idx >= 0) {
+      header_fill_slot_idx_ = slot_idx;
+      return slot_idx;
+    }
+
+    header_slot_full_waits_++;
+    if (header_slot_full_waits_ == 1 || header_slot_full_waits_ % 100 == 0) {
+      HOLOSCAN_LOG_WARN(
+          "All {} async header slots are in flight for {}. Waiting for one to complete "
+          "(wait count: {}). Consider increasing header_batch_slots or reducing header_batch_packets.",
+          header_batch_slots_value_,
+          name(),
+          header_slot_full_waits_);
+    }
+
+    for (size_t wait_idx = 0; wait_idx < header_slots_.size(); ++wait_idx) {
+      auto& slot = header_slots_[wait_idx];
+      if (!slot.in_flight) { continue; }
+
+      CUDA_TRY(cudaEventSynchronize(slot.event));
+      process_header_slot(static_cast<int>(wait_idx), op_output, context);
+      header_fill_slot_idx_ = static_cast<int>(wait_idx);
+      return header_fill_slot_idx_;
+    }
+
+    HOLOSCAN_LOG_ERROR("No available header slot found for {}.", name());
+    return -1;
   }
 
   void free_processed_assembled_batches() {
@@ -859,45 +1036,47 @@ class StemReceiverOp : public Operator {
       free_all_packets_and_burst_rx(burst);
       return;
     }
-    if (burst_size > rows_per_tensor_) {
-      HOLOSCAN_LOG_ERROR("Burst has {} packets but header extraction capacity is {}. Dropping burst.",
-                         burst_size,
-                         rows_per_tensor_);
-      ttl_packets_dropped_ += burst_size;
-      free_all_packets_and_burst_rx(burst);
-      return;
-    }
 
     auto holder = std::make_shared<BurstHolder>(burst);
-    for (uint32_t pkt_idx = 0; pkt_idx < burst_size; ++pkt_idx) {
-      h_header_dev_ptrs_[pkt_idx] =
-          reinterpret_cast<uint8_t*>(get_segment_packet_ptr(burst, 0, pkt_idx)) + header_size_.get();
+    uint32_t pkt_idx = 0;
+    while (pkt_idx < burst_size) {
+      const int slot_idx = acquire_header_fill_slot(op_output, context);
+      if (is_done_) { return; }
+      if (slot_idx < 0) {
+        ttl_packets_dropped_ += (burst_size - pkt_idx);
+        return;
+      }
+
+      auto& slot = header_slots_[slot_idx];
+      const uint32_t available = header_batch_packets_value_ - slot.packet_count;
+      if (available == 0) {
+        if (!launch_header_fill_slot()) {
+          ttl_packets_dropped_ += (burst_size - pkt_idx);
+          return;
+        }
+        continue;
+      }
+
+      const uint32_t take = std::min<uint32_t>(burst_size - pkt_idx, available);
+      const uint32_t holder_index = static_cast<uint32_t>(slot.holders.size());
+      slot.holders.push_back(holder);
+
+      for (uint32_t i = 0; i < take; ++i) {
+        slot.h_dev_ptrs[slot.packet_count] =
+            reinterpret_cast<uint8_t*>(get_segment_packet_ptr(burst, 0, pkt_idx + i)) +
+            header_size_.get();
+        slot.packet_holder_indices.push_back(holder_index);
+        slot.packet_count++;
+      }
+
+      pkt_idx += take;
+      if (slot.packet_count == header_batch_packets_value_ && !launch_header_fill_slot()) {
+        ttl_packets_dropped_ += (burst_size - pkt_idx);
+        return;
+      }
     }
 
-    {
-      profiling::ScopedRange header_range("receiver/extract-packet-headers", profiling::color::kCompute);
-      CUDA_TRY(cudaMemcpyAsync(d_header_dev_ptrs_,
-                               h_header_dev_ptrs_,
-                               sizeof(void*) * burst_size,
-                               cudaMemcpyHostToDevice,
-                               header_stream_));
-      extract_packet_headers(reinterpret_cast<uint8_t**>(d_header_dev_ptrs_),
-                             packet_headers_d_,
-                             burst_size,
-                             header_stream_);
-      CUDA_TRY(cudaMemcpyAsync(packet_headers_h_,
-                               packet_headers_d_,
-                               sizeof(PacketHeaderInfo) * burst_size,
-                               cudaMemcpyDeviceToHost,
-                               header_stream_));
-      CUDA_TRY(cudaStreamSynchronize(header_stream_));
-    }
-
-    for (uint32_t pkt_idx = 0; pkt_idx < burst_size; ++pkt_idx) {
-      add_pending_packet(h_header_dev_ptrs_[pkt_idx], packet_headers_h_[pkt_idx], holder);
-    }
-
-    try_emit_assembled_batches(op_output, context);
+    process_ready_header_slots(op_output, context);
   }
 
   void compute_assembled(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) {
@@ -907,10 +1086,12 @@ class StemReceiverOp : public Operator {
       profiling::ScopedRange reclaim_range("receiver/reclaim-completed", profiling::color::kIo);
       free_processed_assembled_batches();
     }
+    process_ready_header_slots(op_output, context);
 
     if (is_done_) return;
 
     BurstParams* burst = nullptr;
+    bool received_burst = false;
     const auto num_rx_queues = get_num_rx_queues(port_id_);
     for (int q = 0; q < num_rx_queues; q++) {
       auto status = Status::SUCCESS;
@@ -922,9 +1103,16 @@ class StemReceiverOp : public Operator {
 
       const auto burst_size = get_num_packets(burst);
       ttl_pkts_recv_ += burst_size;
+      received_burst = true;
       process_assembled_burst(burst, op_output, context);
       if (is_done_) { return; }
     }
+
+    if (!received_burst) {
+      // If traffic pauses, do not leave a partial header chunk stranded forever.
+      launch_header_fill_slot();
+    }
+    process_ready_header_slots(op_output, context);
   }
 
   void compute(InputContext& op_input, OutputContext& op_output, ExecutionContext& context) override {
@@ -1148,6 +1336,8 @@ class StemReceiverOp : public Operator {
   uint32_t expected_rows_per_tensor_ = 0;
   uint32_t expected_source_mask_value_ = 0xFFU;
   uint32_t expected_source_count_ = 8;
+  uint32_t header_batch_packets_value_ = 32768;
+  uint32_t header_batch_slots_value_ = 3;
 
   std::array<void**, num_concurrent> h_dev_ptrs_;  // host pointers 
   std::array<void*, num_concurrent> d_dev_ptrs_;   // device pointers
@@ -1170,6 +1360,8 @@ class StemReceiverOp : public Operator {
   Parameter<uint32_t> expected_source_mask_;
   Parameter<uint32_t> incomplete_batch_log_interval_;
   Parameter<uint32_t> incomplete_batch_warn_missing_threshold_;
+  Parameter<uint32_t> header_batch_packets_;
+  Parameter<uint32_t> header_batch_slots_;
   Parameter<std::shared_ptr<holoscan::BooleanCondition>> stop_condition_;
   Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
 
@@ -1201,14 +1393,14 @@ class StemReceiverOp : public Operator {
   uint64_t incomplete_batches_emitted_ = 0;
   uint64_t incomplete_rows_missing_total_ = 0;
   uint32_t incomplete_rows_missing_max_ = 0;
+  uint64_t header_batches_launched_ = 0;
+  uint64_t header_batches_completed_ = 0;
+  uint64_t header_slot_full_waits_ = 0;
   int assembled_cur_batch_idx_ = 0;
+  int header_fill_slot_idx_ = -1;
   bool stream_synced_ = false;
 
-  void** h_header_dev_ptrs_ = nullptr;
-  void* d_header_dev_ptrs_ = nullptr;
-  PacketHeaderInfo* packet_headers_h_ = nullptr;
-  PacketHeaderInfo* packet_headers_d_ = nullptr;
-  cudaStream_t header_stream_ = nullptr;
+  std::vector<HeaderBatchSlot> header_slots_;
   std::array<PacketPlacement*, num_concurrent> h_packet_placements_{};
   std::array<PacketPlacement*, num_concurrent> d_packet_placements_{};
 
