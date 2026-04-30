@@ -25,10 +25,12 @@
 #include "holoscan/holoscan.hpp"
 #include "holoscan/core/domain/tensor.hpp"
 #include "holoscan/utils/cuda_macros.hpp"
+#include "gxf/std/tensor.hpp"
 #include <algorithm>
 #include <array>
 #include <arpa/inet.h>
 #include <assert.h>
+#include <atomic>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
@@ -108,8 +110,13 @@ class StemReceiverOp : public Operator {
     uint32_t holder_index = INVALID_HOLDER_INDEX;
   };
 
+  struct OutputBufferLease {
+    std::atomic<bool> released{false};
+  };
+
   struct AssembledBatch {
     std::vector<std::shared_ptr<BurstHolder>> holders;
+    std::shared_ptr<OutputBufferLease> output_lease;
     cudaEvent_t evt = nullptr;
     uint32_t packets_used = 0;
     uint32_t missing_packets = 0;
@@ -855,7 +862,10 @@ class StemReceiverOp : public Operator {
   void free_processed_assembled_batches() {
     while (!assembled_batch_q_.empty()) {
       auto& batch = assembled_batch_q_.front();
-      if (cudaEventQuery(batch.evt) == cudaSuccess) {
+      const bool cuda_done = cudaEventQuery(batch.evt) == cudaSuccess;
+      const bool output_released =
+          !batch.output_lease || batch.output_lease->released.load(std::memory_order_acquire);
+      if (cuda_done && output_released) {
         assembled_batch_q_.pop();
       } else {
         break;
@@ -997,6 +1007,7 @@ class StemReceiverOp : public Operator {
   }
 
   bool emit_current_assembled_batch(OutputContext& op_output, ExecutionContext& context) {
+    (void)context;
     profiling::ScopedRange emit_batch_range("receiver/emit-assembled-batch", profiling::color::kReceiver);
 
     free_processed_assembled_batches();
@@ -1109,24 +1120,23 @@ class StemReceiverOp : public Operator {
       }
     }
 
+    auto output_lease = std::make_shared<OutputBufferLease>();
     auto gxf_tensor = std::make_shared<nvidia::gxf::Tensor>();
-    auto allocator_handle =
-        nvidia::gxf::Handle<nvidia::gxf::Allocator>::Create(context.context(), allocator_->gxf_cid());
-
-    auto result = gxf_tensor->reshape<uint16_t>(
-        nvidia::gxf::Shape{static_cast<int>(frames_per_tensor_.get()), FRAME_HEIGHT, FRAME_WIDTH},
+    nvidia::gxf::Shape tensor_shape{
+        static_cast<int32_t>(frames_per_tensor_.get()), FRAME_HEIGHT, FRAME_WIDTH};
+    auto result = gxf_tensor->wrapMemory(
+        tensor_shape,
+        nvidia::gxf::PrimitiveType::kUnsigned16,
+        sizeof(uint16_t),
+        nvidia::gxf::ComputeTrivialStrides(tensor_shape, sizeof(uint16_t)),
         nvidia::gxf::MemoryStorageType::kDevice,
-        allocator_handle.value());
-    if (!result) { throw std::runtime_error("Failed to reshape output tensor"); }
-
-    {
-      profiling::ScopedRange tensor_copy_range("receiver/batch-d2d-copy", profiling::color::kCopy);
-      HOLOSCAN_CUDA_CALL(cudaMemcpyAsync(gxf_tensor->pointer(),
-                                         full_batch_data_d_[assembled_cur_batch_idx_],
-                                         gxf_tensor->bytes_size(),
-                                         cudaMemcpyDeviceToDevice,
-                                         streams_[assembled_cur_batch_idx_]));
-    }
+        full_batch_data_d_[assembled_cur_batch_idx_],
+        [output_lease](void*) mutable {
+          output_lease->released.store(true, std::memory_order_release);
+          output_lease.reset();
+          return nvidia::gxf::Success;
+        });
+    if (!result) { throw std::runtime_error("Failed to wrap receiver output tensor"); }
 
     auto maybedl = gxf_tensor->toDLManagedTensorContext();
     auto holoscan_tensor = std::make_shared<Tensor>(maybedl.value());
@@ -1140,7 +1150,11 @@ class StemReceiverOp : public Operator {
 
     cudaEventRecord(events_[assembled_cur_batch_idx_], streams_[assembled_cur_batch_idx_]);
     assembled_batch_q_.push(AssembledBatch{
-        std::move(batch_holders), events_[assembled_cur_batch_idx_], packets_to_gather, missing_packets});
+        std::move(batch_holders),
+        output_lease,
+        events_[assembled_cur_batch_idx_],
+        packets_to_gather,
+        missing_packets});
 
     auto write_it = pending_packets_.begin();
     for (auto read_it = pending_packets_.begin(); read_it != pending_packets_.end(); ++read_it) {
