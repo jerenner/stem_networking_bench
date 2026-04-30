@@ -185,7 +185,7 @@ class StemReceiverOp : public Operator {
     expected_rows_per_tensor_ = frames_per_tensor_.get() * expected_source_count_ * ROWS_PER_SOURCE;
     header_batch_packets_value_ = header_batch_packets_.get();
     header_batch_slots_value_ = header_batch_slots_.get();
-    if (use_assembled_batching() &&
+    if (use_assembled_batching() && !hds_.get() &&
         (header_batch_packets_value_ == 0 || header_batch_slots_value_ == 0)) {
       HOLOSCAN_LOG_ERROR("header_batch_packets and header_batch_slots must both be greater than 0.");
       exit(1);
@@ -208,7 +208,7 @@ class StemReceiverOp : public Operator {
       cudaEventCreate(&events_[n]);
     }
 
-    if (use_assembled_batching()) {
+    if (use_assembled_batching() && !hds_.get()) {
       header_slots_.resize(header_batch_slots_value_);
       for (auto& slot : header_slots_) {
         CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&slot.h_dev_ptrs),
@@ -232,16 +232,27 @@ class StemReceiverOp : public Operator {
     initialize_packet_debug();
 
     if (use_assembled_batching()) {
-      HOLOSCAN_LOG_INFO(
-          "StemReceiverOp::initialize() using header-aware batch assembly with {} slack packets, "
-          "expected source mask 0x{:02x} ({} sources, {} expected rows/tensor), "
-          "{} async header slots of {} packets each.",
-          batch_close_slack_packets_.get(),
-          expected_source_mask_value_,
-          expected_source_count_,
-          expected_rows_per_tensor_,
-          header_batch_slots_value_,
-          header_batch_packets_value_);
+      if (hds_.get()) {
+        HOLOSCAN_LOG_INFO(
+            "StemReceiverOp::initialize() using header-aware batch assembly with CPU header-data "
+            "split, {} slack packets, expected source mask 0x{:02x} ({} sources, {} expected "
+            "rows/tensor).",
+            batch_close_slack_packets_.get(),
+            expected_source_mask_value_,
+            expected_source_count_,
+            expected_rows_per_tensor_);
+      } else {
+        HOLOSCAN_LOG_INFO(
+            "StemReceiverOp::initialize() using header-aware batch assembly with {} slack packets, "
+            "expected source mask 0x{:02x} ({} sources, {} expected rows/tensor), "
+            "{} async header slots of {} packets each.",
+            batch_close_slack_packets_.get(),
+            expected_source_mask_value_,
+            expected_source_count_,
+            expected_rows_per_tensor_,
+            header_batch_slots_value_,
+            header_batch_packets_value_);
+      }
     } else {
       HOLOSCAN_LOG_INFO(
           "StemReceiverOp::initialize() using legacy arrival-count batching for this configuration.");
@@ -595,7 +606,7 @@ class StemReceiverOp : public Operator {
   }
 
   bool use_assembled_batching() const {
-    return gpu_direct_.get() && reorder_kernel_.get() && !hds_.get();
+    return gpu_direct_.get() && reorder_kernel_.get();
   }
 
   static uint32_t count_sources_in_mask(uint32_t source_mask) {
@@ -758,6 +769,23 @@ class StemReceiverOp : public Operator {
     if (source_id < 4) { return 511 - static_cast<int32_t>(row_offset * 4 + source_id); }
     if (source_id < 8) { return 512 + static_cast<int32_t>(row_offset * 4 + (source_id - 4)); }
     return -1;
+  }
+
+  static PacketHeaderInfo parse_packet_header_host(const uint8_t* src) {
+    PacketHeaderInfo header{};
+    header.source_id = 0xFFFF;
+    header.global_row = -1;
+
+    if (src != nullptr) {
+      header.row_number = (static_cast<uint16_t>(src[5]) << 8) | static_cast<uint16_t>(src[4]);
+      header.source_id = (static_cast<uint16_t>(src[7]) << 8) | static_cast<uint16_t>(src[6]);
+      header.frame_index = header.row_number / ROWS_PER_SOURCE;
+      header.row_offset = header.row_number % ROWS_PER_SOURCE;
+      header.global_row = static_cast<int16_t>(
+          source_id_to_global_row_host(header.source_id, header.row_offset));
+    }
+
+    return header;
   }
 
   int64_t unwrap_frame_index(uint32_t frame_idx) {
@@ -964,11 +992,12 @@ class StemReceiverOp : public Operator {
 
       {
         profiling::ScopedRange gather_range("receiver/gather-packets", profiling::color::kCompute);
+        const uint16_t gather_header_size = hds_.get() ? 0 : custom_header_size_;
         gather_packets_by_placement(reinterpret_cast<uint8_t**>(d_dev_ptrs_[assembled_cur_batch_idx_]),
                                     d_packet_placements_[assembled_cur_batch_idx_],
                                     static_cast<uint8_t*>(full_batch_data_d_[assembled_cur_batch_idx_]),
                                     nom_payload_size_,
-                                    custom_header_size_,
+                                    gather_header_size,
                                     packets_to_gather,
                                     rows_per_tensor_,
                                     streams_[assembled_cur_batch_idx_]);
@@ -1040,6 +1069,34 @@ class StemReceiverOp : public Operator {
     const auto burst_size = static_cast<uint32_t>(get_num_packets(burst));
     if (burst_size == 0) {
       free_all_packets_and_burst_rx(burst);
+      return;
+    }
+
+    if (hds_.get()) {
+      if (burst->hdr.hdr.num_segs < 2) {
+        HOLOSCAN_LOG_ERROR(
+            "split_boundary is enabled for {}, but received a burst with only {} segment(s). "
+            "Check that the RX queue has CPU header and GPU payload memory regions.",
+            name(),
+            burst->hdr.hdr.num_segs);
+        ttl_packets_dropped_ += burst_size;
+        free_all_packets_and_burst_rx(burst);
+        return;
+      }
+
+      auto holder = std::make_shared<BurstHolder>(burst);
+      {
+        profiling::ScopedRange parse_range("receiver/parse-hds-headers", profiling::color::kReceiver);
+        for (uint32_t pkt_idx = 0; pkt_idx < burst_size; ++pkt_idx) {
+          const auto* custom_header =
+              reinterpret_cast<const uint8_t*>(get_segment_packet_ptr(burst, 0, pkt_idx)) +
+              header_size_.get();
+          auto* payload = get_segment_packet_ptr(burst, 1, pkt_idx);
+          add_pending_packet(payload, parse_packet_header_host(custom_header), holder);
+        }
+      }
+
+      try_emit_assembled_batches(op_output, context);
       return;
     }
 
