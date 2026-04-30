@@ -61,7 +61,8 @@ receiver:
   incomplete_batch_log_interval: 100
   incomplete_batch_warn_missing_threshold: 1024
   header_batch_packets: 8192
-  header_batch_slots: 4
+  header_batch_slots: 8
+  high_priority_header_streams: true
   count: 1000000 # Process some number of frames then stop
   # packet_debug: true
   # packet_debug_output_prefix: "/tmp/receiver_packet_debug"

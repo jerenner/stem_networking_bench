@@ -215,6 +215,12 @@ class StemReceiverOp : public Operator {
     }
 
     if (use_assembled_batching() && !hds_.get()) {
+      int least_stream_priority = 0;
+      int greatest_stream_priority = 0;
+      CUDA_TRY(cudaDeviceGetStreamPriorityRange(&least_stream_priority, &greatest_stream_priority));
+      const int header_stream_priority =
+          high_priority_header_streams_.get() ? greatest_stream_priority : 0;
+
       header_slots_.resize(header_batch_slots_value_);
       for (auto& slot : header_slots_) {
         CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&slot.h_dev_ptrs),
@@ -224,7 +230,9 @@ class StemReceiverOp : public Operator {
                                 sizeof(PacketHeaderInfo) * header_batch_packets_value_));
         CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&slot.headers_d),
                             sizeof(PacketHeaderInfo) * header_batch_packets_value_));
-        CUDA_TRY(cudaStreamCreateWithFlags(&slot.stream, cudaStreamNonBlocking));
+        CUDA_TRY(cudaStreamCreateWithPriority(&slot.stream,
+                                              cudaStreamNonBlocking,
+                                              header_stream_priority));
         CUDA_TRY(cudaEventCreateWithFlags(&slot.event, cudaEventDisableTiming));
         slot.holders.reserve(64);
         slot.packet_holder_indices.reserve(header_batch_packets_value_);
@@ -261,6 +269,10 @@ class StemReceiverOp : public Operator {
             expected_rows_per_tensor_,
             header_batch_slots_value_,
             header_batch_packets_value_);
+        if (high_priority_header_streams_.get()) {
+          HOLOSCAN_LOG_INFO(
+              "StemReceiverOp::initialize() using high-priority CUDA streams for header extraction.");
+        }
       }
     } else {
       HOLOSCAN_LOG_INFO(
@@ -367,6 +379,11 @@ class StemReceiverOp : public Operator {
                          "Header Batch Slots",
                          "Number of asynchronous header-transfer chunks that can be in flight or filling.",
                          4U);
+    spec.param<bool>(high_priority_header_streams_,
+                     "high_priority_header_streams",
+                     "High Priority Header Streams",
+                     "Use high-priority CUDA streams for GPU header extraction/readback.",
+                     true);
     spec.param<std::shared_ptr<holoscan::BooleanCondition>>(stop_condition_,
                                                             "stop_condition",
                                                             "Stop Condition",
@@ -808,10 +825,17 @@ class StemReceiverOp : public Operator {
     if (header_slot_full_waits_ == 1 || header_slot_full_waits_ % 100 == 0) {
       HOLOSCAN_LOG_WARN(
           "All {} async header slots are in flight for {}. Waiting for one to complete "
-          "(wait count: {}). Consider increasing header_batch_slots or reducing header_batch_packets.",
+          "(wait count: {}, launched/completed: {}/{}, in-flight: {}, pending packets: {}, "
+          "assembled queue: {}). Consider increasing header_batch_slots or reducing "
+          "header_batch_packets.",
           header_batch_slots_value_,
           name(),
-          header_slot_full_waits_);
+          header_slot_full_waits_,
+          header_batches_launched_,
+          header_batches_completed_,
+          header_inflight_order_.size(),
+          pending_packets_.size(),
+          assembled_batch_q_.size());
     }
 
     if (!header_inflight_order_.empty()) {
@@ -1518,6 +1542,7 @@ class StemReceiverOp : public Operator {
   Parameter<uint32_t> incomplete_batch_warn_missing_threshold_;
   Parameter<uint32_t> header_batch_packets_;
   Parameter<uint32_t> header_batch_slots_;
+  Parameter<bool> high_priority_header_streams_;
   Parameter<std::shared_ptr<holoscan::BooleanCondition>> stop_condition_;
   Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
 
