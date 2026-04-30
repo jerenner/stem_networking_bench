@@ -1,0 +1,8 @@
+export HOLOSCAN_ENABLE_PROFILE=1
+nsys profile \
+  -t cuda,nvtx \
+  -s none --cpuctxsw=none \
+  --force-overwrite true \
+  -o stem_network_fpga_hdr \
+  stem_networking_bench run_with_network_fpga.yaml
+# nsys stats --report nvtx_sum,cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum stem_network_fpga_hdr.nsys-rep
