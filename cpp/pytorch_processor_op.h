@@ -4,6 +4,7 @@
 #include "holoscan/holoscan.hpp"
 #include <torch/torch.h>
 #include <torch/script.h>
+#include <string>
 
 namespace holoscan::ops {
 
@@ -18,9 +19,19 @@ class PyTorchProcessorOp : public Operator {
   void compute(InputContext& op_input, OutputContext&, ExecutionContext& context) override;
 
  private:
+  void loadDarkFrame();
+
   Parameter<std::shared_ptr<holoscan::Allocator>> allocator_;
   Parameter<bool> noop_;
+  Parameter<bool> subtract_dark_frame_;
+  Parameter<std::string> dark_frame_path_;
+  Parameter<std::string> dark_frame_dataset_;
+
   torch::nn::Conv2d conv_{nullptr};
+  torch::Tensor dark_frame_tensor_;
+  int64_t dark_frame_height_ = 0;
+  int64_t dark_frame_width_ = 0;
+  bool dark_frame_loaded_ = false;
   long long frames_processed_ = 0;
 };
 

@@ -13,7 +13,10 @@ replayer:
   count: 16
 
 processor:
-  # Add any parameters for your processor op here
+  noop: false
+  subtract_dark_frame: false
+  dark_frame_path: ""
+  dark_frame_dataset: "/processed"
 
 writer:
   filepath: "/home/jrenner/local/lbl/holoscan/sparse_frames_out.h5"

@@ -114,7 +114,11 @@ receiver1:
 
 processor:
   noop: true
-  # Add any parameters for your processor op here
+  # When true, the processor loads dark_frame_path once at startup and subtracts
+  # that [rows, cols] frame from every incoming frame on GPU. Output becomes float32.
+  subtract_dark_frame: false
+  dark_frame_path: ""
+  dark_frame_dataset: "/processed"
 
 writer:
   filepath: "/workspace/holohub/build/stem_networking_bench/applications/stem_networking_bench/cpp/sparse_frames_out_net.h5"
