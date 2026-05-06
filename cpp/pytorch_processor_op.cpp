@@ -16,6 +16,13 @@ namespace holoscan::ops {
 
 namespace {
 
+struct Hdf5FrameData {
+  std::vector<float> pixels;
+  int64_t height = 0;
+  int64_t width = 0;
+  std::string dataset_path;
+};
+
 std::string normalizeHdf5DatasetPath(const std::string& dataset_path) {
   if (dataset_path.empty()) {
     return "/processed";
@@ -31,6 +38,36 @@ torch::Dtype torchDtypeFromDLDataType(const DLDataType& dtype) {
     return torch::kFloat32;
   }
   throw std::runtime_error("PyTorchProcessorOp: unsupported input tensor dtype for PyTorch wrapping");
+}
+
+Hdf5FrameData readSingleFrameFloatDataset(const std::string& file_path,
+                                          const std::string& dataset_path) {
+  const std::string normalized_path = normalizeHdf5DatasetPath(dataset_path);
+  H5::H5File file(file_path, H5F_ACC_RDONLY);
+  H5::DataSet dataset = file.openDataSet(normalized_path);
+  H5::DataSpace dataspace = dataset.getSpace();
+
+  const int rank = dataspace.getSimpleExtentNdims();
+  std::vector<hsize_t> dims(rank);
+  dataspace.getSimpleExtentDims(dims.data());
+
+  Hdf5FrameData frame;
+  frame.dataset_path = normalized_path;
+  if (rank == 2) {
+    frame.height = static_cast<int64_t>(dims[0]);
+    frame.width = static_cast<int64_t>(dims[1]);
+  } else if (rank == 3 && dims[0] == 1) {
+    frame.height = static_cast<int64_t>(dims[1]);
+    frame.width = static_cast<int64_t>(dims[2]);
+  } else {
+    throw std::runtime_error(
+        "HDF5 dataset must have shape [H,W] or [1,H,W]; use make_dark_frame.py to average raw stacks");
+  }
+
+  const size_t num_pixels = static_cast<size_t>(frame.height) * static_cast<size_t>(frame.width);
+  frame.pixels.resize(num_pixels);
+  dataset.read(frame.pixels.data(), H5::PredType::NATIVE_FLOAT);
+  return frame;
 }
 
 nvidia::gxf::Shape makeGxfShape(torch::IntArrayRef sizes) {
@@ -84,6 +121,12 @@ void PyTorchProcessorOp::setup(OperatorSpec& spec) {
   spec.param(dark_frame_dataset_, "dark_frame_dataset", "Dark Frame Dataset",
              "Dataset path inside dark_frame_path. Supports [H,W] or [1,H,W].",
              std::string("/processed"));
+  spec.param(apply_valid_pixel_mask_, "apply_valid_pixel_mask", "Apply Valid Pixel Mask",
+             "If true, load valid_pixel_mask_dataset from dark_frame_path and zero invalid pixels on GPU.",
+             false);
+  spec.param(valid_pixel_mask_dataset_, "valid_pixel_mask_dataset", "Valid Pixel Mask Dataset",
+             "Dataset path for a 0/1 valid-pixel mask. Supports [H,W] or [1,H,W].",
+             std::string("/valid_pixel_mask"));
 }
 
 void PyTorchProcessorOp::initialize() {
@@ -106,6 +149,9 @@ void PyTorchProcessorOp::initialize() {
     if (subtract_dark_frame_.get()) {
         loadDarkFrame();
     }
+    if (apply_valid_pixel_mask_.get()) {
+        loadValidPixelMask();
+    }
 }
 
 void PyTorchProcessorOp::loadDarkFrame() {
@@ -120,32 +166,12 @@ void PyTorchProcessorOp::loadDarkFrame() {
 
   try {
     H5::Exception::dontPrint();
-    H5::H5File file(dark_frame_path_.get(), H5F_ACC_RDONLY);
-    H5::DataSet dataset = file.openDataSet(dataset_path);
-    H5::DataSpace dataspace = dataset.getSpace();
-
-    const int rank = dataspace.getSimpleExtentNdims();
-    std::vector<hsize_t> dims(rank);
-    dataspace.getSimpleExtentDims(dims.data());
-
-    if (rank == 2) {
-      dark_frame_height_ = static_cast<int64_t>(dims[0]);
-      dark_frame_width_ = static_cast<int64_t>(dims[1]);
-    } else if (rank == 3 && dims[0] == 1) {
-      dark_frame_height_ = static_cast<int64_t>(dims[1]);
-      dark_frame_width_ = static_cast<int64_t>(dims[2]);
-    } else {
-      throw std::runtime_error(
-          "dark frame dataset must have shape [H,W] or [1,H,W]; use make_dark_frame.py to average raw stacks");
-    }
-
-    const size_t num_pixels = static_cast<size_t>(dark_frame_height_) *
-                              static_cast<size_t>(dark_frame_width_);
-    std::vector<float> dark_frame_data(num_pixels);
-    dataset.read(dark_frame_data.data(), H5::PredType::NATIVE_FLOAT);
+    Hdf5FrameData dark_frame = readSingleFrameFloatDataset(dark_frame_path_.get(), dataset_path);
+    dark_frame_height_ = dark_frame.height;
+    dark_frame_width_ = dark_frame.width;
 
     auto cpu_tensor = torch::from_blob(
-                          dark_frame_data.data(),
+                          dark_frame.pixels.data(),
                           {dark_frame_height_, dark_frame_width_},
                           torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
                           .clone();
@@ -155,11 +181,50 @@ void PyTorchProcessorOp::loadDarkFrame() {
     HOLOSCAN_LOG_INFO("PyTorchProcessorOp: Loaded dark frame '{}' dataset '{}' with shape [{}, {}]. "
                       "Dark-subtracted output will be float32.",
                       dark_frame_path_.get(),
-                      dataset_path,
+                      dark_frame.dataset_path,
                       dark_frame_height_,
                       dark_frame_width_);
   } catch (const H5::Exception& e) {
     HOLOSCAN_LOG_ERROR("PyTorchProcessorOp: failed to load dark frame HDF5 '{}:{}': {}",
+                       dark_frame_path_.get(),
+                       dataset_path,
+                       e.getCDetailMsg());
+    throw;
+  }
+}
+
+void PyTorchProcessorOp::loadValidPixelMask() {
+  if (!torch::cuda::is_available()) {
+    throw std::runtime_error("PyTorchProcessorOp: valid-pixel masking requires CUDA-enabled PyTorch");
+  }
+  if (dark_frame_path_.get().empty()) {
+    throw std::runtime_error("PyTorchProcessorOp: apply_valid_pixel_mask=true requires dark_frame_path");
+  }
+
+  const std::string dataset_path = normalizeHdf5DatasetPath(valid_pixel_mask_dataset_.get());
+
+  try {
+    H5::Exception::dontPrint();
+    Hdf5FrameData valid_pixel_mask = readSingleFrameFloatDataset(dark_frame_path_.get(), dataset_path);
+    valid_pixel_mask_height_ = valid_pixel_mask.height;
+    valid_pixel_mask_width_ = valid_pixel_mask.width;
+
+    auto cpu_tensor = torch::from_blob(
+                          valid_pixel_mask.pixels.data(),
+                          {valid_pixel_mask_height_, valid_pixel_mask_width_},
+                          torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+                          .clone();
+    valid_pixel_mask_tensor_ = cpu_tensor.to(torch::kCUDA).contiguous();
+    valid_pixel_mask_loaded_ = true;
+
+    HOLOSCAN_LOG_INFO("PyTorchProcessorOp: Loaded valid pixel mask '{}' dataset '{}' with shape [{}, {}]. "
+                      "Invalid pixels will be zeroed after dark subtraction.",
+                      dark_frame_path_.get(),
+                      valid_pixel_mask.dataset_path,
+                      valid_pixel_mask_height_,
+                      valid_pixel_mask_width_);
+  } catch (const H5::Exception& e) {
+    HOLOSCAN_LOG_ERROR("PyTorchProcessorOp: failed to load valid pixel mask HDF5 '{}:{}': {}",
                        dark_frame_path_.get(),
                        dataset_path,
                        e.getCDetailMsg());
@@ -190,9 +255,10 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
 
   bool use_torch_cuda = torch::cuda::is_available();
   bool subtract_dark = subtract_dark_frame_.get();
+  bool apply_valid_pixel_mask = apply_valid_pixel_mask_.get();
   torch::Tensor output_tensor;
 
-  if (use_torch_cuda && (!noop_.get() || subtract_dark)) {
+  if (use_torch_cuda && (!noop_.get() || subtract_dark || apply_valid_pixel_mask)) {
       profiling::ScopedRange torch_range("processor/torch-processing", profiling::color::kCompute);
       auto options = torch::TensorOptions()
           .dtype(torchDtypeFromDLDataType(frame_tensor->dtype()))
@@ -210,6 +276,14 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
           }
           validateDarkFrameShape(working_tensor.sizes(), dark_frame_height_, dark_frame_width_);
           working_tensor = working_tensor - dark_frame_tensor_;
+      }
+      if (apply_valid_pixel_mask) {
+          if (!valid_pixel_mask_loaded_) {
+              throw std::runtime_error(
+                  "PyTorchProcessorOp: apply_valid_pixel_mask=true but no valid pixel mask is loaded");
+          }
+          validateDarkFrameShape(working_tensor.sizes(), valid_pixel_mask_height_, valid_pixel_mask_width_);
+          working_tensor = working_tensor * valid_pixel_mask_tensor_;
       }
 
       if (!noop_.get()) {

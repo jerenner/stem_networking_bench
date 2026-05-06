@@ -17,6 +17,8 @@ processor:
   subtract_dark_frame: false
   dark_frame_path: ""
   dark_frame_dataset: "/processed"
+  apply_valid_pixel_mask: false
+  valid_pixel_mask_dataset: "/valid_pixel_mask"
 
 writer:
   filepath: "/home/jrenner/local/lbl/holoscan/sparse_frames_out.h5"
