@@ -1,13 +1,16 @@
 // pytorch_processor_op.cpp
 #include "pytorch_processor_op.h"
 #include "nvtx_ranges.hpp"
+#include "kernels.cuh"
 #include "holoscan/core/domain/tensor.hpp"
 #include "gxf/std/tensor.hpp"
 #include "holoscan/utils/cuda_macros.hpp"
 
+#include <ATen/cuda/CUDAContext.h>
 #include <H5Cpp.h>
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -38,6 +41,26 @@ torch::Dtype torchDtypeFromDLDataType(const DLDataType& dtype) {
     return torch::kFloat32;
   }
   throw std::runtime_error("PyTorchProcessorOp: unsupported input tensor dtype for PyTorch wrapping");
+}
+
+bool isUInt16Tensor(const DLDataType& dtype) {
+  return dtype.code == kDLUInt && dtype.bits == 16;
+}
+
+uint32_t frameCountForShape(torch::IntArrayRef sizes) {
+  if (sizes.size() < 2) {
+    throw std::runtime_error("PyTorchProcessorOp: expected tensor rank >= 2 for dark correction");
+  }
+
+  int64_t frame_count = 1;
+  for (size_t dim = 0; dim + 2 < sizes.size(); ++dim) {
+    frame_count *= sizes[dim];
+  }
+  if (frame_count <= 0 ||
+      frame_count > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+    throw std::runtime_error("PyTorchProcessorOp: frame count is outside supported range");
+  }
+  return static_cast<uint32_t>(frame_count);
 }
 
 Hdf5FrameData readSingleFrameFloatDataset(const std::string& file_path,
@@ -269,21 +292,63 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
 
       torch::Tensor pt_tensor = torch::from_blob(gpu_data_ptr, pt_sizes, options);
 
-      torch::Tensor working_tensor = pt_tensor.to(torch::kFloat32);
-      if (subtract_dark) {
-          if (!dark_frame_loaded_) {
-              throw std::runtime_error("PyTorchProcessorOp: subtract_dark_frame=true but no dark frame is loaded");
+      torch::Tensor working_tensor;
+      const bool can_fuse_correction =
+          isUInt16Tensor(frame_tensor->dtype()) && (subtract_dark || apply_valid_pixel_mask);
+      if (can_fuse_correction) {
+          profiling::ScopedRange fused_range("processor/fused-dark-correction", profiling::color::kCompute);
+          if (subtract_dark) {
+              if (!dark_frame_loaded_) {
+                  throw std::runtime_error("PyTorchProcessorOp: subtract_dark_frame=true but no dark frame is loaded");
+              }
+              validateDarkFrameShape(pt_tensor.sizes(), dark_frame_height_, dark_frame_width_);
           }
-          validateDarkFrameShape(working_tensor.sizes(), dark_frame_height_, dark_frame_width_);
-          working_tensor = working_tensor - dark_frame_tensor_;
-      }
-      if (apply_valid_pixel_mask) {
-          if (!valid_pixel_mask_loaded_) {
-              throw std::runtime_error(
-                  "PyTorchProcessorOp: apply_valid_pixel_mask=true but no valid pixel mask is loaded");
+          if (apply_valid_pixel_mask) {
+              if (!valid_pixel_mask_loaded_) {
+                  throw std::runtime_error(
+                      "PyTorchProcessorOp: apply_valid_pixel_mask=true but no valid pixel mask is loaded");
+              }
+              validateDarkFrameShape(pt_tensor.sizes(), valid_pixel_mask_height_, valid_pixel_mask_width_);
           }
-          validateDarkFrameShape(working_tensor.sizes(), valid_pixel_mask_height_, valid_pixel_mask_width_);
-          working_tensor = working_tensor * valid_pixel_mask_tensor_;
+
+          working_tensor = torch::empty(
+              pt_sizes,
+              torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+
+          const auto tensor_sizes = pt_tensor.sizes();
+          const uint32_t height = static_cast<uint32_t>(tensor_sizes[tensor_sizes.size() - 2]);
+          const uint32_t width = static_cast<uint32_t>(tensor_sizes[tensor_sizes.size() - 1]);
+          const uint32_t frames = frameCountForShape(tensor_sizes);
+          cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+          dark_correct_uint16_to_float(
+              reinterpret_cast<const uint16_t*>(gpu_data_ptr),
+              subtract_dark ? dark_frame_tensor_.data_ptr<float>() : nullptr,
+              apply_valid_pixel_mask ? valid_pixel_mask_tensor_.data_ptr<float>() : nullptr,
+              working_tensor.data_ptr<float>(),
+              frames,
+              height,
+              width,
+              subtract_dark,
+              apply_valid_pixel_mask,
+              stream);
+      } else {
+          working_tensor = pt_tensor.to(torch::kFloat32);
+          if (subtract_dark) {
+              if (!dark_frame_loaded_) {
+                  throw std::runtime_error("PyTorchProcessorOp: subtract_dark_frame=true but no dark frame is loaded");
+              }
+              validateDarkFrameShape(working_tensor.sizes(), dark_frame_height_, dark_frame_width_);
+              working_tensor = working_tensor - dark_frame_tensor_;
+          }
+          if (apply_valid_pixel_mask) {
+              if (!valid_pixel_mask_loaded_) {
+                  throw std::runtime_error(
+                      "PyTorchProcessorOp: apply_valid_pixel_mask=true but no valid pixel mask is loaded");
+              }
+              validateDarkFrameShape(working_tensor.sizes(), valid_pixel_mask_height_, valid_pixel_mask_width_);
+              working_tensor = working_tensor * valid_pixel_mask_tensor_;
+          }
       }
 
       if (!noop_.get()) {

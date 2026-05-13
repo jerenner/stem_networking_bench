@@ -79,3 +79,14 @@ void summarize_packets(uint8_t** src_ptrs,
                        uint16_t header_len,
                        uint32_t num_pkts,
                        cudaStream_t stream);
+
+void dark_correct_uint16_to_float(const uint16_t* input,
+                                  const float* dark_frame,
+                                  const float* valid_pixel_mask,
+                                  float* output,
+                                  uint32_t frames,
+                                  uint32_t height,
+                                  uint32_t width,
+                                  bool subtract_dark,
+                                  bool apply_valid_pixel_mask,
+                                  cudaStream_t stream);

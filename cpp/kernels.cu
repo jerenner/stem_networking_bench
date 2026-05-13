@@ -292,3 +292,56 @@ void summarize_packets(uint8_t** src_ptrs,
   summarize_packets_kernel<<<blocks, threads, 0, stream>>>(
       src_ptrs, summaries, payload_len, header_len, num_pkts);
 }
+
+__global__ void dark_correct_uint16_to_float_kernel(const uint16_t* input,
+                                                    const float* dark_frame,
+                                                    const float* valid_pixel_mask,
+                                                    float* output,
+                                                    uint32_t frames,
+                                                    uint32_t frame_pixels,
+                                                    bool subtract_dark,
+                                                    bool apply_valid_pixel_mask) {
+  const uint32_t pixel_stride = blockDim.x * gridDim.x;
+
+  for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       pixel_idx < frame_pixels;
+       pixel_idx += pixel_stride) {
+    const float dark_value = subtract_dark ? dark_frame[pixel_idx] : 0.0f;
+    const float mask_value = apply_valid_pixel_mask ? valid_pixel_mask[pixel_idx] : 1.0f;
+
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+      const uint64_t idx = static_cast<uint64_t>(frame) * frame_pixels + pixel_idx;
+      output[idx] = (static_cast<float>(input[idx]) - dark_value) * mask_value;
+    }
+  }
+}
+
+void dark_correct_uint16_to_float(const uint16_t* input,
+                                  const float* dark_frame,
+                                  const float* valid_pixel_mask,
+                                  float* output,
+                                  uint32_t frames,
+                                  uint32_t height,
+                                  uint32_t width,
+                                  bool subtract_dark,
+                                  bool apply_valid_pixel_mask,
+                                  cudaStream_t stream) {
+  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
+  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
+  if (total_values == 0) { return; }
+
+  const uint32_t threads = 256;
+  const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
+  const uint32_t blocks =
+      static_cast<uint32_t>(required_blocks > 65535 ? 65535 : required_blocks);
+
+  dark_correct_uint16_to_float_kernel<<<blocks, threads, 0, stream>>>(
+      input,
+      dark_frame,
+      valid_pixel_mask,
+      output,
+      frames,
+      static_cast<uint32_t>(frame_pixels),
+      subtract_dark,
+      apply_valid_pixel_mask);
+}
