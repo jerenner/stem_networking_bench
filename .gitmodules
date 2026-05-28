@@ -1,0 +1,3 @@
+[submodule "third_party/daqiri"]
+	path = third_party/daqiri
+	url = https://github.com/NVIDIA/daqiri.git

@@ -1,0 +1,60 @@
+# Phase 0 daqiri default benchmark, RX side (run on spark-201a = spark-stacked-02).
+#
+# Pairs with daqiri_default_tx_spark960b.yaml. See that file's header for the
+# full topology description and run instructions.
+#
+# Run from the stem_networking_bench repo root on spark-201a:
+#
+#   docker run --rm -it --privileged --network host \
+#       --gpus all --ulimit memlock=-1 --ulimit stack=67108864 \
+#       -v /dev/hugepages:/dev/hugepages \
+#       -v "$PWD/cpp_daqiri/benchmarks:/configs" \
+#       daqiri-torch:local \
+#       /opt/daqiri/bin/daqiri_bench_raw_gpudirect \
+#           /configs/daqiri_default_rx_spark201a.yaml --seconds 10
+#
+# Expected: stdout shows "RX complete: packets=... bytes=... bursts=..." with
+# packet count matching what TX sent (within drop tolerance).
+#
+%YAML 1.2
+---
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "raw"
+    master_core: 8
+    debug: false
+    log_level: "info"
+    loopback: ""
+
+    memory_regions:
+    - name: "Data_RX_GPU"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 51200
+      buf_size: 8064
+
+    interfaces:
+    - name: "rx_port"
+      address: 0000:01:00.0
+      rx:
+        flow_isolation: true
+        queues:
+        - name: "rq_q_0"
+          id: 0
+          cpu_core: 18
+          batch_size: 10240
+          memory_regions:
+            - "Data_RX_GPU"
+        flows:
+        - name: "flow_0"
+          id: 0
+          action:
+            type: queue
+            id: 0
+          match:
+            udp_src: 4096
+            udp_dst: 4096
+
+bench_rx:
+  interface_name: "rx_port"
