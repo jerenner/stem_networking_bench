@@ -1,0 +1,7 @@
+
+# Per-rate sweep output. Keep the parsed parity_table_*.md and results.md;
+# discard the raw per-run logs (they regenerate any time the sweep runs).
+cpp_daqiri/benchmarks/sweep_*/
+cpp_daqiri/benchmarks/logs_tx_*/
+cpp_daqiri/benchmarks/logs_rx_*/
+cpp_daqiri/benchmarks/logs_*.driver.log

@@ -35,6 +35,11 @@ bool env_flag_enabled(const char* name) {
   return !value.empty() && value != "0" && value != "false" && value != "FALSE";
 }
 
+// Default to dual-NIC (the production stem FPGA topology) unless the YAML
+// explicitly sets num_receivers. Phase 1 of the daqiri port adds a
+// single-receiver config to validate STEM-format TX from a single Spark NIC.
+constexpr int kDefaultNumReceivers = 2;
+
 }  // namespace
 
 class App : public holoscan::Application {
@@ -63,11 +68,32 @@ class App : public holoscan::Application {
       }
       HOLOSCAN_LOG_INFO("Configured the Advanced Network manager");
 
-      // DPDK is the default manager backend
-      auto receiver0 = make_operator<ops::StemReceiverOp>("receiver0", from_config("receiver0"));
-      auto receiver1 = make_operator<ops::StemReceiverOp>("receiver1", from_config("receiver1"));
-      add_flow(receiver0, processor, {{"output", "input"}});
-      add_flow(receiver1, processor, {{"output", "input"}});
+      int num_receivers = kDefaultNumReceivers;
+      try {
+        num_receivers = from_config("num_receivers").as<int>();
+      } catch (const std::exception&) {
+        HOLOSCAN_LOG_INFO("num_receivers not set in YAML; defaulting to {}",
+                          kDefaultNumReceivers);
+      }
+      if (num_receivers < 1) {
+        HOLOSCAN_LOG_ERROR("num_receivers must be >= 1 (got {})", num_receivers);
+        exit(1);
+      }
+
+      // DPDK is the default manager backend. Single-NIC mode reads from the
+      // bare "receiver:" block; multi-NIC mode reads from "receiver0:",
+      // "receiver1:", ... .
+      if (num_receivers == 1) {
+        auto rcv = make_operator<ops::StemReceiverOp>(
+            "receiver", from_config("receiver"));
+        add_flow(rcv, processor, {{"output", "input"}});
+      } else {
+        for (int i = 0; i < num_receivers; ++i) {
+          const std::string name = "receiver" + std::to_string(i);
+          auto rcv = make_operator<ops::StemReceiverOp>(name, from_config(name));
+          add_flow(rcv, processor, {{"output", "input"}});
+        }
+      }
     }
 
     auto writer = make_operator<ops::HDF5WriterOp>("writer", from_config("writer"));
