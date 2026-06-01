@@ -45,6 +45,7 @@ struct PacketHeaderInfo {
 struct PacketPlacement {
   uint16_t relative_frame;
   int16_t global_row;
+  uint16_t tile_index;
   uint16_t valid;
 };
 
@@ -72,6 +73,18 @@ void gather_packets_by_placement(uint8_t** src_ptrs,
                                  uint32_t num_pkts,
                                  uint32_t max_rows,
                                  cudaStream_t stream);
+
+void gather_tile_packets_by_placement(uint8_t** src_ptrs,
+                                      const PacketPlacement* placements,
+                                      uint8_t* dst_base,
+                                      uint16_t available_payload_len,
+                                      uint16_t header_len,
+                                      uint32_t num_pkts,
+                                      uint32_t frames,
+                                      uint32_t frame_height,
+                                      uint32_t frame_width,
+                                      bool duplicate_prefix_to_simulate_tile_payload,
+                                      cudaStream_t stream);
 
 void summarize_packets(uint8_t** src_ptrs,
                        PacketDebugSummary* summaries,

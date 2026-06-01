@@ -80,6 +80,8 @@ receiver0:
   gpu_direct: true
   split_boundary: false
   reorder_kernel: true
+  tile_readout: true
+  tile_duplicate_prefix_to_simulate_payload: true
   expected_source_mask: 15 # eth IDs 0-3 active; use 255 for all 8 sources
   batch_close_slack_packets: 512
   incomplete_batch_log_interval: 100
@@ -100,6 +102,8 @@ receiver1:
   gpu_direct: true
   split_boundary: false
   reorder_kernel: true
+  tile_readout: true
+  tile_duplicate_prefix_to_simulate_payload: true
   expected_source_mask: 15 # eth IDs 0-3 active; use 255 for all 8 sources
   batch_close_slack_packets: 512
   incomplete_batch_log_interval: 100
