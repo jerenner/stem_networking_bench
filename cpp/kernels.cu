@@ -465,3 +465,135 @@ void dark_correct_uint16_to_float(const uint16_t* input,
       subtract_dark,
       apply_valid_pixel_mask);
 }
+
+__global__ void compute_frame_mean_float_kernel(const float* input,
+                                                float* mean,
+                                                uint32_t frames,
+                                                uint32_t frame_pixels) {
+  const uint32_t pixel_stride = blockDim.x * gridDim.x;
+
+  for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       pixel_idx < frame_pixels;
+       pixel_idx += pixel_stride) {
+    float sum = 0.0f;
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+      const uint64_t idx = static_cast<uint64_t>(frame) * frame_pixels + pixel_idx;
+      sum += input[idx];
+    }
+    mean[pixel_idx] = sum / static_cast<float>(frames);
+  }
+}
+
+void compute_frame_mean_float(const float* input,
+                              float* mean,
+                              uint32_t frames,
+                              uint32_t height,
+                              uint32_t width,
+                              cudaStream_t stream) {
+  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
+  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
+  if (total_values == 0) { return; }
+
+  const uint32_t threads = 256;
+  const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
+  const uint32_t blocks =
+      static_cast<uint32_t>(required_blocks > 65535 ? 65535 : required_blocks);
+
+  compute_frame_mean_float_kernel<<<blocks, threads, 0, stream>>>(
+      input, mean, frames, static_cast<uint32_t>(frame_pixels));
+}
+
+__device__ __forceinline__ float median_from_small_window(float* values, uint32_t count) {
+  const uint32_t median_idx = count / 2;
+  for (uint32_t i = 0; i <= median_idx; ++i) {
+    uint32_t min_idx = i;
+    float min_value = values[i];
+    for (uint32_t j = i + 1; j < count; ++j) {
+      if (values[j] < min_value) {
+        min_value = values[j];
+        min_idx = j;
+      }
+    }
+    values[min_idx] = values[i];
+    values[i] = min_value;
+  }
+  return values[median_idx];
+}
+
+__global__ void apply_dynamic_half_column_mask_float_kernel(float* input,
+                                                           const float* batch_mean,
+                                                           uint32_t frames,
+                                                           uint32_t height,
+                                                           uint32_t width,
+                                                           uint32_t median_window_pixels,
+                                                           float threshold_ratio,
+                                                           float threshold_offset) {
+  constexpr uint32_t kMaxMedianWindowPixels = 129;
+  float window_values[kMaxMedianWindowPixels];
+
+  const uint32_t frame_pixels = height * width;
+  const uint32_t pixel_stride = blockDim.x * gridDim.x;
+  const uint32_t half_height = height / 2;
+
+  for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       pixel_idx < frame_pixels;
+       pixel_idx += pixel_stride) {
+    const uint32_t row = pixel_idx / width;
+    const uint32_t col = pixel_idx - row * width;
+    const uint32_t half_start = row < half_height ? 0 : half_height;
+    const uint32_t half_end = row < half_height ? half_height : height;
+
+    const uint32_t radius = median_window_pixels / 2;
+    uint32_t row_start = row > radius ? row - radius : half_start;
+    row_start = row_start < half_start ? half_start : row_start;
+    uint32_t row_end = row + radius + 1;
+    row_end = row_end > half_end ? half_end : row_end;
+
+    uint32_t count = 0;
+    for (uint32_t sample_row = row_start;
+         sample_row < row_end && count < kMaxMedianWindowPixels;
+         ++sample_row) {
+      window_values[count++] = batch_mean[static_cast<uint64_t>(sample_row) * width + col];
+    }
+    if (count == 0) { continue; }
+
+    const float local_median = median_from_small_window(window_values, count);
+    const float current_value = batch_mean[pixel_idx];
+    const float threshold = local_median * threshold_ratio + threshold_offset;
+    if (current_value <= threshold) { continue; }
+
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+      const uint64_t idx = static_cast<uint64_t>(frame) * frame_pixels + pixel_idx;
+      input[idx] = 0.0f;
+    }
+  }
+}
+
+void apply_dynamic_half_column_mask_float(float* input,
+                                          const float* batch_mean,
+                                          uint32_t frames,
+                                          uint32_t height,
+                                          uint32_t width,
+                                          uint32_t median_window_pixels,
+                                          float threshold_ratio,
+                                          float threshold_offset,
+                                          cudaStream_t stream) {
+  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
+  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
+  if (total_values == 0) { return; }
+
+  const uint32_t threads = 256;
+  const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
+  const uint32_t blocks =
+      static_cast<uint32_t>(required_blocks > 65535 ? 65535 : required_blocks);
+
+  apply_dynamic_half_column_mask_float_kernel<<<blocks, threads, 0, stream>>>(
+      input,
+      batch_mean,
+      frames,
+      height,
+      width,
+      median_window_pixels,
+      threshold_ratio,
+      threshold_offset);
+}
