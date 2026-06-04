@@ -10,6 +10,8 @@ replayer:
   filepath: "/home/jrenner/local/lbl/holoscan/sparse_frames.h5"
   dataset_name: "/frames"
   repeat: false
+  start_frame: 0
+  frames_per_tensor: 128
   count: 16
 
 processor:
@@ -19,6 +21,10 @@ processor:
   dark_frame_dataset: "/processed"
   apply_valid_pixel_mask: false
   valid_pixel_mask_dataset: "/valid_pixel_mask"
+  apply_dynamic_half_column_mask: false
+  dynamic_mask_median_window_pixels: 31
+  dynamic_mask_threshold_ratio: 1.0
+  dynamic_mask_threshold_offset: 500.0
 
 writer:
   filepath: "/home/jrenner/local/lbl/holoscan/sparse_frames_out.h5"
