@@ -1,0 +1,63 @@
+# IGX Orin + RTX 6000 Ada production RX config for stem_daqiri_rx.
+# Primary topology: RX-only from an external FPGA source into device VRAM.
+# Replace the FPGA-facing PCIe PF and flow match values per production box.
+#
+%YAML 1.2
+---
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "raw"
+    master_core: 8
+    debug: false
+    log_level: "info"
+    loopback: ""
+
+    memory_regions:
+    - name: "Data_RX_GPU"
+      kind: "device"
+      affinity: 0
+      num_bufs: 262144
+      buf_size: 8064   # >= packet size 7786
+
+    interfaces:
+    - name: "rx_port"
+      address: "<FPGA-facing PF>"
+      rx:
+        flow_isolation: true
+        queues:
+        - name: "rx_q_0"
+          id: 0
+          cpu_core: 9
+          batch_size: 4096
+          timeout_us: 1000
+          memory_regions:
+            - "Data_RX_GPU"
+        flows:
+        - name: "flow_0"
+          id: 0
+          action:
+            type: queue
+            id: 0
+          match:
+            udp_dst: 4096   # replace per FPGA flow
+            ipv4_len: 7772  # replace if the FPGA packet length differs
+
+stem_rx:
+  interface_name: "rx_port"
+  frames_per_tensor: 16
+  header_size: 42
+  payload_size: 7680
+  expected_source_mask: 255
+  batch_close_slack_packets: 512
+  total_time_to_recv: -1.0
+  capture_latency: false
+  gpu_header_extract: true
+  subtract_dark: true
+  apply_valid_pixel_mask: true
+
+writer:
+  filepath: "/tmp/stem_rx_igx_production.h5"
+  dataset_name: "/processed"
+  noop: true
+  num_concurrent: 3

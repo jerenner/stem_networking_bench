@@ -39,6 +39,7 @@
 #   STEM_BUILD_TYPE          CMake build type (default Release).
 #   STEM_DAQIRI_BUILD_TX     ON to build the TX binary (Phase 1+).
 #   STEM_DAQIRI_BUILD_RX     ON to build the RX binary (Phase 2+).
+#   STEM_DAQIRI_ENABLE_HDF5  ON to build the optional RX smoke/debug HDF5 writer.
 
 ARG DAQIRI_BASE=daqiri-torch:local
 
@@ -48,10 +49,14 @@ ARG DAQIRI_MGR="dpdk"
 ARG STEM_BUILD_TYPE=Release
 ARG STEM_DAQIRI_BUILD_TX=OFF
 ARG STEM_DAQIRI_BUILD_RX=OFF
+ARG STEM_DAQIRI_ENABLE_HDF5=ON
 
 # build-essential, ninja, pkgconf, and CUDA dev headers are already in the
 # daqiri-torch:local image (DPDK was built from source there). yaml-cpp dev
 # headers come from daqiri's third_party/yaml-cpp via add_subdirectory.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libhdf5-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace/stem
 COPY third_party/daqiri /workspace/stem/third_party/daqiri
@@ -65,6 +70,7 @@ RUN rm -rf /workspace/stem/cpp_daqiri/build \
              -DDAQIRI_MGR="${DAQIRI_MGR}" \
              -DSTEM_DAQIRI_BUILD_TX=${STEM_DAQIRI_BUILD_TX} \
              -DSTEM_DAQIRI_BUILD_RX=${STEM_DAQIRI_BUILD_RX} \
+             -DSTEM_DAQIRI_ENABLE_HDF5=${STEM_DAQIRI_ENABLE_HDF5} \
              -DCMAKE_INSTALL_PREFIX=/opt/stem_daqiri \
     && cmake --build /workspace/stem/cpp_daqiri/build -j "$(nproc)" \
     && cmake --install /workspace/stem/cpp_daqiri/build
@@ -76,10 +82,14 @@ RUN rm -rf /workspace/stem/cpp_daqiri/build \
 # runtime use.
 FROM ${DAQIRI_BASE} AS runtime
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libhdf5-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=stem-daqiri-build /opt/stem_daqiri /opt/stem_daqiri
 
 ENV PATH=/opt/stem_daqiri/bin:${PATH}
-ENV LD_LIBRARY_PATH=/opt/daqiri/lib:${LD_LIBRARY_PATH}
+ENV LD_LIBRARY_PATH=/opt/stem_daqiri/lib:/opt/daqiri/lib:${LD_LIBRARY_PATH}
 
 WORKDIR /opt/stem_daqiri/bin
 CMD ["./stem_daqiri_hello", "--self-test"]
