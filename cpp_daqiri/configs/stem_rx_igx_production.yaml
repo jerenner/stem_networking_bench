@@ -53,8 +53,8 @@ stem_rx:
   total_time_to_recv: -1.0
   capture_latency: false
   gpu_header_extract: true
-  subtract_dark: true
-  apply_valid_pixel_mask: true
+  subtract_dark: false
+  apply_valid_pixel_mask: false
 
 writer:
   filepath: "/tmp/stem_rx_igx_production.h5"

@@ -179,6 +179,10 @@ StemRxConfig parse_stem_rx_cfg(const YAML::Node& root) {
 volatile std::sig_atomic_t g_stop_requested = 0;
 void on_sigint(int) { g_stop_requested = 1; }
 
+struct RxRunStatus {
+  std::atomic<bool> validation_failed{false};
+};
+
 // ---------------------------------------------------------------------------
 // Burst lifetime wrapper. A daqiri burst holds N packets; the daqiri pool
 // reclaims those packets only when we call free_all_packets_and_burst_rx.
@@ -481,6 +485,9 @@ class FrameAssembler {
   uint64_t validation_partial_batches() const { return validation_partial_batches_; }
   uint64_t validation_rows_checked() const { return validation_rows_checked_; }
   uint64_t validation_mismatches() const { return validation_mismatches_; }
+  uint64_t incomplete_batches() const { return incomplete_batches_; }
+  uint64_t incomplete_missing_total() const { return incomplete_missing_total_; }
+  uint64_t incomplete_missing_max() const { return incomplete_missing_max_; }
   uint64_t output_pool_drops() const { return output_pool_drops_; }
   uint64_t sink_queued() const { return sink_ ? sink_->queued() : 0; }
   uint64_t sink_written() const { return sink_ ? sink_->written() : 0; }
@@ -911,8 +918,10 @@ class FrameAssembler {
     pending_packets_.erase(write_it, pending_packets_.end());
 
     if (pkts_to_gather < expected_rows_per_batch_) {
+      const uint64_t missing = expected_rows_per_batch_ - pkts_to_gather;
       incomplete_batches_++;
-      incomplete_missing_total_ += expected_rows_per_batch_ - pkts_to_gather;
+      incomplete_missing_total_ += missing;
+      incomplete_missing_max_ = std::max(incomplete_missing_max_, missing);
     }
 
     current_batch_start_abs_frame_ += cfg_.frames_per_tensor;
@@ -962,6 +971,7 @@ class FrameAssembler {
   bool       stream_synced_ = false;
   uint64_t   incomplete_batches_ = 0;
   uint64_t   incomplete_missing_total_ = 0;
+  uint64_t   incomplete_missing_max_ = 0;
 
   // Phase 3 dark-correction processor scratch.
   float* gpu_dark_frame_ = nullptr;
@@ -995,7 +1005,7 @@ class FrameAssembler {
 // ---------------------------------------------------------------------------
 // RX worker.
 // ---------------------------------------------------------------------------
-void rx_worker(const StemRxConfig& cfg, std::atomic<bool>& stop) {
+void rx_worker(const StemRxConfig& cfg, std::atomic<bool>& stop, RxRunStatus* status) {
   const int port_id = daqiri::get_port_id(cfg.interface_name);
   if (port_id < 0) {
     std::cerr << "Invalid RX interface_name: " << cfg.interface_name << "\n";
@@ -1067,6 +1077,12 @@ void rx_worker(const StemRxConfig& cfg, std::atomic<bool>& stop) {
   // now retained across batch boundaries. Report 0 explicitly so any
   // existing parser that grepped that line still works.
   std::printf("  out-of-window    : 0\n");
+  std::printf("  incomplete batches: %lu\n",
+              static_cast<unsigned long>(asm_state.incomplete_batches()));
+  std::printf("  incomplete missing: %lu\n",
+              static_cast<unsigned long>(asm_state.incomplete_missing_total()));
+  std::printf("  incomplete max    : %lu\n",
+              static_cast<unsigned long>(asm_state.incomplete_missing_max()));
   std::printf("  sink pool drops  : %lu\n",
               static_cast<unsigned long>(asm_state.output_pool_drops()));
   std::printf("  sink queued      : %lu\n",
@@ -1084,6 +1100,17 @@ void rx_worker(const StemRxConfig& cfg, std::atomic<bool>& stop) {
                 static_cast<unsigned long>(asm_state.validation_rows_checked()));
     std::printf("  ramp mismatches  : %lu\n",
                 static_cast<unsigned long>(asm_state.validation_mismatches()));
+    const bool failed =
+        asm_state.validation_batches() == 0 || asm_state.validation_mismatches() != 0;
+    if (failed) {
+      std::fprintf(stderr,
+                   "validate_tx_ramp failed: full_batches=%lu mismatches=%lu\n",
+                   static_cast<unsigned long>(asm_state.validation_batches()),
+                   static_cast<unsigned long>(asm_state.validation_mismatches()));
+      if (status != nullptr) {
+        status->validation_failed.store(true, std::memory_order_release);
+      }
+    }
   }
 
   if (cfg.capture_latency) {
@@ -1155,10 +1182,11 @@ int main(int argc, char** argv) {
             << " duration=" << cfg.total_time_to_recv_s << " s\n";
 
   std::atomic<bool> stop{false};
-  std::thread t(rx_worker, cfg, std::ref(stop));
+  RxRunStatus status;
+  std::thread t(rx_worker, cfg, std::ref(stop), &status);
   t.join();
 
   daqiri::print_stats();
   daqiri::shutdown();
-  return 0;
+  return status.validation_failed.load(std::memory_order_acquire) ? 2 : 0;
 }

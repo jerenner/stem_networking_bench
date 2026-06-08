@@ -54,11 +54,11 @@ stem_rx:
   capture_latency: true
   gpu_header_extract: true
   validate_tx_ramp: false
-  subtract_dark: true
-  apply_valid_pixel_mask: true
+  subtract_dark: false
+  apply_valid_pixel_mask: false
 
 writer:
   filepath: "/tmp/stem_rx_igx_loopback.h5"
   dataset_name: "/processed"
-  noop: false
+  noop: true
   num_concurrent: 3

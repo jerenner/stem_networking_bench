@@ -44,7 +44,7 @@ update --init`:
 ```bash
 rmdir third_party/daqiri 2>/dev/null || true
 git clone --recursive https://github.com/NVIDIA/daqiri.git third_party/daqiri
-git -C third_party/daqiri checkout main
+git -C third_party/daqiri checkout 8c5d69fa3c9bf9e57f6625114b5f0828bb592729
 git -C third_party/daqiri submodule update --init --recursive
 ```
 

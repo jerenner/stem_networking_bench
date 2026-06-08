@@ -123,6 +123,10 @@ Connect `0005:03:00.0` directly to `0005:03:00.1`, then run:
 cpp_daqiri/scripts/run_igx_loopback.sh --rate 20 --tx-seconds 10 --rx-seconds 60
 ```
 
+The loopback RX config defaults to `writer.noop: true` and leaves the optional
+dark/mask processor off so this command measures RX/TX throughput without disk
+I/O or extra processing on the hot path.
+
 Manual RX-first launch:
 
 ```bash
@@ -164,7 +168,11 @@ Correctness gate:
 
 The ramp validator copies complete assembled uint16 batches back to host and
 checks the deterministic TX row ramp byte-for-byte in the assembled columns.
+It exits nonzero if no complete batch is checked or if any mismatch is found.
 For throughput, leave `--validate-ramp` off.
+
+For an HDF5 smoke run, copy the RX config, set `writer.noop: false`, and run at
+a low rate. The HDF5 writer is a debug sink, not the throughput default.
 
 ## Two-Spark Setup
 
