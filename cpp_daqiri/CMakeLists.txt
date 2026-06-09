@@ -34,6 +34,16 @@ find_package(CUDAToolkit REQUIRED)
 # ---------------------------------------------------------------------------
 option(STEM_DAQIRI_BUILD_TX "Build the STEM daqiri TX binary (Phase 1+)" OFF)
 option(STEM_DAQIRI_BUILD_RX "Build the STEM daqiri RX binary (Phase 2+)" OFF)
+option(STEM_DAQIRI_ENABLE_HDF5 "Enable the RX debug HDF5 writer when HDF5 is available" ON)
+
+if(STEM_DAQIRI_ENABLE_HDF5)
+  find_package(HDF5 COMPONENTS CXX QUIET)
+  if(HDF5_FOUND)
+    message(STATUS "HDF5 found; stem_daqiri_rx will include the debug HDF5 writer")
+  else()
+    message(WARNING "HDF5 not found; stem_daqiri_rx will build with writer.noop support only")
+  endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Bring daqiri in as a subproject. We disable daqiri's own examples to avoid
@@ -124,6 +134,11 @@ if(STEM_DAQIRI_BUILD_RX)
     CUDA::cudart
     ${STEM_DAQIRI_YAML_TARGET}
   )
+  if(STEM_DAQIRI_ENABLE_HDF5 AND HDF5_FOUND)
+    target_compile_definitions(stem_daqiri_rx PRIVATE STEM_DAQIRI_HAVE_HDF5=1)
+    target_include_directories(stem_daqiri_rx PRIVATE ${HDF5_INCLUDE_DIRS})
+    target_link_libraries(stem_daqiri_rx PRIVATE ${HDF5_CXX_LIBRARIES})
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -133,10 +148,17 @@ set(STEM_DAQIRI_CONFIGS
   configs/hello_self_test.yaml
 )
 if(STEM_DAQIRI_BUILD_TX)
-  list(APPEND STEM_DAQIRI_CONFIGS configs/stem_tx_spark.yaml)
+  list(APPEND STEM_DAQIRI_CONFIGS
+    configs/stem_tx_spark.yaml
+    configs/stem_tx_igx_loopback.yaml
+  )
 endif()
 if(STEM_DAQIRI_BUILD_RX)
-  list(APPEND STEM_DAQIRI_CONFIGS configs/stem_rx_spark.yaml)
+  list(APPEND STEM_DAQIRI_CONFIGS
+    configs/stem_rx_spark.yaml
+    configs/stem_rx_igx_production.yaml
+    configs/stem_rx_igx_loopback.yaml
+  )
 endif()
 
 foreach(cfg IN LISTS STEM_DAQIRI_CONFIGS)

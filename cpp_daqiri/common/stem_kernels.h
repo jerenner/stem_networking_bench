@@ -40,6 +40,7 @@ struct PacketHeaderInfo {
   uint16_t frame_index;
   uint16_t row_offset;
   int16_t  global_row;  // -1 means invalid source_id
+  uint64_t epoch_us;
 };
 
 struct PacketPlacement {

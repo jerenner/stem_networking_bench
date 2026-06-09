@@ -1,0 +1,56 @@
+# IGX Orin + RTX 6000 Ada HW-loopback TX config for stem_daqiri_tx.
+# Cable TX 0005:03:00.0 directly to RX 0005:03:00.1.
+#
+%YAML 1.2
+---
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "raw"
+    master_core: 7
+    debug: false
+    log_level: "info"
+    loopback: ""
+
+    memory_regions:
+    - name: "Data_TX_GPU"
+      kind: "device"
+      affinity: 0
+      num_bufs: 51200
+      buf_size: 8064   # >= header_size(42) + payload_size(7744) = 7786
+
+    interfaces:
+    - name: "tx_port"
+      address: "0005:03:00.0"
+      tx:
+        queues:
+        - name: "tx_q_0"
+          id: 0
+          batch_size: 4096
+          cpu_core: 10
+          memory_regions:
+            - "Data_TX_GPU"
+          offloads:
+            - "tx_eth_src"
+
+stem_tx:
+  interface_name: "tx_port"
+  batch_size: 1024
+  header_size: 42
+  payload_size: 7744
+
+  ip_src_addr:  "10.99.99.1"
+  ip_dst_addr:  "10.99.99.2"
+  eth_src_addr: "48:b0:2d:f4:04:23"
+  eth_dst_addr: "48:b0:2d:f4:04:24"
+  udp_src_port: 4096
+  udp_dst_port: 4096
+
+  num_sources_active: 8
+  rows_per_source:    128
+  update_headers_per_burst: true
+  stamp_epoch_us: true
+
+  target_rate_gbps: 20.0
+  total_time_to_send: 10.0
+  total_bytes_cap: 0

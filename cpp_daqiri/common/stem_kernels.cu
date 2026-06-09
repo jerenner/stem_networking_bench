@@ -131,6 +131,7 @@ __global__ void stem_extract_packet_headers_kernel(uint8_t** src_ptrs,
   PacketHeaderInfo h{};
   h.source_id = 0xFFFF;
   h.global_row = -1;
+  h.epoch_us = 0;
 
   uint8_t* src = src_ptrs[pkt_idx];
   if (src != nullptr) {
@@ -142,6 +143,9 @@ __global__ void stem_extract_packet_headers_kernel(uint8_t** src_ptrs,
     h.row_offset  = h.row_number % ROWS_PER_SOURCE;
     h.global_row = static_cast<int16_t>(
         source_id_to_global_row(h.source_id, h.row_offset));
+    for (uint32_t i = 0; i < sizeof(uint64_t); ++i) {
+      h.epoch_us |= static_cast<uint64_t>(src[STEM_HDR_OFF_EPOCH_US + i]) << (i * 8);
+    }
   }
   headers[pkt_idx] = h;
 }
