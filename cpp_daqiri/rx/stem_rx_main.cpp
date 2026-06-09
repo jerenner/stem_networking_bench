@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -722,7 +723,10 @@ class FrameAssembler {
     const uint64_t relative_frame = abs_frame - current_batch_start_abs_frame_;
     const uint64_t cell =
         relative_frame * stem::FRAME_HEIGHT + static_cast<uint64_t>(header.global_row);
-    if (cell < current_batch_occupied_.size() && !current_batch_occupied_[cell]) {
+    // relative_frame < frames_per_tensor and global_row < FRAME_HEIGHT are
+    // both enforced upstream, so cell < rows_per_tensor_ by construction.
+    assert(cell < current_batch_occupied_.size());
+    if (!current_batch_occupied_[cell]) {
       current_batch_occupied_[cell] = 1;
       current_batch_unique_packets_++;
     }
@@ -830,7 +834,6 @@ class FrameAssembler {
   void close_batch_and_emit(uint64_t* frames_assembled) {
     const uint64_t batch_end =
         current_batch_start_abs_frame_ + cfg_.frames_per_tensor;
-    OutputSlot* output_slot = acquire_output_slot();
 
     // Walk pending_packets_ once: copy in-window entries to scratch,
     // keep future entries, drop stale entries.
@@ -855,8 +858,10 @@ class FrameAssembler {
             read_it->abs_frame - current_batch_start_abs_frame_;
         const uint64_t cell =
             rel_frame * stem::FRAME_HEIGHT + static_cast<uint64_t>(read_it->global_row);
-        if (cell >= emit_cell_generation_.size() ||
-            emit_cell_generation_[cell] == emit_generation_) {
+        // cell < rows_per_tensor_ by construction (see admit_packet).
+        assert(cell < emit_cell_generation_.size());
+        if (emit_cell_generation_[cell] == emit_generation_) {
+          // Duplicate (frame, row) within this close; drop the later copy.
           continue;
         }
         emit_cell_generation_[cell] = emit_generation_;
@@ -870,7 +875,13 @@ class FrameAssembler {
       }
       // do NOT write_it++ -- this entry is consumed
     }
-    if (output_slot != nullptr && pkts_to_gather > 0) {
+
+    // Only claim a sink slot when we actually have something to gather; this
+    // keeps output_pool_drops a true "writer fell behind" signal instead of
+    // including empty-window closes.
+    OutputSlot* output_slot =
+        pkts_to_gather > 0 ? acquire_output_slot() : nullptr;
+    if (output_slot != nullptr) {
       STEM_CUDA_TRY(cudaMemsetAsync(output_slot->gpu_u16, 0,
                                     rows_per_tensor_ * cfg_.payload_size,
                                     stream_));
@@ -909,10 +920,12 @@ class FrameAssembler {
       STEM_CUDA_TRY(cudaEventSynchronize(output_slot->ready));
       validate_tx_ramp_batch(pkts_to_gather, output_slot->gpu_u16);
       sink_->enqueue(output_slot);
+      // frames_assembled counts only batches that produced a GPU tensor;
+      // empty closes (pkts_to_gather==0) and pool-starved closes
+      // (output_slot==nullptr) do not bump it, so the reported fps reflects
+      // real downstream-visible frames.
       (*frames_assembled) += cfg_.frames_per_tensor;
       emitted_batches_++;
-    } else if (output_slot != nullptr) {
-      release_output_slot(output_slot);
     }
 
     pending_packets_.erase(write_it, pending_packets_.end());
@@ -943,7 +956,9 @@ class FrameAssembler {
         const uint64_t relative_frame = e.abs_frame - current_batch_start_abs_frame_;
         const uint64_t cell =
             relative_frame * stem::FRAME_HEIGHT + static_cast<uint64_t>(e.global_row);
-        if (cell < current_batch_occupied_.size() && !current_batch_occupied_[cell]) {
+        // cell < rows_per_tensor_ by construction (see admit_packet).
+        assert(cell < current_batch_occupied_.size());
+        if (!current_batch_occupied_[cell]) {
           current_batch_occupied_[cell] = 1;
           current_batch_unique_packets_++;
         }
