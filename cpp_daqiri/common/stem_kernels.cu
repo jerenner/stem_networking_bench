@@ -282,6 +282,137 @@ void stem_gather_packets_by_placement(uint8_t** src_ptrs,
       num_pkts, max_rows);
 }
 
+// ---------------------------------------------------------------------------
+// Tile readout. Ported 1:1 from cpp/kernels.cu::tile_geometry +
+// gather_tile_packets_by_placement (upstream jerenner/stem_networking_bench
+// `tiling` branch). The wire payload still comes from the existing row TX,
+// so the kernel optionally fills the missing tail of a 4096-sample tile by
+// wrapping back to the start of the available payload.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ bool tile_geometry(uint32_t tile_index,
+                                              uint32_t& row_start,
+                                              uint32_t& col_start,
+                                              uint32_t& tile_height,
+                                              uint32_t& tile_width) {
+  constexpr uint32_t kZlpTileCols = TILE_ZLP_COLUMNS / TILE_ZLP_TILE_WIDTH;
+  constexpr uint32_t kZlpTileRows = FRAME_HEIGHT / TILE_ZLP_TILE_HEIGHT;
+  constexpr uint32_t kZlpTiles    = kZlpTileCols * kZlpTileRows;
+  constexpr uint32_t kCoreColumns = FRAME_WIDTH - TILE_ZLP_COLUMNS;
+  constexpr uint32_t kCoreTileCols = kCoreColumns / TILE_CORE_TILE_WIDTH;
+  constexpr uint32_t kCoreTileRows = FRAME_HEIGHT / TILE_CORE_TILE_HEIGHT;
+  constexpr uint32_t kCoreTiles    = kCoreTileCols * kCoreTileRows;
+
+  if (tile_index < kZlpTiles) {
+    const uint32_t tile_row = tile_index / kZlpTileCols;
+    const uint32_t tile_col = tile_index % kZlpTileCols;
+    row_start   = tile_row * TILE_ZLP_TILE_HEIGHT;
+    col_start   = tile_col * TILE_ZLP_TILE_WIDTH;
+    tile_height = TILE_ZLP_TILE_HEIGHT;
+    tile_width  = TILE_ZLP_TILE_WIDTH;
+    return true;
+  }
+
+  const uint32_t core_index = tile_index - kZlpTiles;
+  if (core_index >= kCoreTiles) { return false; }
+
+  const uint32_t tile_row = core_index / kCoreTileCols;
+  const uint32_t tile_col = core_index % kCoreTileCols;
+  row_start   = tile_row * TILE_CORE_TILE_HEIGHT;
+  col_start   = TILE_ZLP_COLUMNS + tile_col * TILE_CORE_TILE_WIDTH;
+  tile_height = TILE_CORE_TILE_HEIGHT;
+  tile_width  = TILE_CORE_TILE_WIDTH;
+  return true;
+}
+
+__global__ void stem_gather_tile_packets_by_placement_kernel(
+    uint8_t** src_ptrs,
+    const PacketPlacement* placements,
+    uint8_t* dst_base,
+    uint16_t available_payload_len,
+    uint16_t header_len,
+    uint32_t num_pkts,
+    uint32_t frames,
+    uint32_t frame_height,
+    uint32_t frame_width,
+    bool duplicate_prefix_to_simulate_tile_payload) {
+  const uint32_t pkt_idx = blockIdx.x;
+  if (pkt_idx >= num_pkts) { return; }
+
+  const PacketPlacement placement = placements[pkt_idx];
+  if (!placement.valid || placement.relative_frame >= frames) { return; }
+
+  uint32_t row_start  = 0;
+  uint32_t col_start  = 0;
+  uint32_t tile_h     = 0;
+  uint32_t tile_w     = 0;
+  if (!tile_geometry(placement.tile_index, row_start, col_start, tile_h, tile_w)) {
+    return;
+  }
+  if (row_start + tile_h > frame_height || col_start + tile_w > frame_width) {
+    return;
+  }
+
+  uint8_t* src = src_ptrs[pkt_idx];
+  if (src == nullptr) { return; }
+
+  const uint16_t* payload = reinterpret_cast<const uint16_t*>(src + header_len);
+  uint16_t*       output  = reinterpret_cast<uint16_t*>(dst_base);
+  const uint32_t  available_samples =
+      available_payload_len / sizeof(uint16_t);
+  const uint64_t  frame_offset =
+      static_cast<uint64_t>(placement.relative_frame) *
+      static_cast<uint64_t>(frame_height) *
+      static_cast<uint64_t>(frame_width);
+
+  for (uint32_t sample_idx = threadIdx.x;
+       sample_idx < TILE_SAMPLES;
+       sample_idx += blockDim.x) {
+    uint32_t src_sample_idx = sample_idx;
+    if (duplicate_prefix_to_simulate_tile_payload &&
+        src_sample_idx >= available_samples) {
+      src_sample_idx -= available_samples;
+    }
+    if (src_sample_idx >= available_samples) { continue; }
+
+    const uint32_t local_row = sample_idx / tile_w;
+    const uint32_t local_col = sample_idx - local_row * tile_w;
+    if (local_row >= tile_h) { continue; }
+
+    const uint64_t dst_idx =
+        frame_offset +
+        static_cast<uint64_t>(row_start + local_row) *
+            static_cast<uint64_t>(frame_width) +
+        static_cast<uint64_t>(col_start + local_col);
+    output[dst_idx] = payload[src_sample_idx];
+  }
+}
+
+void stem_gather_tile_packets_by_placement(
+    uint8_t** src_ptrs,
+    const PacketPlacement* placements,
+    uint8_t* dst_base,
+    uint16_t available_payload_len,
+    uint16_t header_len,
+    uint32_t num_pkts,
+    uint32_t frames,
+    uint32_t frame_height,
+    uint32_t frame_width,
+    bool duplicate_prefix_to_simulate_tile_payload,
+    cudaStream_t stream) {
+  if (num_pkts == 0) { return; }
+  stem_gather_tile_packets_by_placement_kernel<<<num_pkts, 256, 0, stream>>>(
+      src_ptrs,
+      placements,
+      dst_base,
+      available_payload_len,
+      header_len,
+      num_pkts,
+      frames,
+      frame_height,
+      frame_width,
+      duplicate_prefix_to_simulate_tile_payload);
+}
+
 // ===========================================================================
 // Phase 3 processor -- dark-frame subtract + valid-pixel mask, uint16 -> fp32
 // ===========================================================================
