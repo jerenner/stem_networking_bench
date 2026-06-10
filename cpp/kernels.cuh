@@ -45,6 +45,7 @@ struct PacketHeaderInfo {
 struct PacketPlacement {
   uint16_t relative_frame;
   int16_t global_row;
+  uint16_t tile_index;
   uint16_t valid;
 };
 
@@ -73,6 +74,18 @@ void gather_packets_by_placement(uint8_t** src_ptrs,
                                  uint32_t max_rows,
                                  cudaStream_t stream);
 
+void gather_tile_packets_by_placement(uint8_t** src_ptrs,
+                                      const PacketPlacement* placements,
+                                      uint8_t* dst_base,
+                                      uint16_t available_payload_len,
+                                      uint16_t header_len,
+                                      uint32_t num_pkts,
+                                      uint32_t frames,
+                                      uint32_t frame_height,
+                                      uint32_t frame_width,
+                                      bool duplicate_prefix_to_simulate_tile_payload,
+                                      cudaStream_t stream);
+
 void summarize_packets(uint8_t** src_ptrs,
                        PacketDebugSummary* summaries,
                        uint16_t payload_len,
@@ -90,3 +103,20 @@ void dark_correct_uint16_to_float(const uint16_t* input,
                                   bool subtract_dark,
                                   bool apply_valid_pixel_mask,
                                   cudaStream_t stream);
+
+void compute_frame_mean_float(const float* input,
+                              float* mean,
+                              uint32_t frames,
+                              uint32_t height,
+                              uint32_t width,
+                              cudaStream_t stream);
+
+void apply_dynamic_half_column_mask_float(float* input,
+                                          const float* batch_mean,
+                                          uint32_t frames,
+                                          uint32_t height,
+                                          uint32_t width,
+                                          uint32_t median_window_pixels,
+                                          float threshold_ratio,
+                                          float threshold_offset,
+                                          cudaStream_t stream);

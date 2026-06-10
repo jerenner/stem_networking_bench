@@ -80,6 +80,15 @@ class StemReceiverOp : public Operator {
   static constexpr int MAX_BURSTS_PER_BATCH = 5000;
   static constexpr uint32_t ROWS_PER_SOURCE = 128;
   static constexpr uint32_t INVALID_HOLDER_INDEX = std::numeric_limits<uint32_t>::max();
+  static constexpr uint32_t ZLP_COLUMNS = 192 * 4;
+  static constexpr uint32_t ZLP_TILE_WIDTH = 32;
+  static constexpr uint32_t ZLP_TILE_HEIGHT = 128;
+  static constexpr uint32_t CORE_TILE_WIDTH = 128;
+  static constexpr uint32_t CORE_TILE_HEIGHT = 32;
+  static constexpr uint32_t TILE_SAMPLES = ZLP_TILE_WIDTH * ZLP_TILE_HEIGHT;
+  static constexpr uint32_t TILE_PAYLOAD_BYTES = TILE_SAMPLES * sizeof(uint16_t);
+  static constexpr uint32_t FULL_FRAME_TILE_PACKETS = 960;
+  static constexpr uint32_t TILE_PACKETS_PER_SOURCE = FULL_FRAME_TILE_PACKETS / 8;
 
   HOLOSCAN_OPERATOR_FORWARD_ARGS(StemReceiverOp)
 
@@ -105,6 +114,7 @@ class StemReceiverOp : public Operator {
     void* packet_ptr = nullptr;
     uint64_t abs_frame = 0;
     int16_t global_row = -1;
+    uint16_t tile_index = 0;
     uint16_t row_number = 0;
     uint16_t source_id = 0;
     uint32_t holder_index = INVALID_HOLDER_INDEX;
@@ -146,11 +156,13 @@ class StemReceiverOp : public Operator {
   ~StemReceiverOp() {
     HOLOSCAN_LOG_INFO(
         "Finished receiver with {}/{} bytes/packets received, {} packets dropped, and {} packets "
-        "ignored from unexpected source IDs. Header batches launched/completed: {}/{}; full-slot waits: {}",
+        "ignored from unexpected source IDs, {} packets ignored by tile readout. Header batches "
+        "launched/completed: {}/{}; full-slot waits: {}",
         ttl_bytes_recv_,
         ttl_pkts_recv_,
         ttl_packets_dropped_,
         ttl_packets_ignored_unexpected_source_,
+        ttl_packets_ignored_tile_readout_,
         header_batches_launched_,
         header_batches_completed_,
         header_slot_full_waits_);
@@ -185,7 +197,9 @@ class StemReceiverOp : public Operator {
 
     // Fixed packet payload constants based on protocol
     custom_header_size_ = 64;   // 1 Word of generic info
-    nom_payload_size_ = 7680;   // 120 words of actual frame row data
+    nom_payload_size_ = FRAME_WIDTH * sizeof(uint16_t);
+    output_tensor_bytes_ =
+        static_cast<uint64_t>(frames_per_tensor_.get()) * FRAME_SIZE_BYTES;
 
     // Derived from user params
     rows_per_tensor_ = frames_per_tensor_.get() * FRAME_HEIGHT; // FRAME_HEIGHT rows per frame
@@ -195,9 +209,24 @@ class StemReceiverOp : public Operator {
       HOLOSCAN_LOG_ERROR("expected_source_mask must include at least one source ID.");
       exit(1);
     }
-    expected_rows_per_tensor_ = frames_per_tensor_.get() * expected_source_count_ * ROWS_PER_SOURCE;
+    if (tile_readout_.get()) {
+      expected_packets_per_frame_ = expected_source_count_ * TILE_PACKETS_PER_SOURCE;
+      packet_cells_per_frame_ = expected_packets_per_frame_;
+      placement_capacity_ = frames_per_tensor_.get() * FULL_FRAME_TILE_PACKETS;
+    } else {
+      expected_packets_per_frame_ = expected_source_count_ * ROWS_PER_SOURCE;
+      packet_cells_per_frame_ = FRAME_HEIGHT;
+      placement_capacity_ = rows_per_tensor_;
+    }
+    expected_rows_per_tensor_ = frames_per_tensor_.get() * expected_packets_per_frame_;
     header_batch_packets_value_ = header_batch_packets_.get();
     header_batch_slots_value_ = header_batch_slots_.get();
+    if (tile_readout_.get() && !use_assembled_batching()) {
+      HOLOSCAN_LOG_ERROR(
+          "tile_readout requires gpu_direct: true and reorder_kernel: true so packets can be "
+          "assembled by header-derived tile placement.");
+      exit(1);
+    }
     if (use_assembled_batching() && !hds_.get() &&
         (header_batch_packets_value_ == 0 || header_batch_slots_value_ == 0)) {
       HOLOSCAN_LOG_ERROR("header_batch_packets and header_batch_slots must both be greater than 0.");
@@ -205,17 +234,17 @@ class StemReceiverOp : public Operator {
     }
 
     for (int n = 0; n < num_concurrent; n++) {
-      CUDA_TRY(cudaMalloc(&full_batch_data_d_[n], rows_per_tensor_ * nom_payload_size_));
+      CUDA_TRY(cudaMalloc(&full_batch_data_d_[n], output_tensor_bytes_));
 
       if (!gpu_direct_.get()) {
-        CUDA_TRY(cudaMallocHost(&full_batch_data_h_[n], rows_per_tensor_ * nom_payload_size_));
+        CUDA_TRY(cudaMallocHost(&full_batch_data_h_[n], output_tensor_bytes_));
       } else {
-        CUDA_TRY(cudaMallocHost((void**)&h_dev_ptrs_[n], sizeof(void*) * rows_per_tensor_));
-        CUDA_TRY(cudaMalloc(&d_dev_ptrs_[n], sizeof(void*) * rows_per_tensor_));
+        CUDA_TRY(cudaMallocHost((void**)&h_dev_ptrs_[n], sizeof(void*) * placement_capacity_));
+        CUDA_TRY(cudaMalloc(&d_dev_ptrs_[n], sizeof(void*) * placement_capacity_));
         CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&h_packet_placements_[n]),
-                                sizeof(PacketPlacement) * rows_per_tensor_));
+                                sizeof(PacketPlacement) * placement_capacity_));
         CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_packet_placements_[n]),
-                            sizeof(PacketPlacement) * rows_per_tensor_));
+                            sizeof(PacketPlacement) * placement_capacity_));
       }
       cudaStreamCreate(&streams_[n]);
       cudaEventCreate(&events_[n]);
@@ -246,9 +275,9 @@ class StemReceiverOp : public Operator {
       }
     }
 
-    current_batch_occupied_.assign(rows_per_tensor_, 0);
-    emit_cell_generation_.assign(rows_per_tensor_, 0);
-    pending_packets_.reserve(rows_per_tensor_ + batch_close_slack_packets_.get() + 4096);
+    current_batch_occupied_.assign(frames_per_tensor_.get() * packet_cells_per_frame_, 0);
+    emit_cell_generation_.assign(frames_per_tensor_.get() * packet_cells_per_frame_, 0);
+    pending_packets_.reserve(expected_rows_per_tensor_ + batch_close_slack_packets_.get() + 4096);
     pending_holders_.reserve(256);
 
     if (hds_.get()) { assert(gpu_direct_.get()); }
@@ -256,11 +285,28 @@ class StemReceiverOp : public Operator {
     initialize_packet_debug();
 
     if (use_assembled_batching()) {
+      if (tile_readout_.get()) {
+        HOLOSCAN_LOG_INFO(
+            "StemReceiverOp::initialize() tile readout enabled: {} full-frame tiles/frame "
+            "(ZLP {} columns as {}x{} tiles; CoreLoss as {}x{} tiles). Current source mask "
+            "expects {} simulated tiles/frame, {} packets/tensor. Row-packet test data is {}.",
+            FULL_FRAME_TILE_PACKETS,
+            ZLP_COLUMNS,
+            ZLP_TILE_HEIGHT,
+            ZLP_TILE_WIDTH,
+            CORE_TILE_HEIGHT,
+            CORE_TILE_WIDTH,
+            expected_packets_per_frame_,
+            expected_rows_per_tensor_,
+            tile_duplicate_prefix_to_simulate_payload_.get()
+                ? "expanded from 3840 to 4096 samples by duplicating the first 256 samples"
+                : "treated as native 4096-sample tile payloads");
+      }
       if (hds_.get()) {
         HOLOSCAN_LOG_INFO(
             "StemReceiverOp::initialize() using header-aware batch assembly with CPU header-data "
             "split, {} slack packets, expected source mask 0x{:02x} ({} sources, {} expected "
-            "rows/tensor).",
+            "packets/tensor).",
             batch_close_slack_packets_.get(),
             expected_source_mask_value_,
             expected_source_count_,
@@ -268,7 +314,7 @@ class StemReceiverOp : public Operator {
       } else {
         HOLOSCAN_LOG_INFO(
             "StemReceiverOp::initialize() using header-aware batch assembly with {} slack packets, "
-            "expected source mask 0x{:02x} ({} sources, {} expected rows/tensor), "
+            "expected source mask 0x{:02x} ({} sources, {} expected packets/tensor), "
             "{} async header slots of {} packets each.",
             batch_close_slack_packets_.get(),
             expected_source_mask_value_,
@@ -286,7 +332,11 @@ class StemReceiverOp : public Operator {
           "StemReceiverOp::initialize() using legacy arrival-count batching for this configuration.");
     }
 
-    HOLOSCAN_LOG_INFO("StemReceiverOp::initialize() complete. Batching {} frames ({} rows) per tensor.", frames_per_tensor_.get(), rows_per_tensor_);
+    HOLOSCAN_LOG_INFO(
+        "StemReceiverOp::initialize() complete. Batching {} frames ({} output rows, {} expected packets) per tensor.",
+        frames_per_tensor_.get(),
+        rows_per_tensor_,
+        expected_rows_per_tensor_);
   }
 
   void freeResources() {
@@ -340,6 +390,17 @@ class StemReceiverOp : public Operator {
     spec.param<uint16_t>(max_packet_size_, "max_packet_size", "Max packet size", "Maximum UDP packet size. Must accommodate headers+payload.", 9100);
     spec.param<uint16_t>(header_size_, "header_size", "Header size", "Header size to strip (ETH+IP+UDP)", 42);
     spec.param<bool>(reorder_kernel_, "reorder_kernel", "Reorder kernel enabled", "Enable reorder kernel", true);
+    spec.param<bool>(tile_readout_,
+                     "tile_readout",
+                     "Tile Readout",
+                     "Interpret packet row IDs as simulated tile IDs and scatter payloads into the configured ZLP/CoreLoss tile layout.",
+                     false);
+    spec.param<bool>(
+        tile_duplicate_prefix_to_simulate_payload_,
+        "tile_duplicate_prefix_to_simulate_payload",
+        "Duplicate Prefix To Simulate Tile Payload",
+        "When tile_readout is enabled with legacy 3840-sample row packets, fill the 4096-sample tile by reusing the first 256 samples at the end.",
+        true);
     spec.param<uint64_t>(count_, "count", "Count", "Number of frames to receive. 0 means infinite.", 0UL);
     spec.param<bool>(packet_debug_,
                      "packet_debug",
@@ -460,7 +521,7 @@ class StemReceiverOp : public Operator {
       return;
     }
 
-    packet_debug_summary_capacity_ = rows_per_tensor_;
+    packet_debug_summary_capacity_ = placement_capacity_;
     CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&packet_debug_summaries_d_),
                         sizeof(PacketDebugSummary) * packet_debug_summary_capacity_));
     CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&packet_debug_summaries_h_),
@@ -571,9 +632,13 @@ class StemReceiverOp : public Operator {
 
     profiling::ScopedRange debug_range("receiver/packet-debug-summary", profiling::color::kCompute);
 
+    const uint16_t debug_payload_size =
+        (tile_readout_.get() && !tile_duplicate_prefix_to_simulate_payload_.get())
+            ? static_cast<uint16_t>(TILE_PAYLOAD_BYTES)
+            : nom_payload_size_;
     summarize_packets(reinterpret_cast<uint8_t**>(d_dev_ptrs_[slot_idx]),
                       packet_debug_summaries_d_,
-                      nom_payload_size_,
+                      debug_payload_size,
                       custom_header_size_,
                       num_packets,
                       streams_[slot_idx]);
@@ -655,6 +720,44 @@ class StemReceiverOp : public Operator {
 
   bool source_expected(uint16_t source_id) const {
     return source_id < 8 && (expected_source_mask_value_ & (1U << source_id)) != 0U;
+  }
+
+  uint32_t expected_source_ordinal(uint16_t source_id) const {
+    uint32_t ordinal = 0;
+    for (uint32_t candidate = 0; candidate < source_id && candidate < 8; ++candidate) {
+      if (source_expected(static_cast<uint16_t>(candidate))) { ordinal++; }
+    }
+    return ordinal;
+  }
+
+  bool packet_identity_from_header(const PacketHeaderInfo& header,
+                                   int16_t& global_row,
+                                   uint16_t& tile_index) const {
+    global_row = header.global_row;
+    tile_index = 0;
+
+    if (!tile_readout_.get()) {
+      return global_row >= 0;
+    }
+
+    // Current test packets still carry 128 row offsets per source. Compact each expected
+    // source to 120 simulated tile packets so 8 sources produce the proposed 960 tiles/frame.
+    if (header.row_offset >= TILE_PACKETS_PER_SOURCE) { return false; }
+
+    const uint32_t source_ordinal = expected_source_ordinal(header.source_id);
+    const uint32_t compact_tile_index = source_ordinal * TILE_PACKETS_PER_SOURCE + header.row_offset;
+    if (compact_tile_index >= expected_packets_per_frame_) { return false; }
+
+    tile_index = static_cast<uint16_t>(compact_tile_index);
+    return true;
+  }
+
+  uint64_t packet_cell_index(const PacketEntry& entry, uint64_t relative_frame) const {
+    if (tile_readout_.get()) {
+      return relative_frame * packet_cells_per_frame_ + entry.tile_index;
+    }
+
+    return relative_frame * FRAME_HEIGHT + static_cast<uint64_t>(entry.global_row);
   }
 
   uint32_t register_pending_holder(std::shared_ptr<BurstHolder> holder) {
@@ -932,7 +1035,7 @@ class StemReceiverOp : public Operator {
       }
 
       const uint64_t relative_frame = entry.abs_frame - current_batch_start_abs_frame_;
-      const uint64_t cell = relative_frame * FRAME_HEIGHT + static_cast<uint64_t>(entry.global_row);
+      const uint64_t cell = packet_cell_index(entry, relative_frame);
       if (cell < current_batch_occupied_.size() && !current_batch_occupied_[cell]) {
         current_batch_occupied_[cell] = 1;
         current_batch_unique_packets_++;
@@ -949,6 +1052,13 @@ class StemReceiverOp : public Operator {
     }
     if (!source_expected(header.source_id)) {
       ttl_packets_ignored_unexpected_source_++;
+      return;
+    }
+
+    int16_t global_row = -1;
+    uint16_t tile_index = 0;
+    if (!packet_identity_from_header(header, global_row, tile_index)) {
+      ttl_packets_ignored_tile_readout_++;
       return;
     }
 
@@ -978,7 +1088,8 @@ class StemReceiverOp : public Operator {
     PacketEntry entry;
     entry.packet_ptr = packet_ptr;
     entry.abs_frame = abs_frame;
-    entry.global_row = header.global_row;
+    entry.global_row = global_row;
+    entry.tile_index = tile_index;
     entry.row_number = header.row_number;
     entry.source_id = header.source_id;
     entry.holder_index = holder_index;
@@ -992,7 +1103,7 @@ class StemReceiverOp : public Operator {
     }
 
     const uint64_t relative_frame = abs_frame - current_batch_start_abs_frame_;
-    const uint64_t cell = relative_frame * FRAME_HEIGHT + static_cast<uint64_t>(header.global_row);
+    const uint64_t cell = packet_cell_index(entry, relative_frame);
     if (cell < current_batch_occupied_.size() && !current_batch_occupied_[cell]) {
       current_batch_occupied_[cell] = 1;
       current_batch_unique_packets_++;
@@ -1027,15 +1138,22 @@ class StemReceiverOp : public Operator {
       }
 
       const uint64_t relative_frame = entry.abs_frame - current_batch_start_abs_frame_;
-      const uint64_t cell = relative_frame * FRAME_HEIGHT + static_cast<uint64_t>(entry.global_row);
+      const uint64_t cell = packet_cell_index(entry, relative_frame);
       if (cell >= emit_cell_generation_.size() || emit_cell_generation_[cell] == emit_generation_) {
         continue;
+      }
+      if (packets_to_gather >= placement_capacity_) {
+        HOLOSCAN_LOG_ERROR(
+            "Placement capacity {} exceeded while emitting batch for {}. Holding remaining packets.",
+            placement_capacity_,
+            name());
+        break;
       }
 
       emit_cell_generation_[cell] = emit_generation_;
       h_dev_ptrs_[assembled_cur_batch_idx_][packets_to_gather] = entry.packet_ptr;
       h_packet_placements_[assembled_cur_batch_idx_][packets_to_gather] = PacketPlacement{
-          static_cast<uint16_t>(relative_frame), entry.global_row, 1};
+          static_cast<uint16_t>(relative_frame), entry.global_row, entry.tile_index, 1};
 
       if (entry.holder_index != INVALID_HOLDER_INDEX &&
           entry.holder_index < pending_holders_.size()) {
@@ -1060,8 +1178,8 @@ class StemReceiverOp : public Operator {
                                  incomplete_batches_emitted_ % incomplete_batch_log_interval_.get() == 0;
       if (warn_now) {
         HOLOSCAN_LOG_WARN(
-            "Emitting incomplete batch starting at absolute frame {}: {} / {} expected rows present, "
-            "{} expected rows missing.",
+            "Emitting incomplete batch starting at absolute frame {}: {} / {} expected packets present, "
+            "{} expected packets missing.",
             current_batch_start_abs_frame_,
             packets_to_gather,
             expected_rows_per_tensor_,
@@ -1071,8 +1189,8 @@ class StemReceiverOp : public Operator {
             static_cast<double>(incomplete_rows_missing_total_) /
             static_cast<double>(incomplete_batches_emitted_);
         HOLOSCAN_LOG_INFO(
-            "Incomplete batch summary for {}: {} incomplete batches, avg {:.1f} missing rows, "
-            "max {} missing rows. Latest batch started at absolute frame {} with {} missing rows.",
+            "Incomplete batch summary for {}: {} incomplete batches, avg {:.1f} missing packets, "
+            "max {} missing packets. Latest batch started at absolute frame {} with {} missing packets.",
             name(),
             incomplete_batches_emitted_,
             avg_missing,
@@ -1084,7 +1202,7 @@ class StemReceiverOp : public Operator {
 
     CUDA_TRY(cudaMemsetAsync(full_batch_data_d_[assembled_cur_batch_idx_],
                              0,
-                             rows_per_tensor_ * nom_payload_size_,
+                             output_tensor_bytes_,
                              streams_[assembled_cur_batch_idx_]));
 
     if (packets_to_gather > 0) {
@@ -1109,14 +1227,33 @@ class StemReceiverOp : public Operator {
       {
         profiling::ScopedRange gather_range("receiver/gather-packets", profiling::color::kCompute);
         const uint16_t gather_header_size = hds_.get() ? 0 : custom_header_size_;
-        gather_packets_by_placement(reinterpret_cast<uint8_t**>(d_dev_ptrs_[assembled_cur_batch_idx_]),
-                                    d_packet_placements_[assembled_cur_batch_idx_],
-                                    static_cast<uint8_t*>(full_batch_data_d_[assembled_cur_batch_idx_]),
-                                    nom_payload_size_,
-                                    gather_header_size,
-                                    packets_to_gather,
-                                    rows_per_tensor_,
-                                    streams_[assembled_cur_batch_idx_]);
+        if (tile_readout_.get()) {
+          const uint16_t tile_available_payload_size =
+              tile_duplicate_prefix_to_simulate_payload_.get()
+                  ? nom_payload_size_
+                  : static_cast<uint16_t>(TILE_PAYLOAD_BYTES);
+          gather_tile_packets_by_placement(
+              reinterpret_cast<uint8_t**>(d_dev_ptrs_[assembled_cur_batch_idx_]),
+              d_packet_placements_[assembled_cur_batch_idx_],
+              static_cast<uint8_t*>(full_batch_data_d_[assembled_cur_batch_idx_]),
+              tile_available_payload_size,
+              gather_header_size,
+              packets_to_gather,
+              frames_per_tensor_.get(),
+              FRAME_HEIGHT,
+              FRAME_WIDTH,
+              tile_duplicate_prefix_to_simulate_payload_.get(),
+              streams_[assembled_cur_batch_idx_]);
+        } else {
+          gather_packets_by_placement(reinterpret_cast<uint8_t**>(d_dev_ptrs_[assembled_cur_batch_idx_]),
+                                      d_packet_placements_[assembled_cur_batch_idx_],
+                                      static_cast<uint8_t*>(full_batch_data_d_[assembled_cur_batch_idx_]),
+                                      nom_payload_size_,
+                                      gather_header_size,
+                                      packets_to_gather,
+                                      rows_per_tensor_,
+                                      streams_[assembled_cur_batch_idx_]);
+        }
       }
     }
 
@@ -1520,6 +1657,7 @@ class StemReceiverOp : public Operator {
   int64_t ttl_pkts_recv_ = 0;
   int64_t ttl_packets_dropped_ = 0;
   int64_t ttl_packets_ignored_unexpected_source_ = 0;
+  int64_t ttl_packets_ignored_tile_readout_ = 0;
 
   int64_t aggr_pkts_recv_ = 0;
   uint64_t total_frames_emitted_ = 0;
@@ -1528,6 +1666,10 @@ class StemReceiverOp : public Operator {
   uint16_t nom_payload_size_;    
   uint32_t rows_per_tensor_;     
   uint32_t expected_rows_per_tensor_ = 0;
+  uint32_t expected_packets_per_frame_ = FRAME_HEIGHT;
+  uint32_t packet_cells_per_frame_ = FRAME_HEIGHT;
+  uint32_t placement_capacity_ = 0;
+  uint64_t output_tensor_bytes_ = 0;
   uint32_t expected_source_mask_value_ = 0xFFU;
   uint32_t expected_source_count_ = 8;
   uint32_t header_batch_packets_value_ = 8192;
@@ -1546,6 +1688,8 @@ class StemReceiverOp : public Operator {
   Parameter<uint16_t> max_packet_size_;
   Parameter<uint16_t> header_size_;
   Parameter<bool> reorder_kernel_;
+  Parameter<bool> tile_readout_;
+  Parameter<bool> tile_duplicate_prefix_to_simulate_payload_;
   Parameter<uint64_t> count_;
   Parameter<bool> packet_debug_;
   Parameter<std::string> packet_debug_output_prefix_;
