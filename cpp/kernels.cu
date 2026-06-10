@@ -228,6 +228,126 @@ void gather_packets_by_placement(uint8_t** src_ptrs,
       src_ptrs, placements, dst_base, payload_len, header_len, num_pkts, max_rows);
 }
 
+__device__ __forceinline__ bool tile_geometry(uint32_t tile_index,
+                                              uint32_t& row_start,
+                                              uint32_t& col_start,
+                                              uint32_t& tile_height,
+                                              uint32_t& tile_width) {
+  constexpr uint32_t kFrameHeight = 1024;
+  constexpr uint32_t kFrameWidth = 3840;
+  constexpr uint32_t kZlpColumns = 192 * 4;
+  constexpr uint32_t kZlpTileWidth = 32;
+  constexpr uint32_t kZlpTileHeight = 128;
+  constexpr uint32_t kCoreTileWidth = 128;
+  constexpr uint32_t kCoreTileHeight = 32;
+  constexpr uint32_t kZlpTileCols = kZlpColumns / kZlpTileWidth;
+  constexpr uint32_t kZlpTileRows = kFrameHeight / kZlpTileHeight;
+  constexpr uint32_t kZlpTiles = kZlpTileCols * kZlpTileRows;
+  constexpr uint32_t kCoreColumns = kFrameWidth - kZlpColumns;
+  constexpr uint32_t kCoreTileCols = kCoreColumns / kCoreTileWidth;
+  constexpr uint32_t kCoreTileRows = kFrameHeight / kCoreTileHeight;
+  constexpr uint32_t kCoreTiles = kCoreTileCols * kCoreTileRows;
+
+  if (tile_index < kZlpTiles) {
+    const uint32_t tile_row = tile_index / kZlpTileCols;
+    const uint32_t tile_col = tile_index % kZlpTileCols;
+    row_start = tile_row * kZlpTileHeight;
+    col_start = tile_col * kZlpTileWidth;
+    tile_height = kZlpTileHeight;
+    tile_width = kZlpTileWidth;
+    return true;
+  }
+
+  const uint32_t core_index = tile_index - kZlpTiles;
+  if (core_index >= kCoreTiles) return false;
+
+  const uint32_t tile_row = core_index / kCoreTileCols;
+  const uint32_t tile_col = core_index % kCoreTileCols;
+  row_start = tile_row * kCoreTileHeight;
+  col_start = kZlpColumns + tile_col * kCoreTileWidth;
+  tile_height = kCoreTileHeight;
+  tile_width = kCoreTileWidth;
+  return true;
+}
+
+__global__ void gather_tile_packets_by_placement_kernel(
+    uint8_t** src_ptrs,
+    const PacketPlacement* placements,
+    uint8_t* dst_base,
+    uint16_t available_payload_len,
+    uint16_t header_len,
+    uint32_t num_pkts,
+    uint32_t frames,
+    uint32_t frame_height,
+    uint32_t frame_width,
+    bool duplicate_prefix_to_simulate_tile_payload) {
+  constexpr uint32_t kTileSamples = 4096;
+
+  const uint32_t pkt_idx = blockIdx.x;
+  if (pkt_idx >= num_pkts) return;
+
+  const PacketPlacement placement = placements[pkt_idx];
+  if (!placement.valid || placement.relative_frame >= frames) return;
+
+  uint32_t row_start = 0;
+  uint32_t col_start = 0;
+  uint32_t tile_height = 0;
+  uint32_t tile_width = 0;
+  if (!tile_geometry(placement.tile_index, row_start, col_start, tile_height, tile_width)) return;
+  if (row_start + tile_height > frame_height || col_start + tile_width > frame_width) return;
+
+  uint8_t* src = src_ptrs[pkt_idx];
+  if (src == nullptr) return;
+
+  const uint16_t* payload = reinterpret_cast<const uint16_t*>(src + header_len);
+  uint16_t* output = reinterpret_cast<uint16_t*>(dst_base);
+  const uint32_t available_samples = available_payload_len / sizeof(uint16_t);
+  const uint64_t frame_offset =
+      static_cast<uint64_t>(placement.relative_frame) * frame_height * frame_width;
+
+  for (uint32_t sample_idx = threadIdx.x; sample_idx < kTileSamples; sample_idx += blockDim.x) {
+    uint32_t src_sample_idx = sample_idx;
+    if (duplicate_prefix_to_simulate_tile_payload && src_sample_idx >= available_samples) {
+      src_sample_idx -= available_samples;
+    }
+    if (src_sample_idx >= available_samples) continue;
+
+    const uint32_t local_row = sample_idx / tile_width;
+    const uint32_t local_col = sample_idx - local_row * tile_width;
+    if (local_row >= tile_height) continue;
+
+    const uint64_t dst_idx =
+        frame_offset +
+        static_cast<uint64_t>(row_start + local_row) * frame_width +
+        (col_start + local_col);
+    output[dst_idx] = payload[src_sample_idx];
+  }
+}
+
+void gather_tile_packets_by_placement(uint8_t** src_ptrs,
+                                      const PacketPlacement* placements,
+                                      uint8_t* dst_base,
+                                      uint16_t available_payload_len,
+                                      uint16_t header_len,
+                                      uint32_t num_pkts,
+                                      uint32_t frames,
+                                      uint32_t frame_height,
+                                      uint32_t frame_width,
+                                      bool duplicate_prefix_to_simulate_tile_payload,
+                                      cudaStream_t stream) {
+  gather_tile_packets_by_placement_kernel<<<num_pkts, 256, 0, stream>>>(
+      src_ptrs,
+      placements,
+      dst_base,
+      available_payload_len,
+      header_len,
+      num_pkts,
+      frames,
+      frame_height,
+      frame_width,
+      duplicate_prefix_to_simulate_tile_payload);
+}
+
 __global__ void summarize_packets_kernel(uint8_t** src_ptrs,
                                          PacketDebugSummary* summaries,
                                          uint16_t payload_len,
@@ -344,4 +464,136 @@ void dark_correct_uint16_to_float(const uint16_t* input,
       static_cast<uint32_t>(frame_pixels),
       subtract_dark,
       apply_valid_pixel_mask);
+}
+
+__global__ void compute_frame_mean_float_kernel(const float* input,
+                                                float* mean,
+                                                uint32_t frames,
+                                                uint32_t frame_pixels) {
+  const uint32_t pixel_stride = blockDim.x * gridDim.x;
+
+  for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       pixel_idx < frame_pixels;
+       pixel_idx += pixel_stride) {
+    float sum = 0.0f;
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+      const uint64_t idx = static_cast<uint64_t>(frame) * frame_pixels + pixel_idx;
+      sum += input[idx];
+    }
+    mean[pixel_idx] = sum / static_cast<float>(frames);
+  }
+}
+
+void compute_frame_mean_float(const float* input,
+                              float* mean,
+                              uint32_t frames,
+                              uint32_t height,
+                              uint32_t width,
+                              cudaStream_t stream) {
+  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
+  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
+  if (total_values == 0) { return; }
+
+  const uint32_t threads = 256;
+  const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
+  const uint32_t blocks =
+      static_cast<uint32_t>(required_blocks > 65535 ? 65535 : required_blocks);
+
+  compute_frame_mean_float_kernel<<<blocks, threads, 0, stream>>>(
+      input, mean, frames, static_cast<uint32_t>(frame_pixels));
+}
+
+__device__ __forceinline__ float median_from_small_window(float* values, uint32_t count) {
+  const uint32_t median_idx = count / 2;
+  for (uint32_t i = 0; i <= median_idx; ++i) {
+    uint32_t min_idx = i;
+    float min_value = values[i];
+    for (uint32_t j = i + 1; j < count; ++j) {
+      if (values[j] < min_value) {
+        min_value = values[j];
+        min_idx = j;
+      }
+    }
+    values[min_idx] = values[i];
+    values[i] = min_value;
+  }
+  return values[median_idx];
+}
+
+__global__ void apply_dynamic_half_column_mask_float_kernel(float* input,
+                                                           const float* batch_mean,
+                                                           uint32_t frames,
+                                                           uint32_t height,
+                                                           uint32_t width,
+                                                           uint32_t median_window_pixels,
+                                                           float threshold_ratio,
+                                                           float threshold_offset) {
+  constexpr uint32_t kMaxMedianWindowPixels = 129;
+  float window_values[kMaxMedianWindowPixels];
+
+  const uint32_t frame_pixels = height * width;
+  const uint32_t pixel_stride = blockDim.x * gridDim.x;
+  const uint32_t half_height = height / 2;
+
+  for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       pixel_idx < frame_pixels;
+       pixel_idx += pixel_stride) {
+    const uint32_t row = pixel_idx / width;
+    const uint32_t col = pixel_idx - row * width;
+    const uint32_t half_start = row < half_height ? 0 : half_height;
+    const uint32_t half_end = row < half_height ? half_height : height;
+
+    const uint32_t radius = median_window_pixels / 2;
+    uint32_t row_start = row > radius ? row - radius : half_start;
+    row_start = row_start < half_start ? half_start : row_start;
+    uint32_t row_end = row + radius + 1;
+    row_end = row_end > half_end ? half_end : row_end;
+
+    uint32_t count = 0;
+    for (uint32_t sample_row = row_start;
+         sample_row < row_end && count < kMaxMedianWindowPixels;
+         ++sample_row) {
+      window_values[count++] = batch_mean[static_cast<uint64_t>(sample_row) * width + col];
+    }
+    if (count == 0) { continue; }
+
+    const float local_median = median_from_small_window(window_values, count);
+    const float current_value = batch_mean[pixel_idx];
+    const float threshold = local_median * threshold_ratio + threshold_offset;
+    if (current_value <= threshold) { continue; }
+
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+      const uint64_t idx = static_cast<uint64_t>(frame) * frame_pixels + pixel_idx;
+      input[idx] = 0.0f;
+    }
+  }
+}
+
+void apply_dynamic_half_column_mask_float(float* input,
+                                          const float* batch_mean,
+                                          uint32_t frames,
+                                          uint32_t height,
+                                          uint32_t width,
+                                          uint32_t median_window_pixels,
+                                          float threshold_ratio,
+                                          float threshold_offset,
+                                          cudaStream_t stream) {
+  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
+  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
+  if (total_values == 0) { return; }
+
+  const uint32_t threads = 256;
+  const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
+  const uint32_t blocks =
+      static_cast<uint32_t>(required_blocks > 65535 ? 65535 : required_blocks);
+
+  apply_dynamic_half_column_mask_float_kernel<<<blocks, threads, 0, stream>>>(
+      input,
+      batch_mean,
+      frames,
+      height,
+      width,
+      median_window_pixels,
+      threshold_ratio,
+      threshold_offset);
 }

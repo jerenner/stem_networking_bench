@@ -45,9 +45,30 @@ struct PacketHeaderInfo {
 
 struct PacketPlacement {
   int16_t  global_row;       // row within a 1024-tall frame, -1 = invalid
+  uint16_t tile_index;       // tile id within a frame (tile readout only)
   uint8_t  relative_frame;   // index within the current batch of frames
   uint8_t  valid;            // 0/1
 };
+
+// ---------------------------------------------------------------------------
+// Tile readout geometry (mirrors cpp/kernels.cu::tile_geometry from upstream
+// jerenner/stem_networking_bench `tiling` branch). A 1024 x 3840 frame is
+// partitioned into 960 tiles: 192 ZLP tiles (32 x 128) in cols [0, 768) and
+// 768 core tiles (128 x 32) in cols [768, 3840). Each tile carries 4096
+// uint16 samples (= TILE_PAYLOAD_BYTES = 8192 B). 8 sources contribute 120
+// tile packets each => 960 tile packets per frame.
+// ---------------------------------------------------------------------------
+constexpr uint32_t TILE_ZLP_COLUMNS         = 192u * 4u;  // 768
+constexpr uint32_t TILE_ZLP_TILE_WIDTH      = 32u;
+constexpr uint32_t TILE_ZLP_TILE_HEIGHT     = 128u;
+constexpr uint32_t TILE_CORE_TILE_WIDTH     = 128u;
+constexpr uint32_t TILE_CORE_TILE_HEIGHT    = 32u;
+constexpr uint32_t TILE_SAMPLES             =
+    TILE_ZLP_TILE_WIDTH * TILE_ZLP_TILE_HEIGHT;            // 4096
+constexpr uint32_t TILE_PAYLOAD_BYTES       =
+    TILE_SAMPLES * sizeof(uint16_t);                       // 8192
+constexpr uint32_t FULL_FRAME_TILE_PACKETS  = 960u;
+constexpr uint32_t TILE_PACKETS_PER_SOURCE  = FULL_FRAME_TILE_PACKETS / 8u;  // 120
 
 // ---------------------------------------------------------------------------
 // Host helpers (Phase 1 TX)
@@ -112,6 +133,31 @@ void stem_gather_packets_by_placement(uint8_t** src_ptrs,
                                       uint32_t num_pkts,
                                       uint32_t max_rows,
                                       cudaStream_t stream);
+
+// Tile-readout variant of the placement gather: scatter each packet's
+// available payload into its (ZLP or core) tile within a full
+// [frames, frame_height, frame_width] uint16 plane. Mirrors
+// cpp/kernels.cu::gather_tile_packets_by_placement from upstream/tiling.
+//
+// `available_payload_len` is the wire payload length actually present in
+// each packet (e.g. 7680 for the existing row TX). When
+// `duplicate_prefix_to_simulate_tile_payload` is true and
+// available_payload_len < TILE_PAYLOAD_BYTES, the missing tail samples are
+// filled by wrapping back to the front of the payload, matching the
+// upstream Holoscan "simulated tile readout" used to A/B-test the tile
+// reassembly against the existing row-format TX.
+void stem_gather_tile_packets_by_placement(
+    uint8_t** src_ptrs,
+    const PacketPlacement* placements,
+    uint8_t* dst_base,
+    uint16_t available_payload_len,
+    uint16_t header_len,
+    uint32_t num_pkts,
+    uint32_t frames,
+    uint32_t frame_height,
+    uint32_t frame_width,
+    bool duplicate_prefix_to_simulate_tile_payload,
+    cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Phase 3 processor: dark-frame subtraction + valid-pixel mask in one fused

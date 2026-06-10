@@ -150,6 +150,26 @@ void PyTorchProcessorOp::setup(OperatorSpec& spec) {
   spec.param(valid_pixel_mask_dataset_, "valid_pixel_mask_dataset", "Valid Pixel Mask Dataset",
              "Dataset path for a 0/1 valid-pixel mask. Supports [H,W] or [1,H,W].",
              std::string("/valid_pixel_mask"));
+  spec.param(apply_dynamic_half_column_mask_,
+             "apply_dynamic_half_column_mask",
+             "Apply Dynamic Half-Column Mask",
+             "If true, compute a batch-mean image on GPU and zero pixels whose half-column local mean is anomalously high.",
+             false);
+  spec.param(dynamic_mask_median_window_pixels_,
+             "dynamic_mask_median_window_pixels",
+             "Dynamic Mask Median Window Pixels",
+             "Number of same-column pixels in the top/bottom half-column median window. Maximum supported value is 129.",
+             31U);
+  spec.param(dynamic_mask_threshold_ratio_,
+             "dynamic_mask_threshold_ratio",
+             "Dynamic Mask Threshold Ratio",
+             "Mask if batch_mean > local_median * ratio + offset.",
+             1.0f);
+  spec.param(dynamic_mask_threshold_offset_,
+             "dynamic_mask_threshold_offset",
+             "Dynamic Mask Threshold Offset",
+             "Mask if batch_mean > local_median * ratio + offset.",
+             500.0f);
 }
 
 void PyTorchProcessorOp::initialize() {
@@ -174,6 +194,23 @@ void PyTorchProcessorOp::initialize() {
     }
     if (apply_valid_pixel_mask_.get()) {
         loadValidPixelMask();
+    }
+    if (apply_dynamic_half_column_mask_.get()) {
+        if (!torch::cuda::is_available()) {
+            throw std::runtime_error(
+                "PyTorchProcessorOp: dynamic half-column masking requires CUDA-enabled PyTorch");
+        }
+        if (dynamic_mask_median_window_pixels_.get() == 0 ||
+            dynamic_mask_median_window_pixels_.get() > 129) {
+            throw std::runtime_error(
+                "PyTorchProcessorOp: dynamic_mask_median_window_pixels must be in [1, 129]");
+        }
+        HOLOSCAN_LOG_INFO(
+            "PyTorchProcessorOp: Dynamic half-column mask enabled with median window M={}, "
+            "threshold = median * {:.3f} + {:.3f}.",
+            dynamic_mask_median_window_pixels_.get(),
+            dynamic_mask_threshold_ratio_.get(),
+            dynamic_mask_threshold_offset_.get());
     }
 }
 
@@ -279,9 +316,11 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
   bool use_torch_cuda = torch::cuda::is_available();
   bool subtract_dark = subtract_dark_frame_.get();
   bool apply_valid_pixel_mask = apply_valid_pixel_mask_.get();
+  bool apply_dynamic_half_column_mask = apply_dynamic_half_column_mask_.get();
   torch::Tensor output_tensor;
 
-  if (use_torch_cuda && (!noop_.get() || subtract_dark || apply_valid_pixel_mask)) {
+  if (use_torch_cuda &&
+      (!noop_.get() || subtract_dark || apply_valid_pixel_mask || apply_dynamic_half_column_mask)) {
       profiling::ScopedRange torch_range("processor/torch-processing", profiling::color::kCompute);
       auto options = torch::TensorOptions()
           .dtype(torchDtypeFromDLDataType(frame_tensor->dtype()))
@@ -294,7 +333,8 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
 
       torch::Tensor working_tensor;
       const bool can_fuse_correction =
-          isUInt16Tensor(frame_tensor->dtype()) && (subtract_dark || apply_valid_pixel_mask);
+          isUInt16Tensor(frame_tensor->dtype()) &&
+          (subtract_dark || apply_valid_pixel_mask || apply_dynamic_half_column_mask);
       if (can_fuse_correction) {
           profiling::ScopedRange fused_range("processor/fused-dark-correction", profiling::color::kCompute);
           if (subtract_dark) {
@@ -349,6 +389,37 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
               validateDarkFrameShape(working_tensor.sizes(), valid_pixel_mask_height_, valid_pixel_mask_width_);
               working_tensor = working_tensor * valid_pixel_mask_tensor_;
           }
+      }
+
+      if (apply_dynamic_half_column_mask) {
+          profiling::ScopedRange dynamic_mask_range(
+              "processor/dynamic-half-column-mask", profiling::color::kCompute);
+          const auto tensor_sizes = working_tensor.sizes();
+          const uint32_t height = static_cast<uint32_t>(tensor_sizes[tensor_sizes.size() - 2]);
+          const uint32_t width = static_cast<uint32_t>(tensor_sizes[tensor_sizes.size() - 1]);
+          const uint32_t frames = frameCountForShape(tensor_sizes);
+          cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+          torch::Tensor batch_mean = torch::empty(
+              {static_cast<int64_t>(height), static_cast<int64_t>(width)},
+              torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+          compute_frame_mean_float(
+              working_tensor.data_ptr<float>(),
+              batch_mean.data_ptr<float>(),
+              frames,
+              height,
+              width,
+              stream);
+          apply_dynamic_half_column_mask_float(
+              working_tensor.data_ptr<float>(),
+              batch_mean.data_ptr<float>(),
+              frames,
+              height,
+              width,
+              dynamic_mask_median_window_pixels_.get(),
+              dynamic_mask_threshold_ratio_.get(),
+              dynamic_mask_threshold_offset_.get(),
+              stream);
       }
 
       if (!noop_.get()) {

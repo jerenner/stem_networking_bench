@@ -29,6 +29,10 @@ class PyTorchProcessorOp : public Operator {
   Parameter<std::string> dark_frame_dataset_;
   Parameter<bool> apply_valid_pixel_mask_;
   Parameter<std::string> valid_pixel_mask_dataset_;
+  Parameter<bool> apply_dynamic_half_column_mask_;
+  Parameter<uint32_t> dynamic_mask_median_window_pixels_;
+  Parameter<float> dynamic_mask_threshold_ratio_;
+  Parameter<float> dynamic_mask_threshold_offset_;
 
   torch::nn::Conv2d conv_{nullptr};
   torch::Tensor dark_frame_tensor_;
