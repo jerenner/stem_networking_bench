@@ -53,10 +53,11 @@ stem_rx:
   total_time_to_recv: 30.0
   capture_latency: true
   gpu_header_extract: true
-  validate_tx_ramp: false
   subtract_dark: false
   apply_valid_pixel_mask: false
-  tile_readout: false
+  # Tile readout is the only reassembly mode; the test TX still emits 128
+  # row packets/source @ 7680 B so leave tile_duplicate_prefix_to_simulate_payload
+  # true. Set to false if the source emits full 4096-sample tile payloads.
   tile_duplicate_prefix_to_simulate_payload: true
 
 writer:

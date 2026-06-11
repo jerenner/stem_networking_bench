@@ -88,11 +88,11 @@ stem_rx:
   subtract_dark: true
   apply_valid_pixel_mask: true
 
-  # Row readout. Set tile_readout: true to mirror upstream/tiling's
-  # ZLP/core tile reassembly (see stem_rx_spark_tiled.yaml). The
-  # existing TX (which still emits 128 rows/source @ 7680 B) is reused;
-  # the RX maps row_offset [0,120) into compact tile slots and the gather
-  # kernel fills the missing 256 tile samples by wrapping the payload
-  # prefix.
-  tile_readout: false
+  # Tile readout is the only reassembly mode now (mirrors upstream/tiling).
+  # The daqiri test TX still emits 128 rows/source @ 7680 B; the RX maps
+  # row_offset [0,120) into compact tile slots, drops the 8 extra rows per
+  # source as `tile dropped pkts`, and the gather kernel fills the missing
+  # 256 tile samples by wrapping the 3840-sample payload prefix. With a
+  # real FPGA source that emits full 4096-sample tile payloads, set
+  # tile_duplicate_prefix_to_simulate_payload: false.
   tile_duplicate_prefix_to_simulate_payload: true
