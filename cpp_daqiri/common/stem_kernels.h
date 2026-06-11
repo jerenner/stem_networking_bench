@@ -15,9 +15,10 @@
  *     numbers; harmless to ship in Phase 1)
  *
  * Phase 2 (RX) uses:
- *   - stem_gather_packets (port of gather_packets in cpp/kernels.cu)
- *   - stem_gather_packets_by_placement (port of gather_packets_by_placement)
  *   - stem_extract_packet_headers (port of extract_packet_headers)
+ *   - stem_gather_tile_packets_by_placement (port of
+ *     gather_tile_packets_by_placement; the only RX gather kernel since
+ *     LBNL's FPGA emits tile-shaped payloads only)
  *
  * Phase 3 (processor) uses:
  *   - stem_dark_correct_uint16_to_float (port of dark_correct_uint16_to_float)
@@ -116,36 +117,20 @@ void stem_extract_packet_headers(uint8_t** src_ptrs,
                                  uint32_t num_pkts,
                                  cudaStream_t stream);
 
-void stem_gather_packets(uint8_t** src_ptrs,
-                         uint8_t* dst_base,
-                         uint16_t payload_len,
-                         uint16_t header_len,
-                         uint32_t num_pkts,
-                         uint32_t max_rows,
-                         uint64_t base_absolute_row,
-                         cudaStream_t stream);
-
-void stem_gather_packets_by_placement(uint8_t** src_ptrs,
-                                      const PacketPlacement* placements,
-                                      uint8_t* dst_base,
-                                      uint16_t payload_len,
-                                      uint16_t header_len,
-                                      uint32_t num_pkts,
-                                      uint32_t max_rows,
-                                      cudaStream_t stream);
-
-// Tile-readout variant of the placement gather: scatter each packet's
-// available payload into its (ZLP or core) tile within a full
+// Tile-readout placement gather: scatter each packet's available payload
+// into its (ZLP or core) tile within a full
 // [frames, frame_height, frame_width] uint16 plane. Mirrors
 // cpp/kernels.cu::gather_tile_packets_by_placement from upstream/tiling.
 //
+// This is the only RX gather path now that LBNL's FPGA emits tile-shaped
+// payloads exclusively; the legacy row-based gather has been removed.
+//
 // `available_payload_len` is the wire payload length actually present in
-// each packet (e.g. 7680 for the existing row TX). When
-// `duplicate_prefix_to_simulate_tile_payload` is true and
-// available_payload_len < TILE_PAYLOAD_BYTES, the missing tail samples are
-// filled by wrapping back to the front of the payload, matching the
-// upstream Holoscan "simulated tile readout" used to A/B-test the tile
-// reassembly against the existing row-format TX.
+// each packet (e.g. 7680 for stem_daqiri_tx, which still emits row-sized
+// payloads for testing). When `duplicate_prefix_to_simulate_tile_payload`
+// is true and available_payload_len < TILE_PAYLOAD_BYTES, the missing tail
+// samples are filled by wrapping back to the front of the payload, so the
+// daqiri TX can drive the tile RX in a self-test loop.
 void stem_gather_tile_packets_by_placement(
     uint8_t** src_ptrs,
     const PacketPlacement* placements,

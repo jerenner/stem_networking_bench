@@ -156,7 +156,6 @@ endif()
 if(STEM_DAQIRI_BUILD_RX)
   list(APPEND STEM_DAQIRI_CONFIGS
     configs/stem_rx_spark.yaml
-    configs/stem_rx_spark_tiled.yaml
     configs/stem_rx_igx_production.yaml
     configs/stem_rx_igx_loopback.yaml
   )
