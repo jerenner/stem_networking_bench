@@ -413,19 +413,20 @@ void summarize_packets(uint8_t** src_ptrs,
       src_ptrs, summaries, payload_len, header_len, num_pkts);
 }
 
-__global__ void compute_blr_baseline_uint16_kernel(const uint16_t* input,
-                                                   const float* dark_frame,
-                                                   float* baseline,
-                                                   uint32_t frames,
-                                                   uint32_t height,
-                                                   uint32_t width,
-                                                   uint32_t blr_rows,
-                                                   uint32_t zlp_width,
-                                                   uint32_t zlp_group_columns,
-                                                   uint32_t core_group_columns,
-                                                   uint32_t zlp_bins,
-                                                   uint32_t bins_per_half,
-                                                   bool subtract_dark) {
+template <typename InputT>
+__global__ void compute_blr_baseline_kernel(const InputT* input,
+                                            const float* dark_frame,
+                                            float* baseline,
+                                            uint32_t frames,
+                                            uint32_t height,
+                                            uint32_t width,
+                                            uint32_t blr_rows,
+                                            uint32_t zlp_width,
+                                            uint32_t zlp_group_columns,
+                                            uint32_t core_group_columns,
+                                            uint32_t zlp_bins,
+                                            uint32_t bins_per_half,
+                                            bool subtract_dark) {
   const uint64_t baseline_values = static_cast<uint64_t>(frames) * 2 * bins_per_half;
   const uint64_t stride = static_cast<uint64_t>(blockDim.x) * gridDim.x;
   const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
@@ -466,7 +467,8 @@ __global__ void compute_blr_baseline_uint16_kernel(const uint16_t* input,
   }
 }
 
-void compute_blr_baseline_uint16(const uint16_t* input,
+template <typename InputT>
+void launch_compute_blr_baseline(const InputT* input,
                                  const float* dark_frame,
                                  float* baseline,
                                  uint32_t frames,
@@ -490,7 +492,7 @@ void compute_blr_baseline_uint16(const uint16_t* input,
   const uint32_t blocks =
       static_cast<uint32_t>(required_blocks > 65535 ? 65535 : required_blocks);
 
-  compute_blr_baseline_uint16_kernel<<<blocks, threads, 0, stream>>>(
+  compute_blr_baseline_kernel<InputT><<<blocks, threads, 0, stream>>>(
       input,
       dark_frame,
       baseline,
@@ -506,8 +508,63 @@ void compute_blr_baseline_uint16(const uint16_t* input,
       subtract_dark);
 }
 
-__global__ void correct_uint16_with_blr_and_mean_kernel(
-    const uint16_t* input,
+void compute_blr_baseline(const uint16_t* input,
+                          const float* dark_frame,
+                          float* baseline,
+                          uint32_t frames,
+                          uint32_t height,
+                          uint32_t width,
+                          uint32_t blr_rows,
+                          uint32_t zlp_width,
+                          uint32_t zlp_group_columns,
+                          uint32_t core_group_columns,
+                          bool subtract_dark,
+                          cudaStream_t stream) {
+  launch_compute_blr_baseline(
+      input,
+      dark_frame,
+      baseline,
+      frames,
+      height,
+      width,
+      blr_rows,
+      zlp_width,
+      zlp_group_columns,
+      core_group_columns,
+      subtract_dark,
+      stream);
+}
+
+void compute_blr_baseline(const float* input,
+                          const float* dark_frame,
+                          float* baseline,
+                          uint32_t frames,
+                          uint32_t height,
+                          uint32_t width,
+                          uint32_t blr_rows,
+                          uint32_t zlp_width,
+                          uint32_t zlp_group_columns,
+                          uint32_t core_group_columns,
+                          bool subtract_dark,
+                          cudaStream_t stream) {
+  launch_compute_blr_baseline(
+      input,
+      dark_frame,
+      baseline,
+      frames,
+      height,
+      width,
+      blr_rows,
+      zlp_width,
+      zlp_group_columns,
+      core_group_columns,
+      subtract_dark,
+      stream);
+}
+
+template <typename InputT>
+__global__ void correct_with_blr_and_mean_kernel(
+    const InputT* input,
     const float* dark_frame,
     const float* blr_baseline,
     float* output,
@@ -561,7 +618,8 @@ __global__ void correct_uint16_with_blr_and_mean_kernel(
   }
 }
 
-void correct_uint16_with_blr_and_mean(const uint16_t* input,
+template <typename InputT>
+void launch_correct_with_blr_and_mean(const InputT* input,
                                       const float* dark_frame,
                                       const float* blr_baseline,
                                       float* output,
@@ -590,7 +648,7 @@ void correct_uint16_with_blr_and_mean(const uint16_t* input,
   const uint32_t blocks =
       static_cast<uint32_t>(required_blocks > 65535 ? 65535 : required_blocks);
 
-  correct_uint16_with_blr_and_mean_kernel<<<blocks, threads, 0, stream>>>(
+  correct_with_blr_and_mean_kernel<InputT><<<blocks, threads, 0, stream>>>(
       input,
       dark_frame,
       blr_baseline,
@@ -609,194 +667,70 @@ void correct_uint16_with_blr_and_mean(const uint16_t* input,
       compute_batch_mean);
 }
 
-__global__ void compute_frame_mean_float_kernel(const float* input,
-                                                float* mean,
-                                                uint32_t frames,
-                                                uint32_t frame_pixels) {
-  const uint32_t pixel_stride = blockDim.x * gridDim.x;
-
-  for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
-       pixel_idx < frame_pixels;
-       pixel_idx += pixel_stride) {
-    float sum = 0.0f;
-    for (uint32_t frame = 0; frame < frames; ++frame) {
-      const uint64_t idx = static_cast<uint64_t>(frame) * frame_pixels + pixel_idx;
-      sum += input[idx];
-    }
-    mean[pixel_idx] = sum / static_cast<float>(frames);
-  }
-}
-
-void compute_frame_mean_float(const float* input,
-                              float* mean,
-                              uint32_t frames,
-                              uint32_t height,
-                              uint32_t width,
-                              cudaStream_t stream) {
-  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
-  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
-  if (total_values == 0) { return; }
-
-  const uint32_t threads = 256;
-  const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
-  const uint32_t blocks =
-      static_cast<uint32_t>(required_blocks > 65535 ? 65535 : required_blocks);
-
-  compute_frame_mean_float_kernel<<<blocks, threads, 0, stream>>>(
-      input, mean, frames, static_cast<uint32_t>(frame_pixels));
-}
-
-__global__ void compute_blr_baseline_float_kernel(const float* input,
-                                                  float* baseline,
-                                                  uint32_t frames,
-                                                  uint32_t height,
-                                                  uint32_t width,
-                                                  uint32_t blr_rows,
-                                                  uint32_t zlp_width,
-                                                  uint32_t zlp_group_columns,
-                                                  uint32_t core_group_columns,
-                                                  uint32_t zlp_bins,
-                                                  uint32_t bins_per_half) {
-  const uint64_t baseline_values = static_cast<uint64_t>(frames) * 2 * bins_per_half;
-  const uint64_t stride = static_cast<uint64_t>(blockDim.x) * gridDim.x;
-  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
-
-  for (uint64_t baseline_idx =
-           static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       baseline_idx < baseline_values;
-       baseline_idx += stride) {
-    const uint32_t bin = baseline_idx % bins_per_half;
-    const uint64_t frame_half = baseline_idx / bins_per_half;
-    const uint32_t half = frame_half % 2;
-    const uint32_t frame = frame_half / 2;
-
-    const bool is_zlp = bin < zlp_bins;
-    const uint32_t group_columns =
-        is_zlp ? zlp_group_columns : core_group_columns;
-    const uint32_t group_start =
-        is_zlp
-            ? bin * zlp_group_columns
-            : zlp_width + (bin - zlp_bins) * core_group_columns;
-    const uint32_t row_start = half == 0 ? 0 : height - blr_rows;
-
-    float sum = 0.0f;
-    for (uint32_t row_offset = 0; row_offset < blr_rows; ++row_offset) {
-      const uint64_t row_base =
-          static_cast<uint64_t>(frame) * frame_pixels +
-          static_cast<uint64_t>(row_start + row_offset) * width +
-          group_start;
-      for (uint32_t col_offset = 0; col_offset < group_columns; ++col_offset) {
-        sum += input[row_base + col_offset];
-      }
-    }
-
-    baseline[baseline_idx] =
-        sum / static_cast<float>(blr_rows * group_columns);
-  }
-}
-
-void compute_blr_baseline_float(const float* input,
-                                float* baseline,
-                                uint32_t frames,
-                                uint32_t height,
-                                uint32_t width,
-                                uint32_t blr_rows,
-                                uint32_t zlp_width,
-                                uint32_t zlp_group_columns,
-                                uint32_t core_group_columns,
-                                cudaStream_t stream) {
-  if (frames == 0 || height == 0 || width == 0 || blr_rows == 0) { return; }
-
-  const uint32_t zlp_bins = zlp_width / zlp_group_columns;
-  const uint32_t core_bins = (width - zlp_width) / core_group_columns;
-  const uint32_t bins_per_half = zlp_bins + core_bins;
-  const uint64_t baseline_values = static_cast<uint64_t>(frames) * 2 * bins_per_half;
-
-  const uint32_t threads = 256;
-  const uint64_t required_blocks = (baseline_values + threads - 1) / threads;
-  const uint32_t blocks =
-      static_cast<uint32_t>(required_blocks > 65535 ? 65535 : required_blocks);
-
-  compute_blr_baseline_float_kernel<<<blocks, threads, 0, stream>>>(
+void correct_with_blr_and_mean(const uint16_t* input,
+                               const float* dark_frame,
+                               const float* blr_baseline,
+                               float* output,
+                               float* batch_mean,
+                               uint32_t frames,
+                               uint32_t height,
+                               uint32_t width,
+                               uint32_t zlp_width,
+                               uint32_t zlp_group_columns,
+                               uint32_t core_group_columns,
+                               bool subtract_dark,
+                               bool apply_blr,
+                               bool compute_batch_mean,
+                               cudaStream_t stream) {
+  launch_correct_with_blr_and_mean(
       input,
-      baseline,
-      frames,
-      height,
-      width,
-      blr_rows,
-      zlp_width,
-      zlp_group_columns,
-      core_group_columns,
-      zlp_bins,
-      bins_per_half);
-}
-
-__global__ void subtract_blr_baseline_float_kernel(float* input,
-                                                   const float* baseline,
-                                                   uint32_t frames,
-                                                   uint32_t height,
-                                                   uint32_t width,
-                                                   uint32_t zlp_width,
-                                                   uint32_t zlp_group_columns,
-                                                   uint32_t core_group_columns,
-                                                   uint32_t zlp_bins,
-                                                   uint32_t bins_per_half) {
-  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
-  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
-  const uint64_t stride = static_cast<uint64_t>(blockDim.x) * gridDim.x;
-  const uint32_t half_height = height / 2;
-
-  for (uint64_t idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       idx < total_values;
-       idx += stride) {
-    const uint64_t pixel_idx = idx % frame_pixels;
-    const uint32_t frame = idx / frame_pixels;
-    const uint32_t row = pixel_idx / width;
-    const uint32_t col = pixel_idx - static_cast<uint64_t>(row) * width;
-    const uint32_t half = row < half_height ? 0 : 1;
-    const uint32_t bin =
-        col < zlp_width
-            ? col / zlp_group_columns
-            : zlp_bins + (col - zlp_width) / core_group_columns;
-    const uint64_t baseline_idx =
-        (static_cast<uint64_t>(frame) * 2 + half) * bins_per_half + bin;
-    input[idx] -= baseline[baseline_idx];
-  }
-}
-
-void subtract_blr_baseline_float(float* input,
-                                 const float* baseline,
-                                 uint32_t frames,
-                                 uint32_t height,
-                                 uint32_t width,
-                                 uint32_t zlp_width,
-                                 uint32_t zlp_group_columns,
-                                 uint32_t core_group_columns,
-                                 cudaStream_t stream) {
-  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
-  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
-  if (total_values == 0) { return; }
-
-  const uint32_t zlp_bins = zlp_width / zlp_group_columns;
-  const uint32_t core_bins = (width - zlp_width) / core_group_columns;
-  const uint32_t bins_per_half = zlp_bins + core_bins;
-
-  const uint32_t threads = 256;
-  const uint64_t required_blocks = (total_values + threads - 1) / threads;
-  const uint32_t blocks =
-      static_cast<uint32_t>(required_blocks > 65535 ? 65535 : required_blocks);
-
-  subtract_blr_baseline_float_kernel<<<blocks, threads, 0, stream>>>(
-      input,
-      baseline,
+      dark_frame,
+      blr_baseline,
+      output,
+      batch_mean,
       frames,
       height,
       width,
       zlp_width,
       zlp_group_columns,
       core_group_columns,
-      zlp_bins,
-      bins_per_half);
+      subtract_dark,
+      apply_blr,
+      compute_batch_mean,
+      stream);
+}
+
+void correct_with_blr_and_mean(const float* input,
+                               const float* dark_frame,
+                               const float* blr_baseline,
+                               float* output,
+                               float* batch_mean,
+                               uint32_t frames,
+                               uint32_t height,
+                               uint32_t width,
+                               uint32_t zlp_width,
+                               uint32_t zlp_group_columns,
+                               uint32_t core_group_columns,
+                               bool subtract_dark,
+                               bool apply_blr,
+                               bool compute_batch_mean,
+                               cudaStream_t stream) {
+  launch_correct_with_blr_and_mean(
+      input,
+      dark_frame,
+      blr_baseline,
+      output,
+      batch_mean,
+      frames,
+      height,
+      width,
+      zlp_width,
+      zlp_group_columns,
+      core_group_columns,
+      subtract_dark,
+      apply_blr,
+      compute_batch_mean,
+      stream);
 }
 
 __device__ __forceinline__ float median_from_small_window(float* values, uint32_t count) {

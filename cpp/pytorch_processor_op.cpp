@@ -444,21 +444,22 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
       }
 
       torch::Tensor working_tensor;
-      const bool can_fuse_correction =
-          isUInt16Tensor(frame_tensor->dtype()) &&
-          (subtract_dark || apply_valid_pixel_mask || apply_blr_correction ||
-           apply_dynamic_half_column_mask);
-      if (can_fuse_correction) {
-          if (!fused_uint16_path_logged_) {
+      const bool input_is_uint16 = isUInt16Tensor(frame_tensor->dtype());
+      const bool use_fused_correction =
+          subtract_dark || apply_valid_pixel_mask || apply_blr_correction ||
+          apply_dynamic_half_column_mask;
+      if (use_fused_correction) {
+          if (!fused_correction_path_logged_) {
               HOLOSCAN_LOG_INFO(
-                  "PyTorchProcessorOp: Using fused uint16 correction path "
+                  "PyTorchProcessorOp: Using fused correction path for {} input "
                   "(dark subtraction: {}, BLR: {}, batch mean/dynamic mask: {}, "
                   "valid-pixel mask: {}).",
+                  input_is_uint16 ? "uint16" : "float32",
                   subtract_dark,
                   apply_blr_correction,
                   apply_dynamic_half_column_mask,
                   apply_valid_pixel_mask);
-              fused_uint16_path_logged_ = true;
+              fused_correction_path_logged_ = true;
           }
           working_tensor = torch::empty(
               pt_sizes,
@@ -474,19 +475,35 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
               blr_baseline = torch::empty(
                   {static_cast<int64_t>(frames), 2, static_cast<int64_t>(blr_bins)},
                   torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
-              compute_blr_baseline_uint16(
-                  reinterpret_cast<const uint16_t*>(gpu_data_ptr),
-                  subtract_dark ? dark_frame_tensor_.data_ptr<float>() : nullptr,
-                  blr_baseline.data_ptr<float>(),
-                  frames,
-                  height,
-                  width,
-                  blr_rows_.get(),
-                  blr_zlp_width_.get(),
-                  blr_zlp_group_columns_.get(),
-                  blr_core_group_columns_.get(),
-                  subtract_dark,
-                  stream);
+              if (input_is_uint16) {
+                  compute_blr_baseline(
+                      reinterpret_cast<const uint16_t*>(gpu_data_ptr),
+                      subtract_dark ? dark_frame_tensor_.data_ptr<float>() : nullptr,
+                      blr_baseline.data_ptr<float>(),
+                      frames,
+                      height,
+                      width,
+                      blr_rows_.get(),
+                      blr_zlp_width_.get(),
+                      blr_zlp_group_columns_.get(),
+                      blr_core_group_columns_.get(),
+                      subtract_dark,
+                      stream);
+              } else {
+                  compute_blr_baseline(
+                      reinterpret_cast<const float*>(gpu_data_ptr),
+                      subtract_dark ? dark_frame_tensor_.data_ptr<float>() : nullptr,
+                      blr_baseline.data_ptr<float>(),
+                      frames,
+                      height,
+                      width,
+                      blr_rows_.get(),
+                      blr_zlp_width_.get(),
+                      blr_zlp_group_columns_.get(),
+                      blr_core_group_columns_.get(),
+                      subtract_dark,
+                      stream);
+              }
           }
           if (apply_dynamic_half_column_mask) {
               batch_mean = torch::empty(
@@ -496,80 +513,43 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
 
           profiling::ScopedRange fused_range(
               "processor/fused-correction-blr-mean", profiling::color::kCompute);
-          correct_uint16_with_blr_and_mean(
-              reinterpret_cast<const uint16_t*>(gpu_data_ptr),
-              subtract_dark ? dark_frame_tensor_.data_ptr<float>() : nullptr,
-              apply_blr_correction ? blr_baseline.data_ptr<float>() : nullptr,
-              working_tensor.data_ptr<float>(),
-              apply_dynamic_half_column_mask ? batch_mean.data_ptr<float>() : nullptr,
-              frames,
-              height,
-              width,
-              blr_zlp_width_.get(),
-              blr_zlp_group_columns_.get(),
-              blr_core_group_columns_.get(),
-              subtract_dark,
-              apply_blr_correction,
-              apply_dynamic_half_column_mask,
-              stream);
-      } else {
-          working_tensor = pt_tensor.to(torch::kFloat32);
-          if (subtract_dark) {
-              working_tensor = working_tensor - dark_frame_tensor_;
-          } else if (apply_valid_pixel_mask || apply_blr_correction ||
-                     apply_dynamic_half_column_mask) {
-              // Float32 input may alias upstream storage; own the buffer before in-place kernels.
-              working_tensor = working_tensor.clone();
-          }
-      }
-
-      if (apply_blr_correction && !can_fuse_correction) {
-          profiling::ScopedRange blr_range(
-              "processor/blr-correction", profiling::color::kCompute);
-          const uint32_t blr_bins =
-              blr_zlp_width_.get() / blr_zlp_group_columns_.get() +
-              (width - blr_zlp_width_.get()) / blr_core_group_columns_.get();
-          torch::Tensor blr_baseline = torch::empty(
-              {static_cast<int64_t>(frames), 2, static_cast<int64_t>(blr_bins)},
-              torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
-          compute_blr_baseline_float(
-              working_tensor.data_ptr<float>(),
-              blr_baseline.data_ptr<float>(),
-              frames,
-              height,
-              width,
-              blr_rows_.get(),
-              blr_zlp_width_.get(),
-              blr_zlp_group_columns_.get(),
-              blr_core_group_columns_.get(),
-              stream);
-          subtract_blr_baseline_float(
-              working_tensor.data_ptr<float>(),
-              blr_baseline.data_ptr<float>(),
-              frames,
-              height,
-              width,
-              blr_zlp_width_.get(),
-              blr_zlp_group_columns_.get(),
-              blr_core_group_columns_.get(),
-              stream);
-      }
-
-      if (apply_dynamic_half_column_mask) {
-          profiling::ScopedRange dynamic_mask_range(
-              "processor/dynamic-half-column-mask", profiling::color::kCompute);
-          if (!can_fuse_correction) {
-              batch_mean = torch::empty(
-                  {static_cast<int64_t>(height), static_cast<int64_t>(width)},
-                  torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
-              compute_frame_mean_float(
+          if (input_is_uint16) {
+              correct_with_blr_and_mean(
+                  reinterpret_cast<const uint16_t*>(gpu_data_ptr),
+                  subtract_dark ? dark_frame_tensor_.data_ptr<float>() : nullptr,
+                  apply_blr_correction ? blr_baseline.data_ptr<float>() : nullptr,
                   working_tensor.data_ptr<float>(),
-                  batch_mean.data_ptr<float>(),
+                  apply_dynamic_half_column_mask ? batch_mean.data_ptr<float>() : nullptr,
                   frames,
                   height,
                   width,
+                  blr_zlp_width_.get(),
+                  blr_zlp_group_columns_.get(),
+                  blr_core_group_columns_.get(),
+                  subtract_dark,
+                  apply_blr_correction,
+                  apply_dynamic_half_column_mask,
+                  stream);
+          } else {
+              correct_with_blr_and_mean(
+                  reinterpret_cast<const float*>(gpu_data_ptr),
+                  subtract_dark ? dark_frame_tensor_.data_ptr<float>() : nullptr,
+                  apply_blr_correction ? blr_baseline.data_ptr<float>() : nullptr,
+                  working_tensor.data_ptr<float>(),
+                  apply_dynamic_half_column_mask ? batch_mean.data_ptr<float>() : nullptr,
+                  frames,
+                  height,
+                  width,
+                  blr_zlp_width_.get(),
+                  blr_zlp_group_columns_.get(),
+                  blr_core_group_columns_.get(),
+                  subtract_dark,
+                  apply_blr_correction,
+                  apply_dynamic_half_column_mask,
                   stream);
           }
+      } else {
+          working_tensor = pt_tensor.to(torch::kFloat32);
       }
 
       if (apply_dynamic_half_column_mask) {
@@ -610,7 +590,9 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
       }
   } else {
       if (frames_processed_ == 0) {
-          HOLOSCAN_LOG_INFO("PyTorchProcessorOp: Bypassing inference (NOOP Mode). Passes original Uint16 tensor natively.");
+          HOLOSCAN_LOG_INFO(
+              "PyTorchProcessorOp: Bypassing inference (NOOP Mode). "
+              "Passes the original input tensor natively.");
       }
       profiling::ScopedRange noop_range("processor/noop-pass-through", profiling::color::kBackpressure);
       TensorMap out_map;
