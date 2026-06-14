@@ -136,7 +136,11 @@ void PyTorchProcessorOp::setup(OperatorSpec& spec) {
 
   // Add an allocator parameter needed for creating the output tensor
   spec.param(allocator_, "allocator", "Allocator", "Allocator for output tensors.");
-  spec.param(noop_, "noop", "No-Op Mode", "If true, pass input tensor to output without processing.", false);
+  spec.param(noop_,
+             "noop",
+             "No-Op Mode",
+             "If true, skip reduction and emit a frame batch. Enabled corrections still run.",
+             false);
   spec.param(subtract_dark_frame_, "subtract_dark_frame", "Subtract Dark Frame",
              "If true, load dark_frame_path and subtract it from each incoming frame on GPU.", false);
   spec.param(dark_frame_path_, "dark_frame_path", "Dark Frame Path",
@@ -150,10 +154,35 @@ void PyTorchProcessorOp::setup(OperatorSpec& spec) {
   spec.param(valid_pixel_mask_dataset_, "valid_pixel_mask_dataset", "Valid Pixel Mask Dataset",
              "Dataset path for a 0/1 valid-pixel mask. Supports [H,W] or [1,H,W].",
              std::string("/valid_pixel_mask"));
+  spec.param(apply_blr_correction_,
+             "apply_blr_correction",
+             "Apply BLR Correction",
+             "If true, estimate and subtract the ImageJ-style per-frame baseline from top/bottom edge rows.",
+             false);
+  spec.param(blr_rows_,
+             "blr_rows",
+             "BLR Rows",
+             "Number of top and bottom edge rows used to estimate the per-frame baseline.",
+             30U);
+  spec.param(blr_zlp_width_,
+             "blr_zlp_width",
+             "BLR ZLP Width",
+             "Width in columns of the four-read ZLP region.",
+             768U);
+  spec.param(blr_zlp_group_columns_,
+             "blr_zlp_group_columns",
+             "BLR ZLP Group Columns",
+             "Number of adjacent ZLP columns averaged into one baseline value.",
+             4U);
+  spec.param(blr_core_group_columns_,
+             "blr_core_group_columns",
+             "BLR Core Group Columns",
+             "Number of adjacent CoreLoss columns averaged into one baseline value.",
+             16U);
   spec.param(apply_dynamic_half_column_mask_,
              "apply_dynamic_half_column_mask",
              "Apply Dynamic Half-Column Mask",
-             "If true, compute a batch-mean image on GPU and zero pixels whose half-column local mean is anomalously high.",
+             "If true, compute a batch-mean image on GPU and zero half-column local outliers.",
              false);
   spec.param(dynamic_mask_median_window_pixels_,
              "dynamic_mask_median_window_pixels",
@@ -163,13 +192,23 @@ void PyTorchProcessorOp::setup(OperatorSpec& spec) {
   spec.param(dynamic_mask_threshold_ratio_,
              "dynamic_mask_threshold_ratio",
              "Dynamic Mask Threshold Ratio",
-             "Mask if batch_mean > local_median * ratio + offset.",
+             "Scale applied to the local median before evaluating the outlier deviation.",
              1.0f);
   spec.param(dynamic_mask_threshold_offset_,
              "dynamic_mask_threshold_offset",
              "Dynamic Mask Threshold Offset",
-             "Mask if batch_mean > local_median * ratio + offset.",
+             "Absolute deviation from local_median * ratio required to mask a pixel.",
              500.0f);
+  spec.param(dynamic_mask_excluded_edge_rows_,
+             "dynamic_mask_excluded_edge_rows",
+             "Dynamic Mask Excluded Edge Rows",
+             "Number of non-imaging rows excluded at the top and bottom of each frame.",
+             32U);
+  spec.param(dynamic_mask_two_sided_,
+             "dynamic_mask_two_sided",
+             "Dynamic Mask Two Sided",
+             "If true, mask both positive and negative deviations from the local median.",
+             true);
 }
 
 void PyTorchProcessorOp::initialize() {
@@ -195,22 +234,48 @@ void PyTorchProcessorOp::initialize() {
     if (apply_valid_pixel_mask_.get()) {
         loadValidPixelMask();
     }
+    if (apply_blr_correction_.get()) {
+        if (!torch::cuda::is_available()) {
+            throw std::runtime_error(
+                "PyTorchProcessorOp: BLR correction requires CUDA-enabled PyTorch");
+        }
+        if (blr_rows_.get() == 0 || blr_zlp_group_columns_.get() == 0 ||
+            blr_core_group_columns_.get() == 0) {
+            throw std::runtime_error(
+                "PyTorchProcessorOp: BLR row and column-group sizes must be greater than zero");
+        }
+        HOLOSCAN_LOG_INFO(
+            "PyTorchProcessorOp: ImageJ-style BLR correction enabled using {} edge rows, "
+            "ZLP width {} grouped by {} columns, and CoreLoss grouped by {} columns.",
+            blr_rows_.get(),
+            blr_zlp_width_.get(),
+            blr_zlp_group_columns_.get(),
+            blr_core_group_columns_.get());
+    }
     if (apply_dynamic_half_column_mask_.get()) {
         if (!torch::cuda::is_available()) {
             throw std::runtime_error(
                 "PyTorchProcessorOp: dynamic half-column masking requires CUDA-enabled PyTorch");
         }
         if (dynamic_mask_median_window_pixels_.get() == 0 ||
-            dynamic_mask_median_window_pixels_.get() > 129) {
+            dynamic_mask_median_window_pixels_.get() > 129 ||
+            dynamic_mask_median_window_pixels_.get() % 2 == 0) {
             throw std::runtime_error(
-                "PyTorchProcessorOp: dynamic_mask_median_window_pixels must be in [1, 129]");
+                "PyTorchProcessorOp: dynamic_mask_median_window_pixels must be odd and in [1, 129]");
+        }
+        if (dynamic_mask_threshold_offset_.get() < 0.0f) {
+            throw std::runtime_error(
+                "PyTorchProcessorOp: dynamic_mask_threshold_offset must be non-negative");
         }
         HOLOSCAN_LOG_INFO(
             "PyTorchProcessorOp: Dynamic half-column mask enabled with median window M={}, "
-            "threshold = median * {:.3f} + {:.3f}.",
+            "{} outlier detection around median * {:.3f} with offset {:.3f}; "
+            "excluding {} top/bottom rows.",
             dynamic_mask_median_window_pixels_.get(),
+            dynamic_mask_two_sided_.get() ? "two-sided" : "positive-only",
             dynamic_mask_threshold_ratio_.get(),
-            dynamic_mask_threshold_offset_.get());
+            dynamic_mask_threshold_offset_.get(),
+            dynamic_mask_excluded_edge_rows_.get());
     }
 }
 
@@ -278,7 +343,7 @@ void PyTorchProcessorOp::loadValidPixelMask() {
     valid_pixel_mask_loaded_ = true;
 
     HOLOSCAN_LOG_INFO("PyTorchProcessorOp: Loaded valid pixel mask '{}' dataset '{}' with shape [{}, {}]. "
-                      "Invalid pixels will be zeroed after dark subtraction.",
+                      "Invalid pixels will be zeroed after detector corrections.",
                       dark_frame_path_.get(),
                       valid_pixel_mask.dataset_path,
                       valid_pixel_mask_height_,
@@ -316,11 +381,13 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
   bool use_torch_cuda = torch::cuda::is_available();
   bool subtract_dark = subtract_dark_frame_.get();
   bool apply_valid_pixel_mask = apply_valid_pixel_mask_.get();
+  bool apply_blr_correction = apply_blr_correction_.get();
   bool apply_dynamic_half_column_mask = apply_dynamic_half_column_mask_.get();
   torch::Tensor output_tensor;
 
   if (use_torch_cuda &&
-      (!noop_.get() || subtract_dark || apply_valid_pixel_mask || apply_dynamic_half_column_mask)) {
+      (!noop_.get() || subtract_dark || apply_valid_pixel_mask || apply_blr_correction ||
+       apply_dynamic_half_column_mask)) {
       profiling::ScopedRange torch_range("processor/torch-processing", profiling::color::kCompute);
       auto options = torch::TensorOptions()
           .dtype(torchDtypeFromDLDataType(frame_tensor->dtype()))
@@ -334,7 +401,8 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
       torch::Tensor working_tensor;
       const bool can_fuse_correction =
           isUInt16Tensor(frame_tensor->dtype()) &&
-          (subtract_dark || apply_valid_pixel_mask || apply_dynamic_half_column_mask);
+          (subtract_dark || apply_valid_pixel_mask || apply_blr_correction ||
+           apply_dynamic_half_column_mask);
       if (can_fuse_correction) {
           profiling::ScopedRange fused_range("processor/fused-dark-correction", profiling::color::kCompute);
           if (subtract_dark) {
@@ -343,14 +411,6 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
               }
               validateDarkFrameShape(pt_tensor.sizes(), dark_frame_height_, dark_frame_width_);
           }
-          if (apply_valid_pixel_mask) {
-              if (!valid_pixel_mask_loaded_) {
-                  throw std::runtime_error(
-                      "PyTorchProcessorOp: apply_valid_pixel_mask=true but no valid pixel mask is loaded");
-              }
-              validateDarkFrameShape(pt_tensor.sizes(), valid_pixel_mask_height_, valid_pixel_mask_width_);
-          }
-
           working_tensor = torch::empty(
               pt_sizes,
               torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
@@ -364,13 +424,13 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
           dark_correct_uint16_to_float(
               reinterpret_cast<const uint16_t*>(gpu_data_ptr),
               subtract_dark ? dark_frame_tensor_.data_ptr<float>() : nullptr,
-              apply_valid_pixel_mask ? valid_pixel_mask_tensor_.data_ptr<float>() : nullptr,
+              nullptr,
               working_tensor.data_ptr<float>(),
               frames,
               height,
               width,
               subtract_dark,
-              apply_valid_pixel_mask,
+              false,
               stream);
       } else {
           working_tensor = pt_tensor.to(torch::kFloat32);
@@ -380,25 +440,75 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
               }
               validateDarkFrameShape(working_tensor.sizes(), dark_frame_height_, dark_frame_width_);
               working_tensor = working_tensor - dark_frame_tensor_;
+          } else if (apply_valid_pixel_mask || apply_blr_correction ||
+                     apply_dynamic_half_column_mask) {
+              // Float32 input may alias upstream storage; own the buffer before in-place kernels.
+              working_tensor = working_tensor.clone();
           }
-          if (apply_valid_pixel_mask) {
-              if (!valid_pixel_mask_loaded_) {
-                  throw std::runtime_error(
-                      "PyTorchProcessorOp: apply_valid_pixel_mask=true but no valid pixel mask is loaded");
-              }
-              validateDarkFrameShape(working_tensor.sizes(), valid_pixel_mask_height_, valid_pixel_mask_width_);
-              working_tensor = working_tensor * valid_pixel_mask_tensor_;
+      }
+
+      const auto tensor_sizes = working_tensor.sizes();
+      const uint32_t height =
+          static_cast<uint32_t>(tensor_sizes[tensor_sizes.size() - 2]);
+      const uint32_t width =
+          static_cast<uint32_t>(tensor_sizes[tensor_sizes.size() - 1]);
+      const uint32_t frames = frameCountForShape(tensor_sizes);
+      cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+      if ((apply_blr_correction || apply_dynamic_half_column_mask) && height % 2 != 0) {
+          throw std::runtime_error(
+              "PyTorchProcessorOp: BLR correction and half-column masking require even frame height");
+      }
+
+      if (apply_blr_correction) {
+          profiling::ScopedRange blr_range(
+              "processor/blr-correction", profiling::color::kCompute);
+          if (height < 2 * blr_rows_.get()) {
+              throw std::runtime_error(
+                  "PyTorchProcessorOp: frame height must be at least twice blr_rows");
           }
+          if (blr_zlp_width_.get() > width ||
+              blr_zlp_width_.get() % blr_zlp_group_columns_.get() != 0 ||
+              (width - blr_zlp_width_.get()) % blr_core_group_columns_.get() != 0) {
+              throw std::runtime_error(
+                  "PyTorchProcessorOp: frame width is incompatible with configured BLR regions");
+          }
+
+          const uint32_t blr_bins =
+              blr_zlp_width_.get() / blr_zlp_group_columns_.get() +
+              (width - blr_zlp_width_.get()) / blr_core_group_columns_.get();
+          torch::Tensor blr_baseline = torch::empty(
+              {static_cast<int64_t>(frames), 2, static_cast<int64_t>(blr_bins)},
+              torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+          compute_blr_baseline_float(
+              working_tensor.data_ptr<float>(),
+              blr_baseline.data_ptr<float>(),
+              frames,
+              height,
+              width,
+              blr_rows_.get(),
+              blr_zlp_width_.get(),
+              blr_zlp_group_columns_.get(),
+              blr_core_group_columns_.get(),
+              stream);
+          subtract_blr_baseline_float(
+              working_tensor.data_ptr<float>(),
+              blr_baseline.data_ptr<float>(),
+              frames,
+              height,
+              width,
+              blr_zlp_width_.get(),
+              blr_zlp_group_columns_.get(),
+              blr_core_group_columns_.get(),
+              stream);
       }
 
       if (apply_dynamic_half_column_mask) {
           profiling::ScopedRange dynamic_mask_range(
               "processor/dynamic-half-column-mask", profiling::color::kCompute);
-          const auto tensor_sizes = working_tensor.sizes();
-          const uint32_t height = static_cast<uint32_t>(tensor_sizes[tensor_sizes.size() - 2]);
-          const uint32_t width = static_cast<uint32_t>(tensor_sizes[tensor_sizes.size() - 1]);
-          const uint32_t frames = frameCountForShape(tensor_sizes);
-          cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+          if (2 * dynamic_mask_excluded_edge_rows_.get() >= height) {
+              throw std::runtime_error(
+                  "PyTorchProcessorOp: dynamic_mask_excluded_edge_rows leaves no imaging pixels");
+          }
 
           torch::Tensor batch_mean = torch::empty(
               {static_cast<int64_t>(height), static_cast<int64_t>(width)},
@@ -419,12 +529,31 @@ void PyTorchProcessorOp::compute(InputContext& op_input, OutputContext& op_outpu
               dynamic_mask_median_window_pixels_.get(),
               dynamic_mask_threshold_ratio_.get(),
               dynamic_mask_threshold_offset_.get(),
+              dynamic_mask_excluded_edge_rows_.get(),
+              dynamic_mask_two_sided_.get(),
+              stream);
+      }
+
+      if (apply_valid_pixel_mask) {
+          profiling::ScopedRange valid_mask_range(
+              "processor/valid-pixel-mask", profiling::color::kCompute);
+          if (!valid_pixel_mask_loaded_) {
+              throw std::runtime_error(
+                  "PyTorchProcessorOp: apply_valid_pixel_mask=true but no valid pixel mask is loaded");
+          }
+          validateDarkFrameShape(
+              working_tensor.sizes(), valid_pixel_mask_height_, valid_pixel_mask_width_);
+          apply_valid_pixel_mask_float(
+              working_tensor.data_ptr<float>(),
+              valid_pixel_mask_tensor_.data_ptr<float>(),
+              frames,
+              height,
+              width,
               stream);
       }
 
       if (!noop_.get()) {
-          // We expect [128, 1024, 3840].
-          // Sum all frames into a single 1024-row frame: [Batch, H, W] -> [H, W].
+          // Reduce the corrected frame batch from [Batch, H, W] to [H, W].
           output_tensor = working_tensor.sum(0, /*keepdim=*/false).contiguous();
       } else {
           output_tensor = working_tensor.contiguous();

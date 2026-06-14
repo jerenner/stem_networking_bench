@@ -111,6 +111,27 @@ void compute_frame_mean_float(const float* input,
                               uint32_t width,
                               cudaStream_t stream);
 
+void compute_blr_baseline_float(const float* input,
+                                float* baseline,
+                                uint32_t frames,
+                                uint32_t height,
+                                uint32_t width,
+                                uint32_t blr_rows,
+                                uint32_t zlp_width,
+                                uint32_t zlp_group_columns,
+                                uint32_t core_group_columns,
+                                cudaStream_t stream);
+
+void subtract_blr_baseline_float(float* input,
+                                 const float* baseline,
+                                 uint32_t frames,
+                                 uint32_t height,
+                                 uint32_t width,
+                                 uint32_t zlp_width,
+                                 uint32_t zlp_group_columns,
+                                 uint32_t core_group_columns,
+                                 cudaStream_t stream);
+
 void apply_dynamic_half_column_mask_float(float* input,
                                           const float* batch_mean,
                                           uint32_t frames,
@@ -119,4 +140,13 @@ void apply_dynamic_half_column_mask_float(float* input,
                                           uint32_t median_window_pixels,
                                           float threshold_ratio,
                                           float threshold_offset,
+                                          uint32_t excluded_edge_rows,
+                                          bool two_sided,
                                           cudaStream_t stream);
+
+void apply_valid_pixel_mask_float(float* input,
+                                  const float* valid_pixel_mask,
+                                  uint32_t frames,
+                                  uint32_t height,
+                                  uint32_t width,
+                                  cudaStream_t stream);

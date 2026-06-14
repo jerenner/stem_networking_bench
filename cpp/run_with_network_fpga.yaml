@@ -127,12 +127,21 @@ processor:
   # are zeroed after dark subtraction.
   apply_valid_pixel_mask: false
   valid_pixel_mask_dataset: "/valid_pixel_mask"
+  # ImageJ BLR correction. Keep disabled for the walking-dot test unless the
+  # first/last rows represent real baseline-reference data.
+  apply_blr_correction: false
+  blr_rows: 30
+  blr_zlp_width: 768
+  blr_zlp_group_columns: 4
+  blr_core_group_columns: 16
   # Dynamic per-batch hot/blinker masking. The batch mean is compared to a
   # same-column local median computed independently for top and bottom halves.
   apply_dynamic_half_column_mask: true
   dynamic_mask_median_window_pixels: 31
   dynamic_mask_threshold_ratio: 1.0
   dynamic_mask_threshold_offset: 500.0
+  dynamic_mask_excluded_edge_rows: 32
+  dynamic_mask_two_sided: true
 
 writer:
   filepath: "/workspace/holohub/build/stem_networking_bench/applications/stem_networking_bench/cpp/sparse_frames_out_net.h5"
