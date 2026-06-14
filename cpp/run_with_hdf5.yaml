@@ -7,40 +7,49 @@ scheduler:
   worker_thread_number: 3 # One for replayer, one for processor, one for writer
 
 replayer:
-  filepath: "/home/jrenner/local/lbl/holoscan/sparse_frames.h5"
+  filepath: "/workspace/holohub/build/stem_networking_bench/applications/stem_networking_bench/cpp/nio_15pa_dark_frames_float32_uncompressed.h5"
   dataset_name: "/frames"
   repeat: false
-  start_frame: 0
+  start_frame: 256
   frames_per_tensor: 128
-  count: 16
+  count: 256
 
 processor:
-  noop: false
-  subtract_dark_frame: false
-  dark_frame_path: ""
+  # With noop=true, enabled corrections still run, but the corrected
+  # [batch, rows, columns] tensor is preserved. With noop=false, the corrected
+  # frames are summed over the batch dimension before they are emitted.
+  noop: true
+  # Load one [rows, columns] dark frame at startup and subtract it from every
+  # incoming frame on the GPU. The processing output is float32.
+  subtract_dark_frame: true
+  dark_frame_path: "nio_15pa_dark_frame_float32.h5"
   dark_frame_dataset: "/processed"
+  # Optionally load the static mask produced while building the dark frame.
+  # Pixels with mask value 0 are zeroed after all other detector corrections.
   apply_valid_pixel_mask: false
   valid_pixel_mask_dataset: "/valid_pixel_mask"
-  # ImageJ BLR correction: estimate a baseline independently for each frame,
-  # detector half, and coarse ZLP/CoreLoss column group from edge rows.
-  apply_blr_correction: false
+  # ImageJ BLR correction: for each frame and detector half, average the outer
+  # edge rows within coarse column groups and subtract that baseline from the
+  # corresponding half. ZLP and CoreLoss use different column-group widths.
+  apply_blr_correction: true
   blr_rows: 30
   blr_zlp_width: 768
   blr_zlp_group_columns: 4
   blr_core_group_columns: 16
-  apply_dynamic_half_column_mask: false
+  # Dynamic hot/blinker masking: calculate the batch-mean image, compare each
+  # imaging pixel with a local same-column median inside its detector half,
+  # and zero that pixel in every frame when it exceeds the configured test.
+  apply_dynamic_half_column_mask: true
   dynamic_mask_median_window_pixels: 31
+  # Outlier test: abs(batch_mean - local_median * ratio) > offset when
+  # two_sided=true; otherwise only positive deviations are masked.
   dynamic_mask_threshold_ratio: 1.0
   dynamic_mask_threshold_offset: 500.0
+  # Exclude non-imaging rows at the outer top and bottom detector edges from
+  # dynamic-mask candidates and median windows.
   dynamic_mask_excluded_edge_rows: 32
   dynamic_mask_two_sided: true
 
 writer:
-  filepath: "/home/jrenner/local/lbl/holoscan/sparse_frames_out.h5"
+  filepath: "nio_frames_out_blr.h5"
   dataset_name: "/processed"
-
-resources:
-  # Define the actual allocator resource
-  - &allocator
-    type: holoscan::UnboundedAllocator
-    name: "pool"

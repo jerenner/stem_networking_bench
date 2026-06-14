@@ -131,6 +131,47 @@ def save_frame_comparison(raw_frame,
     plt.close(fig)
 
 
+def save_mean_profiles(mean_image,
+                       top_rows: slice,
+                       bottom_rows: slice,
+                       edge_rows: int,
+                       zlp_width: int,
+                       title_prefix: str,
+                       value_label: str,
+                       output_path: Path,
+                       plt,
+                       np) -> None:
+    height = mean_image.shape[0]
+    row_profile = mean_image.mean(axis=1)
+    top_column_profile = mean_image[top_rows].mean(axis=0)
+    bottom_column_profile = mean_image[bottom_rows].mean(axis=0)
+
+    fig, axes = plt.subplots(2, 1, figsize=(15, 8), constrained_layout=True)
+    axes[0].plot(np.arange(height), row_profile, linewidth=1.0)
+    axes[0].axvspan(0, edge_rows - 1, color="tab:gray", alpha=0.2)
+    axes[0].axvspan(
+        height - edge_rows, height - 1, color="tab:gray", alpha=0.2
+    )
+    axes[0].axvline(height // 2, color="black", linestyle="--", linewidth=0.8)
+    axes[0].set_title(f"{title_prefix} row mean")
+    axes[0].set_xlabel("Row")
+    axes[0].set_ylabel(f"Mean {value_label}")
+    axes[0].grid(alpha=0.2)
+
+    axes[1].plot(top_column_profile, label="top imaging half", linewidth=0.9)
+    axes[1].plot(
+        bottom_column_profile, label="bottom imaging half", linewidth=0.9
+    )
+    axes[1].axvline(zlp_width, color="black", linestyle="--", linewidth=0.8)
+    axes[1].set_title(f"{title_prefix} column mean, imaging pixels only")
+    axes[1].set_xlabel("Column")
+    axes[1].set_ylabel(f"Mean {value_label}")
+    axes[1].legend()
+    axes[1].grid(alpha=0.2)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--raw-file", type=Path, required=True)
@@ -356,33 +397,30 @@ def main() -> None:
         fig.savefig(args.output_dir / "histograms_by_detector_half.png", dpi=180)
         plt.close(fig)
 
-        row_profile = mean_processed.mean(axis=1)
-        top_column_profile = mean_processed[top_rows].mean(axis=0)
-        bottom_column_profile = mean_processed[bottom_rows].mean(axis=0)
-        fig, axes = plt.subplots(2, 1, figsize=(15, 8), constrained_layout=True)
-        axes[0].plot(np.arange(height), row_profile, linewidth=1.0)
-        axes[0].axvspan(0, args.edge_rows - 1, color="tab:gray", alpha=0.2)
-        axes[0].axvspan(
-            height - args.edge_rows, height - 1, color="tab:gray", alpha=0.2
+        save_mean_profiles(
+            mean_pre_mask,
+            top_rows,
+            bottom_rows,
+            args.edge_rows,
+            args.zlp_width,
+            "Dark-subtracted + BLR-corrected pre-mask data",
+            "pre-mask value",
+            args.output_dir / "dark_blr_pre_mask_profiles.png",
+            plt,
+            np,
         )
-        axes[0].axvline(height // 2, color="black", linestyle="--", linewidth=0.8)
-        axes[0].set_title("Processed-data row mean")
-        axes[0].set_xlabel("Row")
-        axes[0].set_ylabel("Mean processed value")
-        axes[0].grid(alpha=0.2)
-
-        axes[1].plot(top_column_profile, label="top imaging half", linewidth=0.9)
-        axes[1].plot(
-            bottom_column_profile, label="bottom imaging half", linewidth=0.9
+        save_mean_profiles(
+            mean_processed,
+            top_rows,
+            bottom_rows,
+            args.edge_rows,
+            args.zlp_width,
+            "Fully processed data",
+            "processed value",
+            args.output_dir / "processed_profiles.png",
+            plt,
+            np,
         )
-        axes[1].axvline(args.zlp_width, color="black", linestyle="--", linewidth=0.8)
-        axes[1].set_title("Processed-data column mean, imaging pixels only")
-        axes[1].set_xlabel("Column")
-        axes[1].set_ylabel("Mean processed value")
-        axes[1].legend()
-        axes[1].grid(alpha=0.2)
-        fig.savefig(args.output_dir / "processed_profiles.png", dpi=180)
-        plt.close(fig)
 
         summary = {
             "raw_file": str(args.raw_file),
@@ -399,6 +437,7 @@ def main() -> None:
                 np.count_nonzero(inferred_zero_count)
             ),
             "max_inferred_zero_count": int(inferred_zero_count.max()),
+            "mean_pre_mask": float(mean_pre_mask[imaging_valid].mean()),
             "mean_processed": float(mean_processed[imaging_valid].mean()),
             "mean_processed_stddev": float(processed_std[imaging_valid].mean()),
         }

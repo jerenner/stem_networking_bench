@@ -50,6 +50,7 @@ class PyTorchProcessorOp : public Operator {
   int64_t valid_pixel_mask_width_ = 0;
   bool dark_frame_loaded_ = false;
   bool valid_pixel_mask_loaded_ = false;
+  bool fused_uint16_path_logged_ = false;
   long long frames_processed_ = 0;
 };
 
