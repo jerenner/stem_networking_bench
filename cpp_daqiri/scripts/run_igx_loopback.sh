@@ -17,7 +17,6 @@ TX_SECONDS="10"
 RATE="20"
 RX_CONFIG="/opt/stem_daqiri/bin/configs/stem_rx_igx_loopback.yaml"
 TX_CONFIG="/opt/stem_daqiri/bin/configs/stem_tx_igx_loopback.yaml"
-VALIDATE_RAMP=""
 RX_CONTAINER="stem_igx_rx"
 
 if [[ -f "${SOURCE_RX_CONFIG}" ]]; then
@@ -35,7 +34,6 @@ while [[ $# -gt 0 ]]; do
         --rate) RATE="$2"; shift 2 ;;
         --rx-config) RX_CONFIG="$2"; shift 2 ;;
         --tx-config) TX_CONFIG="$2"; shift 2 ;;
-        --validate-ramp) VALIDATE_RAMP="--validate-ramp"; shift ;;
         -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
         *) echo "unknown arg $1" >&2; exit 1 ;;
     esac
@@ -76,8 +74,7 @@ docker run -d --name "${RX_CONTAINER}" \
     "${IMAGE}" \
     /opt/stem_daqiri/bin/stem_daqiri_rx \
     "${RX_DOCKER_CONFIG}" \
-    --seconds "${RX_SECONDS}" \
-    ${VALIDATE_RAMP}
+    --seconds "${RX_SECONDS}"
 
 for _ in $(seq 1 60); do
     if docker logs "${RX_CONTAINER}" 2>&1 | grep -q "Starting RX Core"; then

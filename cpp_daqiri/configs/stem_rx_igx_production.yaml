@@ -55,8 +55,11 @@ stem_rx:
   gpu_header_extract: true
   subtract_dark: false
   apply_valid_pixel_mask: false
-  tile_readout: false
-  tile_duplicate_prefix_to_simulate_payload: true
+  # Tile readout is the only reassembly mode. Set
+  # tile_duplicate_prefix_to_simulate_payload: false when the FPGA emits
+  # full 4096-sample tile payloads; leave true for the daqiri test TX or
+  # any source that still emits 7680 B row-sized payloads.
+  tile_duplicate_prefix_to_simulate_payload: false
 
 writer:
   filepath: "/tmp/stem_rx_igx_production.h5"

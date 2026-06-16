@@ -162,133 +162,17 @@ void stem_extract_packet_headers(uint8_t** src_ptrs,
 }
 
 // ===========================================================================
-// Phase 2 RX -- gather packets by parsing the STEM header on the GPU
-// (legacy path, count-based aggregation).
-// ===========================================================================
-__global__ void stem_gather_packets_kernel(uint8_t** src_ptrs,
-                                           uint8_t* dst_base,
-                                           uint16_t payload_len,
-                                           uint16_t header_len,
-                                           uint32_t num_pkts,
-                                           uint32_t max_rows,
-                                           uint64_t base_absolute_row) {
-  const uint32_t pkt_idx = blockIdx.x;
-  if (pkt_idx >= num_pkts) return;
-
-  uint8_t* src = src_ptrs[pkt_idx];
-  if (src == nullptr) return;
-
-  const uint16_t row_number = (static_cast<uint16_t>(src[5]) << 8) |
-                              static_cast<uint16_t>(src[4]);
-  const uint32_t source_id = (static_cast<uint16_t>(src[7]) << 8) |
-                             static_cast<uint16_t>(src[6]);
-
-  const uint32_t frame_idx = row_number / ROWS_PER_SOURCE;
-  const uint32_t row_offset = row_number % ROWS_PER_SOURCE;
-
-  const int32_t global_row = source_id_to_global_row(source_id, row_offset);
-  if (global_row < 0) return;
-
-  const uint32_t rows_per_frame = FRAME_HEIGHT;
-  const uint32_t base_frame_mod =
-      static_cast<uint32_t>((base_absolute_row / rows_per_frame) % FRAMES_PER_WRAP);
-  const uint32_t batch_frames = max_rows / rows_per_frame;
-  const uint32_t relative_frame =
-      (frame_idx + FRAMES_PER_WRAP - base_frame_mod) % FRAMES_PER_WRAP;
-  if (relative_frame >= batch_frames) return;
-
-  const int64_t target_row_1d =
-      static_cast<int64_t>(relative_frame) * rows_per_frame + global_row;
-  if (target_row_1d < 0 ||
-      target_row_1d >= static_cast<int64_t>(max_rows)) return;
-
-  const uint8_t* payload_src = src + header_len;
-  uint8_t* dst = dst_base + target_row_1d * payload_len;
-
-  // The wire packet is only 2-byte-aligned because Eth(14)+IP(20)+UDP(8)
-  // = 42 bytes leaves the payload offset at 42 from the start. Using uint4
-  // or uint32_t would trip a CUDA Misaligned Address fault; uint16_t is
-  // safe and the payload is uint16 samples anyway.
-  const uint16_t* src16 = reinterpret_cast<const uint16_t*>(payload_src);
-  uint16_t* dst16 = reinterpret_cast<uint16_t*>(dst);
-  const int unroll_len = payload_len / sizeof(uint16_t);
-  for (int i = threadIdx.x; i < unroll_len; i += blockDim.x) {
-    dst16[i] = src16[i];
-  }
-}
-
-void stem_gather_packets(uint8_t** src_ptrs,
-                         uint8_t* dst_base,
-                         uint16_t payload_len,
-                         uint16_t header_len,
-                         uint32_t num_pkts,
-                         uint32_t max_rows,
-                         uint64_t base_absolute_row,
-                         cudaStream_t stream) {
-  if (num_pkts == 0) { return; }
-  stem_gather_packets_kernel<<<num_pkts, 256, 0, stream>>>(
-      src_ptrs, dst_base, payload_len, header_len,
-      num_pkts, max_rows, base_absolute_row);
-}
-
-// ===========================================================================
-// Phase 2 RX -- gather packets using host-precomputed placements (modern
-// slack-based batching path; see cpp/stem_receiver_op.h).
-// ===========================================================================
-__global__ void stem_gather_packets_by_placement_kernel(uint8_t** src_ptrs,
-                                                        const PacketPlacement* placements,
-                                                        uint8_t* dst_base,
-                                                        uint16_t payload_len,
-                                                        uint16_t header_len,
-                                                        uint32_t num_pkts,
-                                                        uint32_t max_rows) {
-  const uint32_t pkt_idx = blockIdx.x;
-  if (pkt_idx >= num_pkts) return;
-
-  const PacketPlacement placement = placements[pkt_idx];
-  if (!placement.valid || placement.global_row < 0) return;
-
-  const int64_t target_row_1d =
-      static_cast<int64_t>(placement.relative_frame) * FRAME_HEIGHT +
-      placement.global_row;
-  if (target_row_1d < 0 ||
-      target_row_1d >= static_cast<int64_t>(max_rows)) return;
-
-  uint8_t* src = src_ptrs[pkt_idx];
-  if (src == nullptr) return;
-
-  const uint8_t* payload_src = src + header_len;
-  uint8_t* dst = dst_base + target_row_1d * payload_len;
-
-  const uint16_t* src16 = reinterpret_cast<const uint16_t*>(payload_src);
-  uint16_t* dst16 = reinterpret_cast<uint16_t*>(dst);
-  const int unroll_len = payload_len / sizeof(uint16_t);
-  for (int i = threadIdx.x; i < unroll_len; i += blockDim.x) {
-    dst16[i] = src16[i];
-  }
-}
-
-void stem_gather_packets_by_placement(uint8_t** src_ptrs,
-                                      const PacketPlacement* placements,
-                                      uint8_t* dst_base,
-                                      uint16_t payload_len,
-                                      uint16_t header_len,
-                                      uint32_t num_pkts,
-                                      uint32_t max_rows,
-                                      cudaStream_t stream) {
-  if (num_pkts == 0) { return; }
-  stem_gather_packets_by_placement_kernel<<<num_pkts, 256, 0, stream>>>(
-      src_ptrs, placements, dst_base, payload_len, header_len,
-      num_pkts, max_rows);
-}
-
-// ---------------------------------------------------------------------------
-// Tile readout. Ported 1:1 from cpp/kernels.cu::tile_geometry +
+// Phase 2 RX -- tile-readout placement gather.
+//
+// Ported 1:1 from cpp/kernels.cu::tile_geometry +
 // gather_tile_packets_by_placement (upstream jerenner/stem_networking_bench
-// `tiling` branch). The wire payload still comes from the existing row TX,
-// so the kernel optionally fills the missing tail of a 4096-sample tile by
+// `tiling` branch). This is the only RX gather path; the legacy row-based
+// path was removed because LBNL's FPGA cannot emit row-shaped payloads.
+//
+// When the daqiri test TX still emits 7680 B row payloads, the kernel
+// optionally fills the missing 256 samples of a 4096-sample tile by
 // wrapping back to the start of the available payload.
-// ---------------------------------------------------------------------------
+// ===========================================================================
 __device__ __forceinline__ bool tile_geometry(uint32_t tile_index,
                                               uint32_t& row_start,
                                               uint32_t& col_start,

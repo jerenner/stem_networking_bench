@@ -158,18 +158,13 @@ docker run --rm \
     --rate 20
 ```
 
-Correctness gate:
-
-```bash
-/opt/stem_daqiri/bin/stem_daqiri_rx \
-    /opt/stem_daqiri/bin/configs/stem_rx_igx_loopback.yaml \
-    --seconds 20 --validate-ramp
-```
-
-The ramp validator copies complete assembled uint16 batches back to host and
-checks the deterministic TX row ramp byte-for-byte in the assembled columns.
-It exits nonzero if no complete batch is checked or if any mismatch is found.
-For throughput, leave `--validate-ramp` off.
+RX assembly is now tile-only (`gather_tile_packets_by_placement`); the legacy
+row-based gather and its `--validate-ramp` correctness gate were removed
+because LBNL's FPGA cannot emit row-shaped payloads. The test TX still emits
+128 row packets/source; the RX drops `row_offset >= 120` as `tile dropped pkts`
+and fills the remaining 256 tile samples by wrapping the payload prefix
+(`tile_duplicate_prefix_to_simulate_payload: true`). Set that knob to false
+when driving from a real FPGA that already emits 4096-sample tile payloads.
 
 For an HDF5 smoke run, copy the RX config, set `writer.noop: false`, and run at
 a low rate. The HDF5 writer is a debug sink, not the throughput default.

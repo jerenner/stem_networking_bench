@@ -6,6 +6,12 @@
  * packets into batched GPU frame tensors of shape
  *   [frames_per_tensor, 1024, 3840] uint16
  *
+ * Reassembly is tile-readout only (mirrors upstream/tiling): each packet
+ * is scattered into its (ZLP or core) tile within the 1024 x 3840 frame
+ * plane via stem_gather_tile_packets_by_placement. The legacy row-based
+ * gather was removed because LBNL's FPGA can only emit tile-shaped
+ * payloads.
+ *
  * Port of the essentials of cpp/stem_receiver_op.h. Two important pieces
  * of the Holoscan original are mirrored here so that Phase 3 parity is
  * even possible:
@@ -117,22 +123,19 @@ struct StemRxConfig {
   // a GPU header extraction kernel plus header-only DtoH metadata copy.
   bool gpu_header_extract = false;
 
-  // Test-only correctness gate: copy the assembled uint16 tensor back after
-  // gather and verify it matches stem_daqiri_tx's deterministic row ramp.
-  // Only valid in row-readout mode (tile_readout=false); with tile_readout
-  // the ramp samples are scattered into tile cells and the row-based
-  // expectation no longer applies, so validation is silently skipped.
-  bool validate_tx_ramp = false;
-
-  // Tile readout (mirrors upstream/tiling cpp/run_with_network_fpga.yaml).
-  // When true the RX reinterprets each packet's (source_id, row_offset) as a
-  // tile_index (compacted source_ordinal * 120 + row_offset) and scatters
-  // payloads into a full [frames, FRAME_HEIGHT, FRAME_WIDTH] uint16 plane
-  // using the ZLP/core tile geometry. row_offset >= 120 is dropped.
-  bool tile_readout = false;
-  // When the wire still carries 3840-sample row payloads but we want to fill
-  // a 4096-sample tile, wrap the first 256 samples to the end of the tile.
-  // Matches Holoscan's tile_duplicate_prefix_to_simulate_payload knob.
+  // Tile-readout reassembly (the only path; mirrors upstream/tiling
+  // cpp/run_with_network_fpga.yaml). The RX reinterprets each packet's
+  // (source_id, row_offset) as a tile_index (compacted
+  // source_ordinal * 120 + row_offset) and scatters payloads into a full
+  // [frames, FRAME_HEIGHT, FRAME_WIDTH] uint16 plane using the ZLP/core
+  // tile geometry. row_offset >= 120 is dropped (counted as
+  // `tile dropped pkts`). The legacy row-based reassembly path was
+  // removed because LBNL's FPGA cannot emit row-shaped payloads.
+  //
+  // When the daqiri test TX still carries 3840-sample row payloads but we
+  // want to fill a 4096-sample tile, wrap the first 256 samples to the end
+  // of the tile. Matches Holoscan's tile_duplicate_prefix_to_simulate_payload
+  // knob. Set to false when the source is the real FPGA (full tile payloads).
   bool tile_duplicate_prefix_to_simulate_payload = true;
 
   // Phase 3 processor: apply uint16 -> float dark correction kernel after
@@ -166,14 +169,10 @@ StemRxConfig parse_stem_rx_cfg(const YAML::Node& root) {
       rx["capture_latency"].as<bool>(cfg.capture_latency);
   cfg.gpu_header_extract =
       rx["gpu_header_extract"].as<bool>(cfg.gpu_header_extract);
-  cfg.validate_tx_ramp =
-      rx["validate_tx_ramp"].as<bool>(cfg.validate_tx_ramp);
   cfg.subtract_dark =
       rx["subtract_dark"].as<bool>(cfg.subtract_dark);
   cfg.apply_valid_pixel_mask =
       rx["apply_valid_pixel_mask"].as<bool>(cfg.apply_valid_pixel_mask);
-  cfg.tile_readout =
-      rx["tile_readout"].as<bool>(cfg.tile_readout);
   cfg.tile_duplicate_prefix_to_simulate_payload =
       rx["tile_duplicate_prefix_to_simulate_payload"].as<bool>(
           cfg.tile_duplicate_prefix_to_simulate_payload);
@@ -198,10 +197,6 @@ StemRxConfig parse_stem_rx_cfg(const YAML::Node& root) {
 // ---------------------------------------------------------------------------
 volatile std::sig_atomic_t g_stop_requested = 0;
 void on_sigint(int) { g_stop_requested = 1; }
-
-struct RxRunStatus {
-  std::atomic<bool> validation_failed{false};
-};
 
 // ---------------------------------------------------------------------------
 // Burst lifetime wrapper. A daqiri burst holds N packets; the daqiri pool
@@ -413,21 +408,14 @@ class FrameAssembler {
         expected_source_count_(
             __builtin_popcount(cfg.expected_source_mask & 0xff)),
         rows_per_tensor_(cfg.frames_per_tensor * stem::FRAME_HEIGHT),
-        packets_per_source_per_frame_(
-            cfg.tile_readout ? stem::TILE_PACKETS_PER_SOURCE
-                             : stem::ROWS_PER_SOURCE),
         packet_cells_per_frame_(
-            cfg.tile_readout
-                ? expected_source_count_ * stem::TILE_PACKETS_PER_SOURCE
-                : stem::FRAME_HEIGHT),
+            expected_source_count_ * stem::TILE_PACKETS_PER_SOURCE),
         placement_capacity_(
-            cfg.tile_readout
-                ? cfg.frames_per_tensor * stem::FULL_FRAME_TILE_PACKETS
-                : rows_per_tensor_),
-        expected_rows_per_batch_(
+            cfg.frames_per_tensor * stem::FULL_FRAME_TILE_PACKETS),
+        expected_packets_per_batch_(
             cfg.frames_per_tensor *
             expected_source_count_ *
-            packets_per_source_per_frame_) {
+            stem::TILE_PACKETS_PER_SOURCE) {
     STEM_CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&h_pkt_ptrs_),
                                  sizeof(uint8_t*) * placement_capacity_));
     STEM_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_pkt_ptrs_),
@@ -518,10 +506,6 @@ class FrameAssembler {
 
   std::vector<int64_t>& latencies_us() { return latencies_us_; }
   uint64_t tile_packets_ignored() const { return tile_packets_ignored_; }
-  uint64_t validation_batches() const { return validation_batches_; }
-  uint64_t validation_partial_batches() const { return validation_partial_batches_; }
-  uint64_t validation_rows_checked() const { return validation_rows_checked_; }
-  uint64_t validation_mismatches() const { return validation_mismatches_; }
   uint64_t incomplete_batches() const { return incomplete_batches_; }
   uint64_t incomplete_missing_total() const { return incomplete_missing_total_; }
   uint64_t incomplete_missing_max() const { return incomplete_missing_max_; }
@@ -629,27 +613,9 @@ class FrameAssembler {
     return -1;
   }
 
-  static bool global_row_to_source(uint32_t global_row,
-                                   uint32_t* source_id,
-                                   uint32_t* row_offset) {
-    if (global_row < 512) {
-      const uint32_t packed = 511 - global_row;
-      *source_id = packed % 4;
-      *row_offset = packed / 4;
-      return true;
-    }
-    if (global_row < stem::FRAME_HEIGHT) {
-      const uint32_t packed = global_row - 512;
-      *source_id = 4 + (packed % 4);
-      *row_offset = packed / 4;
-      return true;
-    }
-    return false;
-  }
-
   // Number of expected sources strictly preceding `source_id` in the mask
-  // ordering (used to compact 8 sources of 128 row_offsets each into the 960
-  // tile slots when tile_readout is on). Matches StemReceiverOp upstream.
+  // ordering, used to compact 8 sources of 128 row_offsets each into the
+  // 960 tile slots/frame. Matches StemReceiverOp upstream.
   uint32_t expected_source_ordinal(uint16_t source_id) const {
     uint32_t ordinal = 0;
     for (uint32_t s = 0; s < source_id && s < 8; ++s) {
@@ -658,10 +624,11 @@ class FrameAssembler {
     return ordinal;
   }
 
-  // Translate (source_id, row_offset) into a tile_index in tile_readout
-  // mode. Returns false (and increments tile_packets_ignored_) for packets
-  // with row_offset >= TILE_PACKETS_PER_SOURCE since the wire TX still
-  // emits 128 rows/source but only 120 of them map to tile slots.
+  // Translate (source_id, row_offset) into a tile_index. Returns false
+  // (and increments tile_packets_ignored_) for packets with
+  // row_offset >= TILE_PACKETS_PER_SOURCE: the daqiri test TX still emits
+  // 128 rows/source but only 120 of them map to tile slots. The real FPGA
+  // source naturally only emits the 120 in-tile packets.
   bool compute_tile_index(const stem::PacketHeaderInfo& header,
                           uint16_t* tile_index) {
     if (header.row_offset >= stem::TILE_PACKETS_PER_SOURCE) {
@@ -680,17 +647,12 @@ class FrameAssembler {
   }
 
   // Cell index used by the per-batch occupied bitmap and emit-generation
-  // dedup map. In row mode, one cell per (frame, global_row). In tile mode,
-  // one cell per (frame, compact tile_index).
+  // dedup map: one cell per (frame, compact tile_index).
   uint64_t packet_cell_index(const PacketEntry& entry,
                              uint64_t relative_frame) const {
-    if (cfg_.tile_readout) {
-      return relative_frame *
-                 static_cast<uint64_t>(packet_cells_per_frame_) +
-             static_cast<uint64_t>(entry.tile_index);
-    }
-    return relative_frame * stem::FRAME_HEIGHT +
-           static_cast<uint64_t>(entry.global_row);
+    return relative_frame *
+               static_cast<uint64_t>(packet_cells_per_frame_) +
+           static_cast<uint64_t>(entry.tile_index);
   }
 
   // Use the same nearest-cycle unwrap as cpp/stem_receiver_op.h. With
@@ -769,7 +731,7 @@ class FrameAssembler {
     }
 
     uint16_t tile_index = 0;
-    if (cfg_.tile_readout && !compute_tile_index(header, &tile_index)) {
+    if (!compute_tile_index(header, &tile_index)) {
       return;  // counted as tile_packets_ignored_
     }
 
@@ -845,66 +807,6 @@ class FrameAssembler {
     }
   }
 
-  void validate_tx_ramp_batch(uint32_t pkts_to_gather, const uint8_t* gpu_frame_buf) {
-    if (!cfg_.validate_tx_ramp) { return; }
-    // The deterministic TX row ramp lives at row coordinates; in tile mode
-    // those samples are scattered into tile cells and the row-based
-    // expectation no longer holds. Skip silently (a startup warning is
-    // emitted from rx_worker so the user knows).
-    if (cfg_.tile_readout) { return; }
-    if (pkts_to_gather < expected_rows_per_batch_) {
-      validation_partial_batches_++;
-      return;
-    }
-
-    const uint32_t width = cfg_.payload_size / sizeof(uint16_t);
-    const size_t sample_count =
-        static_cast<size_t>(rows_per_tensor_) * static_cast<size_t>(width);
-    if (validation_host_buf_.size() < sample_count) {
-      validation_host_buf_.resize(sample_count);
-    }
-
-    STEM_CUDA_TRY(cudaMemcpy(validation_host_buf_.data(), gpu_frame_buf,
-                             sample_count * sizeof(uint16_t),
-                             cudaMemcpyDeviceToHost));
-    validation_batches_++;
-
-    for (uint32_t rel_frame = 0; rel_frame < cfg_.frames_per_tensor; ++rel_frame) {
-      for (uint32_t global_row = 0; global_row < stem::FRAME_HEIGHT; ++global_row) {
-        uint32_t source_id = 0;
-        uint32_t row_offset = 0;
-        if (!global_row_to_source(global_row, &source_id, &row_offset) ||
-            !((cfg_.expected_source_mask >> source_id) & 0x1u)) {
-          continue;
-        }
-        validation_rows_checked_++;
-        const size_t row_base =
-            (static_cast<size_t>(rel_frame) * stem::FRAME_HEIGHT + global_row) *
-            static_cast<size_t>(width);
-        for (uint32_t sample = 0; sample < width; ++sample) {
-          const uint16_t expected =
-              static_cast<uint16_t>((source_id << 12) |
-                                    (row_offset & 0xff) |
-                                    ((sample & 0xf) << 8));
-          const uint16_t actual = validation_host_buf_[row_base + sample];
-          if (actual != expected) {
-            validation_mismatches_++;
-            if (!validation_first_mismatch_reported_) {
-              validation_first_mismatch_reported_ = true;
-              std::fprintf(stderr,
-                           "validate_tx_ramp first mismatch: batch=%lu "
-                           "relative_frame=%u global_row=%u source_id=%u "
-                           "row_offset=%u sample=%u expected=0x%04x actual=0x%04x\n",
-                           static_cast<unsigned long>(validation_batches_ - 1),
-                           rel_frame, global_row, source_id, row_offset, sample,
-                           expected, actual);
-            }
-          }
-        }
-      }
-    }
-  }
-
   // Close batches as long as we have either a complete window's worth of
   // unique packets, OR enough future packets piled up to justify the
   // slack-close.
@@ -916,7 +818,7 @@ class FrameAssembler {
 
   bool should_close_current_batch() const {
     if (!stream_synced_) { return false; }
-    if (current_batch_unique_packets_ >= expected_rows_per_batch_) {
+    if (current_batch_unique_packets_ >= expected_packets_per_batch_) {
       return true;
     }
     return current_batch_unique_packets_ > 0 &&
@@ -984,29 +886,21 @@ class FrameAssembler {
                                     sizeof(stem::PacketPlacement) * pkts_to_gather,
                                     cudaMemcpyHostToDevice, stream_));
 
-      if (cfg_.tile_readout) {
-        // Available wire payload is unchanged (still 7680 B per packet);
-        // the tile gather kernel fills the missing 256 samples of the
-        // 4096-sample tile by wrapping the prefix when requested.
-        stem::stem_gather_tile_packets_by_placement(
-            d_pkt_ptrs_, d_placements_, output_slot->gpu_u16,
-            stem::STEM_PAYLOAD_SIZE,
-            static_cast<uint16_t>(cfg_.header_size + stem::STEM_HEADER_SIZE),
-            pkts_to_gather,
-            cfg_.frames_per_tensor,
-            stem::FRAME_HEIGHT,
-            stem::FRAME_WIDTH,
-            cfg_.tile_duplicate_prefix_to_simulate_payload,
-            stream_);
-      } else {
-        stem::stem_gather_packets_by_placement(
-            d_pkt_ptrs_, d_placements_, output_slot->gpu_u16,
-            stem::STEM_PAYLOAD_SIZE,
-            static_cast<uint16_t>(cfg_.header_size + stem::STEM_HEADER_SIZE),
-            pkts_to_gather,
-            rows_per_tensor_,
-            stream_);
-      }
+      // The daqiri test TX still emits 7680 B row payloads; the tile gather
+      // kernel fills the missing 256 samples of each 4096-sample tile by
+      // wrapping the payload prefix when tile_duplicate_prefix_to_simulate_payload
+      // is true. With a real FPGA source emitting full TILE_PAYLOAD_BYTES
+      // tiles, set that knob to false in the YAML.
+      stem::stem_gather_tile_packets_by_placement(
+          d_pkt_ptrs_, d_placements_, output_slot->gpu_u16,
+          stem::STEM_PAYLOAD_SIZE,
+          static_cast<uint16_t>(cfg_.header_size + stem::STEM_HEADER_SIZE),
+          pkts_to_gather,
+          cfg_.frames_per_tensor,
+          stem::FRAME_HEIGHT,
+          stem::FRAME_WIDTH,
+          cfg_.tile_duplicate_prefix_to_simulate_payload,
+          stream_);
 
       if (output_slot->gpu_float != nullptr) {
         const uint32_t width = cfg_.payload_size / sizeof(uint16_t);
@@ -1025,8 +919,6 @@ class FrameAssembler {
       output_slot->batch_index = emitted_batches_;
       output_slot->frames = cfg_.frames_per_tensor;
       STEM_CUDA_TRY(cudaEventRecord(output_slot->ready, stream_));
-      STEM_CUDA_TRY(cudaEventSynchronize(output_slot->ready));
-      validate_tx_ramp_batch(pkts_to_gather, output_slot->gpu_u16);
       sink_->enqueue(output_slot);
       // frames_assembled counts only batches that produced a GPU tensor;
       // empty closes (pkts_to_gather==0) and pool-starved closes
@@ -1038,8 +930,8 @@ class FrameAssembler {
 
     pending_packets_.erase(write_it, pending_packets_.end());
 
-    if (pkts_to_gather < expected_rows_per_batch_) {
-      const uint64_t missing = expected_rows_per_batch_ - pkts_to_gather;
+    if (pkts_to_gather < expected_packets_per_batch_) {
+      const uint64_t missing = expected_packets_per_batch_ - pkts_to_gather;
       incomplete_batches_++;
       incomplete_missing_total_ += missing;
       incomplete_missing_max_ = std::max(incomplete_missing_max_, missing);
@@ -1076,10 +968,9 @@ class FrameAssembler {
   const StemRxConfig& cfg_;
   const uint32_t      expected_source_count_;
   const uint32_t      rows_per_tensor_;
-  const uint32_t      packets_per_source_per_frame_;
   const uint32_t      packet_cells_per_frame_;
   const uint32_t      placement_capacity_;
-  const uint32_t      expected_rows_per_batch_;
+  const uint32_t      expected_packets_per_batch_;
   uint8_t**           h_pkt_ptrs_ = nullptr;
   uint8_t**           d_pkt_ptrs_ = nullptr;
   stem::PacketPlacement* h_placements_ = nullptr;
@@ -1111,17 +1002,11 @@ class FrameAssembler {
   // Phase 3 latency samples (us).
   std::vector<int64_t> latencies_us_;
 
-  // Tile readout: packets dropped because their row_offset is >= 120
-  // (i.e. outside the 960 tiles/frame compact mapping).
+  // Packets dropped because their row_offset is >= 120 (outside the 960
+  // tiles/frame compact mapping). The daqiri test TX still emits 128
+  // rows/source so this is 8 per source per frame in self-test runs; the
+  // real FPGA emits only the 120 in-tile packets and this stays at 0.
   uint64_t tile_packets_ignored_ = 0;
-
-  // Test-only ramp validation scratch/counters.
-  std::vector<uint16_t> validation_host_buf_;
-  uint64_t validation_batches_ = 0;
-  uint64_t validation_partial_batches_ = 0;
-  uint64_t validation_rows_checked_ = 0;
-  uint64_t validation_mismatches_ = 0;
-  bool validation_first_mismatch_reported_ = false;
 
   // Device-memory header extraction scratch, grown to the largest seen burst.
   uint32_t burst_header_capacity_ = 0;
@@ -1135,7 +1020,7 @@ class FrameAssembler {
 // ---------------------------------------------------------------------------
 // RX worker.
 // ---------------------------------------------------------------------------
-void rx_worker(const StemRxConfig& cfg, std::atomic<bool>& stop, RxRunStatus* status) {
+void rx_worker(const StemRxConfig& cfg, std::atomic<bool>& stop) {
   const int port_id = daqiri::get_port_id(cfg.interface_name);
   if (port_id < 0) {
     std::cerr << "Invalid RX interface_name: " << cfg.interface_name << "\n";
@@ -1203,10 +1088,8 @@ void rx_worker(const StemRxConfig& cfg, std::atomic<bool>& stop, RxRunStatus* st
               static_cast<unsigned long>(frames_assembled), fps);
   std::printf("  unexpected source: %lu\n",
               static_cast<unsigned long>(drops_unexpected_source));
-  if (cfg.tile_readout) {
-    std::printf("  tile dropped pkts: %lu  (row_offset >= 120 in tile mode)\n",
-                static_cast<unsigned long>(asm_state.tile_packets_ignored()));
-  }
+  std::printf("  tile dropped pkts: %lu  (row_offset >= 120)\n",
+              static_cast<unsigned long>(asm_state.tile_packets_ignored()));
   // The previous "out-of-window" counter was a bug -- those packets are
   // now retained across batch boundaries. Report 0 explicitly so any
   // existing parser that grepped that line still works.
@@ -1225,31 +1108,6 @@ void rx_worker(const StemRxConfig& cfg, std::atomic<bool>& stop, RxRunStatus* st
               static_cast<unsigned long>(asm_state.sink_written()));
   std::printf("  sink errors      : %lu\n",
               static_cast<unsigned long>(asm_state.sink_errors()));
-  if (cfg.validate_tx_ramp && cfg.tile_readout) {
-    std::printf("  ramp validation  : skipped (tile_readout=true; "
-                "row-based ramp expectation does not apply)\n");
-  }
-  if (cfg.validate_tx_ramp && !cfg.tile_readout) {
-    std::printf("  ramp batches     : %lu\n",
-                static_cast<unsigned long>(asm_state.validation_batches()));
-    std::printf("  ramp partial skip: %lu\n",
-                static_cast<unsigned long>(asm_state.validation_partial_batches()));
-    std::printf("  ramp rows checked: %lu\n",
-                static_cast<unsigned long>(asm_state.validation_rows_checked()));
-    std::printf("  ramp mismatches  : %lu\n",
-                static_cast<unsigned long>(asm_state.validation_mismatches()));
-    const bool failed =
-        asm_state.validation_batches() == 0 || asm_state.validation_mismatches() != 0;
-    if (failed) {
-      std::fprintf(stderr,
-                   "validate_tx_ramp failed: full_batches=%lu mismatches=%lu\n",
-                   static_cast<unsigned long>(asm_state.validation_batches()),
-                   static_cast<unsigned long>(asm_state.validation_mismatches()));
-      if (status != nullptr) {
-        status->validation_failed.store(true, std::memory_order_release);
-      }
-    }
-  }
 
   if (cfg.capture_latency) {
     auto& lat = asm_state.latencies_us();
@@ -1287,13 +1145,10 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, on_sigint);
 
   double cli_seconds = -2.0;
-  bool cli_validate_tx_ramp = false;
   for (int i = 2; i < argc; ++i) {
     const std::string flag = argv[i];
     if (flag == "--seconds" && i + 1 < argc) {
       cli_seconds = std::stod(argv[++i]);
-    } else if (flag == "--validate-ramp") {
-      cli_validate_tx_ramp = true;
     }
   }
 
@@ -1305,32 +1160,24 @@ int main(int argc, char** argv) {
 
   StemRxConfig cfg = parse_stem_rx_cfg(root);
   if (cli_seconds > -1.5) { cfg.total_time_to_recv_s = cli_seconds; }
-  if (cli_validate_tx_ramp) { cfg.validate_tx_ramp = true; }
 
   std::cout << "stem_daqiri_rx starting on '" << cfg.interface_name
             << "' frames_per_tensor=" << cfg.frames_per_tensor
             << " header_size=" << cfg.header_size
             << " payload_size=" << cfg.payload_size
             << " gpu_header_extract=" << (cfg.gpu_header_extract ? "true" : "false")
-            << " tile_readout=" << (cfg.tile_readout ? "true" : "false")
             << " tile_dup_prefix=" << (cfg.tile_duplicate_prefix_to_simulate_payload ? "true" : "false")
-            << " validate_tx_ramp=" << (cfg.validate_tx_ramp ? "true" : "false")
             << " writer.noop=" << (cfg.writer.noop ? "true" : "false")
             << " writer.num_concurrent=" << cfg.writer.num_concurrent
             << " source_mask=0x" << std::hex << cfg.expected_source_mask
             << std::dec
             << " duration=" << cfg.total_time_to_recv_s << " s\n";
-  if (cfg.tile_readout && cfg.validate_tx_ramp) {
-    std::cerr << "warning: --validate-ramp is ignored when tile_readout=true; "
-                 "ramp samples are scattered into tile cells\n";
-  }
 
   std::atomic<bool> stop{false};
-  RxRunStatus status;
-  std::thread t(rx_worker, cfg, std::ref(stop), &status);
+  std::thread t(rx_worker, cfg, std::ref(stop));
   t.join();
 
   daqiri::print_stats();
   daqiri::shutdown();
-  return status.validation_failed.load(std::memory_order_acquire) ? 2 : 0;
+  return 0;
 }
