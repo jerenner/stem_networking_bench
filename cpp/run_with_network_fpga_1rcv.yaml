@@ -1,7 +1,7 @@
 %YAML 1.2
 ---
 # Holoscan stem_networking_bench config, SINGLE-receiver mode. Used during
-# Phase 1 of the daqiri port to validate the new daqiri-based TX against the
+# TX-only daqiri validation to check the daqiri-based TX against the
 # original Holoscan RX (which is the "known good" STEM frame assembler).
 #
 # Run on spark-stacked-02 (spark-201a, 169.254.95.47). The peer Spark
@@ -85,6 +85,6 @@ processor:
   valid_pixel_mask_dataset: "/valid_pixel_mask"
 
 writer:
-  filepath: "/tmp/stem_phase1_rx_validator.h5"
+  filepath: "/tmp/stem_holoscan_rx_validator.h5"
   dataset_name: "/processed"
   noop: true

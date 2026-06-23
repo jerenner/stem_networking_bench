@@ -2,8 +2,8 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
  * All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
- * Phase 2 stem_daqiri_rx: daqiri-based RX that assembles STEM-format UDP
- * packets into batched GPU frame tensors of shape
+ * stem_daqiri_rx: daqiri-based RX that assembles STEM-format UDP packets into
+ * batched GPU frame tensors of shape
  *   [frames_per_tensor, 1024, 3840] uint16
  *
  * Reassembly is tile-readout only (mirrors upstream/tiling): each packet
@@ -13,8 +13,7 @@
  * payloads.
  *
  * Port of the essentials of cpp/stem_receiver_op.h. Two important pieces
- * of the Holoscan original are mirrored here so that Phase 3 parity is
- * even possible:
+ * of the Holoscan original are mirrored here so that parity is even possible:
  *
  *   1. Burst lifetime via std::shared_ptr<BurstHolder>. A burst is only
  *      released when no PacketEntry still references it. That lets future
@@ -24,8 +23,8 @@
  *      batches. When the window slides, those packets become in-window
  *      and feed the next gather kernel.
  *
- * The output frame tensor is allocated once at startup and reused.
- * Phase 3 hooks: per-packet epoch_us latency capture and an optional
+ * The output frame tensor is allocated once at startup and reused. Optional
+ * runtime controls include per-packet epoch_us latency capture and a
  * dark-correct CUDA stage.
  */
 #include <cuda_runtime.h>
@@ -95,9 +94,9 @@ struct ReplayerConfig {
 };
 
 // ===========================================================================
-// Crisp CUDA error reporting. On Phase 2/3 the runtime is supposed to
-// touch GPUDirect; silent failures here would surface as "0 frames assembled"
-// at the end of the run with no breadcrumb.
+// Crisp CUDA error reporting. The live RX runtime is supposed to touch
+// GPUDirect; silent failures here would surface as "0 frames assembled" at
+// the end of the run with no breadcrumb.
 // ===========================================================================
 inline void stem_cuda_check(cudaError_t err, const char* stmt, const char* file,
                             int line) {
@@ -138,11 +137,10 @@ struct StemRxConfig {
   // Optional run-duration cap in seconds. < 0 means run until SIGINT.
   double total_time_to_recv_s = 30.0;
 
-  // Phase 3 latency measurement: read epoch_us from packets stamped by the
-  // TX and compute now - epoch_us. We only sample at (source_id == 0,
-  // row_offset == 0) packets because those are the deterministic "frame
-  // start" packets in the STEM TX -- avoids the stale-stamp races on
-  // mbuf pool rotation.
+  // Live latency measurement: read epoch_us from packets stamped by the TX and
+  // compute now - epoch_us. We only sample at (source_id == 0, row_offset == 0)
+  // packets because those are the deterministic "frame start" packets in the
+  // STEM TX -- avoids the stale-stamp races on mbuf pool rotation.
   bool capture_latency = false;
 
   // Spark/unified-memory keeps CPU header reads. IGX/dGPU device memory uses
@@ -851,7 +849,7 @@ class FramePipeline {
 
 // ---------------------------------------------------------------------------
 // Frame assembler. Owns the GPU output frame buffer, the placement scratch
-// arrays, the pending packet vector, and the Phase 3 latency samples.
+// arrays, the pending packet vector, and the live latency samples.
 // ---------------------------------------------------------------------------
 class FrameAssembler {
  public:
@@ -1515,7 +1513,7 @@ class FrameAssembler {
   uint64_t output_pool_drops_ = 0;
   uint64_t emitted_batches_ = 0;
 
-  // Phase 3 latency samples (us).
+  // Live latency samples (us).
   std::vector<int64_t> latencies_us_;
 
   // Packets dropped because their row_offset is >= 120 (outside the 960

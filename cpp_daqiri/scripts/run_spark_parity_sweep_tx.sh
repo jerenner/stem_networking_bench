@@ -2,18 +2,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
-# Phase 3 parity-sweep -- TX side. Run on spark-stacked-01 (spark-960b).
+# Spark parity/throughput sweep -- TX side. Run on spark-stacked-01 (spark-960b).
 # Loops over target rates and runs N iterations of stem_daqiri_tx at each
 # rate. Captures stdout into per-rate log files under cpp_daqiri/benchmarks/.
 #
-# Coordinated with run_phase3_sweep_rx.sh: start the RX sweep on
+# Coordinated with run_spark_parity_sweep_rx.sh: start the RX sweep on
 # spark-stacked-02 FIRST so it is ready to capture each TX run.
 #
 # Args:
 #   --rates "50 80 95"   space-separated target rates in Gbps
 #   --runs N             iterations per rate (default 3)
 #   --seconds N          seconds per run (default 10)
-#   --image T            container image (default stem_daqiri:phase3)
+#   --image T            container image (default stem_daqiri:tx-rx)
 #   --outdir D           output directory (default cpp_daqiri/benchmarks/logs_tx_<utc>)
 #   --label L            extra label baked into the log filenames
 
@@ -22,7 +22,7 @@ set -euo pipefail
 RATES_DEFAULT="50 80 95"
 RUNS=3
 SECS=10
-IMAGE="stem_daqiri:phase3"
+IMAGE="stem_daqiri:tx-rx"
 LABEL="daqiri_tx"
 RATES="${RATES_DEFAULT}"
 

@@ -7,8 +7,7 @@
  * the next burst is allowed to ship. A target_rate_gbps <= 0 disables
  * pacing (unbounded send).
  *
- * Pacing model (matches the plan in
- * /home/ccrozier/.cursor/plans/holoscan_to_daqiri_phased_port_*.plan.md):
+ * Pacing model:
  *
  *   per-burst sleep = max(0, bytes_in_burst / target_bps - elapsed_since_start)
  *

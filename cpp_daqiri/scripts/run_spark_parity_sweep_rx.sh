@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
-# Phase 3 parity-sweep -- RX side. Run on spark-stacked-02 (spark-201a).
+# Spark parity/throughput sweep -- RX side. Run on spark-stacked-02 (spark-201a).
 # Loops over target rates (must match the TX sweep) and starts a new RX
 # instance for each iteration. Each RX run lasts a couple seconds longer
 # than the matched TX run so it can drain after the TX stops sending.
 #
-# Args (same shape as run_phase3_sweep_tx.sh):
+# Args (same shape as run_spark_parity_sweep_tx.sh):
 #   --rates "50 80 95"
 #   --runs N
 #   --seconds N       TX seconds per run; RX runs for SECS + 4
@@ -15,7 +15,7 @@
 #   --outdir D
 #   --label L
 #   --binary daqiri|holoscan
-#     daqiri   -> uses stem_daqiri:phase3 + stem_daqiri_rx
+#     daqiri   -> uses stem_daqiri:tx-rx + stem_daqiri_rx
 #     holoscan -> uses stem_holoscan:local + cpp/stem_networking_bench
 #                  with cpp/run_with_network_fpga_1rcv.yaml
 
@@ -24,7 +24,7 @@ set -euo pipefail
 RATES="50 80 95"
 RUNS=3
 SECS=10
-IMAGE_DAQIRI="stem_daqiri:phase3"
+IMAGE_DAQIRI="stem_daqiri:tx-rx"
 IMAGE_HOLO="stem_holoscan:local"
 LABEL="daqiri_rx"
 BINARY="daqiri"

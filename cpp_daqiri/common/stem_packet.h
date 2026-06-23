@@ -58,7 +58,7 @@ constexpr uint32_t STEM_HDR_OFF_ROW_NUMBER_LO = 4;   // u16 LE row_number
 constexpr uint32_t STEM_HDR_OFF_ROW_NUMBER_HI = 5;
 constexpr uint32_t STEM_HDR_OFF_SOURCE_ID_LO  = 6;   // u16 LE source_id
 constexpr uint32_t STEM_HDR_OFF_SOURCE_ID_HI  = 7;
-// Phase 3 latency stamping: epoch_us (uint64 LE) at bytes [16, 24) of STEM hdr.
+// Live latency stamping: epoch_us (uint64 LE) at bytes [16, 24) of STEM hdr.
 // Only stamped for the first packet of each frame (source_id==0, row_offset==0).
 constexpr uint32_t STEM_HDR_OFF_EPOCH_US      = 16;
 

@@ -19,26 +19,27 @@
 #
 # Then build this image from the stem_networking_bench repo root:
 #
+# Hello/link-check image:
 #     docker build -f Dockerfile.daqiri \
 #       --build-arg STEM_DAQIRI_BUILD_TX=OFF \
 #       --build-arg STEM_DAQIRI_BUILD_RX=OFF \
-#       -t stem_daqiri:phase0 .
+#       -t stem_daqiri:hello .
 #
-# Phase 1 builds the TX:
+# TX-only image:
 #     docker build -f Dockerfile.daqiri \
-#       --build-arg STEM_DAQIRI_BUILD_TX=ON  -t stem_daqiri:phase1 .
+#       --build-arg STEM_DAQIRI_BUILD_TX=ON -t stem_daqiri:tx-only .
 #
-# Phase 2 adds RX:
+# TX+RX image:
 #     docker build -f Dockerfile.daqiri \
 #       --build-arg STEM_DAQIRI_BUILD_TX=ON --build-arg STEM_DAQIRI_BUILD_RX=ON \
-#       -t stem_daqiri:phase2 .
+#       -t stem_daqiri:tx-rx .
 #
 # Build args:
 #   DAQIRI_BASE              Base image (default daqiri-torch:local).
 #   DAQIRI_ENGINE            daqiri engine backends to compile in (default dpdk).
 #   STEM_BUILD_TYPE          CMake build type (default Release).
-#   STEM_DAQIRI_BUILD_TX     ON to build the TX binary (Phase 1+).
-#   STEM_DAQIRI_BUILD_RX     ON to build the RX binary (Phase 2+).
+#   STEM_DAQIRI_BUILD_TX     ON to build the TX binary.
+#   STEM_DAQIRI_BUILD_RX     ON to build the RX binary.
 #   STEM_DAQIRI_ENABLE_HDF5  ON to build the optional RX smoke/debug HDF5 writer.
 #   STEM_DAQIRI_REQUIRE_HDF5 ON to fail the build if HDF5 is unavailable.
 

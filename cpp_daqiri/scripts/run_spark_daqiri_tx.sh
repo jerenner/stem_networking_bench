@@ -2,24 +2,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
-# Phase 1 runtime gate -- TX side. Run on spark-stacked-01 (spark-960b,
-# 169.254.100.253). Starts stem_daqiri_tx in the stem_daqiri:phase1
+# TX-only Spark runtime gate. Run on spark-stacked-01 (spark-960b,
+# 169.254.100.253). Starts stem_daqiri_tx in the stem_daqiri:tx-only
 # container against cpp_daqiri/configs/stem_tx_spark.yaml.
 #
 # Args (all optional):
 #   --seconds N   override total_time_to_send_s (default from YAML)
 #   --rate    G   override target_rate_gbps   (default from YAML)
-#   --image   T   override container image    (default stem_daqiri:phase1)
+#   --image   T   override container image    (default stem_daqiri:tx-only)
 #   --config  P   override config path inside the container
 #
-# Coordinated with cpp_daqiri/scripts/run_phase1_rx.sh which must already
-# be running on spark-stacked-02.
+# Coordinated with cpp_daqiri/scripts/run_spark_holoscan_rx_validator.sh,
+# which must already be running on spark-stacked-02.
 
 set -euo pipefail
 
 SECONDS_ARG=""
 RATE_ARG=""
-IMAGE="stem_daqiri:phase1"
+IMAGE="stem_daqiri:tx-only"
 CONFIG="/opt/stem_daqiri/bin/configs/stem_tx_spark.yaml"
 
 while [[ $# -gt 0 ]]; do

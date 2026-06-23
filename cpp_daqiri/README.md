@@ -14,13 +14,20 @@ one 7786 B UDP packet carries one 1024-frame row payload:
 
 ## Build
 
-Populate daqiri before building. If `.git/config` is a read-only bind mount,
-use a direct clone instead of `git submodule update --init`:
+Populate the pinned daqiri submodule before building:
+
+```bash
+git submodule update --init --recursive third_party/daqiri
+git -C third_party/daqiri rev-parse --short HEAD
+```
+
+The expected pin after the current update is `3cce706`. If `.git/config` is a
+read-only bind mount, use a direct clone instead of `git submodule update`:
 
 ```bash
 rmdir third_party/daqiri 2>/dev/null || true
 git clone --recursive https://github.com/NVIDIA/daqiri.git third_party/daqiri
-git -C third_party/daqiri checkout 8c5d69fa3c9bf9e57f6625114b5f0828bb592729
+git -C third_party/daqiri checkout 3cce706f5caf1a97351aeaf459fffb4a39478922
 git -C third_party/daqiri submodule update --init --recursive
 ```
 
@@ -33,22 +40,30 @@ IMAGE_TAG=daqiri-torch:local BASE_IMAGE=torch BASE_TARGET=dpdk \
 cd ../..
 ```
 
-Build the STEM daqiri image:
+`DAQIRI_ENGINE` is the current daqiri build knob for engine backends. Older
+documentation used `DAQIRI_MGR`; the STEM CMake wrapper still accepts it as a
+compatibility alias, but new builds should use `DAQIRI_ENGINE`.
+
+Build the parity-capable STEM daqiri image with TX, RX, and mandatory HDF5
+replay/writer/correction-file support:
 
 ```bash
 docker build -f Dockerfile.daqiri \
     --build-arg STEM_DAQIRI_BUILD_TX=ON \
     --build-arg STEM_DAQIRI_BUILD_RX=ON \
-    -t stem_daqiri:phase2 .
+    --build-arg STEM_DAQIRI_REQUIRE_HDF5=ON \
+    -t stem_daqiri:parity-hdf5 .
 ```
 
-The same Phase 2 binary carries the Phase 3 controls via YAML:
+`STEM_DAQIRI_REQUIRE_HDF5=ON` makes HDF5 replay, writer, and correction-file
+support mandatory. For a throughput-only image, omit that build arg and use a
+separate local tag such as `stem_daqiri:tx-rx`.
+
+The same RX/TX binaries carry the live-validation and sweep controls via YAML:
 `stamp_epoch_us`, `capture_latency`, `gpu_header_extract`, `hds`, the
 Holoscan-compatible top-level `processor` block, and the `writer` block.
 Legacy `stem_rx.subtract_dark` and `stem_rx.apply_valid_pixel_mask` are still
 accepted as deprecated aliases when `processor` is absent.
-Use `-DSTEM_DAQIRI_REQUIRE_HDF5=ON` for parity-capable builds that must include
-HDF5 writer/replay/correction-file support; configure fails if HDF5 is missing.
 
 ## RX-Only Production
 
@@ -95,7 +110,7 @@ docker run --rm -it \
     --gpus all \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     -v /dev/hugepages:/dev/hugepages \
-    stem_daqiri:phase2 \
+    stem_daqiri:parity-hdf5 \
     /opt/stem_daqiri/bin/stem_daqiri_rx \
     /opt/stem_daqiri/bin/configs/stem_rx_igx_production.yaml
 ```
@@ -153,6 +168,15 @@ cpp_daqiri/scripts/run_daqiri_validation.sh live-writer # writer.noop:false
 cpp_daqiri/scripts/run_daqiri_validation.sh live-pixel  # non-HDS/HDS HDF5 compare
 ```
 
+Latest local validation after the daqiri pin update to `3cce706`:
+
+- `hdf5`, `config`, and `live-all` passed against `stem_daqiri:parity-hdf5`.
+- Non-HDS unbounded 30-minute soak passed: 1800 s TX, 22.4 TB sent,
+  99.632 Gbps TX, 2,811,664 frames assembled, zero DPDK missed, error, or
+  out-of-buffer counters, and zero sink drops/errors.
+- HDS has passed the scripted short stress gate. A long HDS soak and a fresh
+  Holoscan end-to-end comparison are still separate follow-up tests.
+
 If you prefer a long-running container for manual `docker exec` testing,
 launch it from the repo root:
 
@@ -167,7 +191,7 @@ docker run -d --name stem_daqiri_live \
     -v /tmp:/tmp \
     -v "$PWD":/workspace/stem \
     -w /workspace/stem \
-    stem_daqiri:phase3-hdf5 \
+    stem_daqiri:parity-hdf5 \
     sleep infinity
 ```
 
@@ -186,6 +210,28 @@ cpp_daqiri/scripts/daqiri_docker_exec.sh \
     stem_daqiri_hello --self-test
 ```
 
+For a long non-HDS soak, keep RX alive longer than TX so it can drain and print
+the final summary. This reproduces the current 30-minute coverage shape:
+
+```bash
+docker exec -d stem_daqiri_live bash -lc \
+  'export LD_LIBRARY_PATH=/usr/local/cuda/compat/lib:${LD_LIBRARY_PATH:-};
+   rm -f /tmp/stem_daqiri_soak_nonhds.log /tmp/stem_daqiri_soak_nonhds.rc;
+   /opt/stem_daqiri/bin/stem_daqiri_rx \
+     /opt/stem_daqiri/bin/configs/stem_rx_igx_loopback.yaml \
+     --seconds 1860 > /tmp/stem_daqiri_soak_nonhds.log 2>&1;
+   echo $? > /tmp/stem_daqiri_soak_nonhds.rc'
+
+cpp_daqiri/scripts/daqiri_docker_exec.sh \
+  /opt/stem_daqiri/bin/stem_daqiri_tx \
+  /opt/stem_daqiri/bin/configs/stem_tx_igx_loopback.yaml \
+  --seconds 1800 --rate 0
+
+cpp_daqiri/scripts/daqiri_docker_exec.sh \
+  bash -lc 'cat /tmp/stem_daqiri_soak_nonhds.rc;
+            tail -80 /tmp/stem_daqiri_soak_nonhds.log'
+```
+
 Manual RX-first launch:
 
 ```bash
@@ -196,7 +242,7 @@ docker run -d --name stem_igx_rx \
     --gpus all \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     -v /dev/hugepages:/dev/hugepages \
-    stem_daqiri:phase2 \
+    stem_daqiri:parity-hdf5 \
     /opt/stem_daqiri/bin/stem_daqiri_rx \
     /opt/stem_daqiri/bin/configs/stem_rx_igx_loopback.yaml \
     --seconds 60
@@ -210,7 +256,7 @@ docker run --rm \
     --gpus all \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     -v /dev/hugepages:/dev/hugepages \
-    stem_daqiri:phase2 \
+    stem_daqiri:parity-hdf5 \
     /opt/stem_daqiri/bin/stem_daqiri_tx \
     /opt/stem_daqiri/bin/configs/stem_tx_igx_loopback.yaml \
     --seconds 10 \
@@ -265,6 +311,10 @@ Multi-receiver DAQIRI output is currently allowed only with `writer.noop:true`;
 HDF5 output is refused because receiver streams would otherwise interleave by
 arrival order in one dataset.
 
+DAQIRI HDF5 replay is finite-only and intentionally rejects
+`replayer.repeat:true`. Holoscan can repeat/wrap HDF5 replay input, but parity
+replay runs should use `repeat:false` on both sides.
+
 ## Two-Spark Setup
 
 Configs:
@@ -295,22 +345,22 @@ hugepages before running:
 sudo sysctl -w vm.nr_hugepages=2048
 ```
 
-Start RX on `spark-201a`:
+Start RX on `spark-201a` with the TX+RX Spark wrapper:
 
 ```bash
-cpp_daqiri/scripts/run_phase2_rx.sh --seconds 14
+cpp_daqiri/scripts/run_spark_daqiri_rx.sh --seconds 14
 ```
 
-Start TX on `spark-960b`:
+Start TX on `spark-960b` with the matching wrapper:
 
 ```bash
-cpp_daqiri/scripts/run_phase2_tx.sh --seconds 10 --rate 50
+cpp_daqiri/scripts/run_spark_daqiri_tx_for_rx.sh --seconds 10 --rate 50
 ```
 
-For the Phase 3 parity sweep:
+For the Spark parity sweep:
 
 ```bash
-cpp_daqiri/scripts/run_phase3_sweep_orchestrated.sh \
+cpp_daqiri/scripts/run_spark_parity_sweep_orchestrated.sh \
     --rates "10 25 50 80" --runs 1 --seconds 8 \
     --outdir cpp_daqiri/benchmarks/sweep_<utc>
 ```
@@ -322,7 +372,7 @@ include clock offset, and samples with negative skew are dropped.
 Parse sweep logs into `cpp_daqiri/benchmarks/results.md`:
 
 ```bash
-cpp_daqiri/scripts/parse_phase3_results.py \
+cpp_daqiri/scripts/parse_spark_parity_results.py \
     --daqiri-tx-dir   cpp_daqiri/benchmarks/sweep_<utc> \
     --daqiri-rx-dir   cpp_daqiri/benchmarks/sweep_<utc> \
     --holoscan-tx-dir cpp_daqiri/benchmarks/logs_tx_<utc> \
@@ -334,7 +384,7 @@ cpp_daqiri/scripts/parse_phase3_results.py \
 
 | Path | Purpose |
 | --- | --- |
-| `CMakeLists.txt` | Phased build and optional HDF5 sink linkage |
+| `CMakeLists.txt` | Build options for hello/link-check, TX, RX, and optional HDF5 linkage |
 | `common/stem_packet.h` | STEM wire layout and frame geometry |
 | `common/stem_kernels.{cu,h}` | TX header update, RX header extract, gather, processor kernels |
 | `tx/stem_tx_main.cpp` | paced STEM TX |
@@ -349,4 +399,4 @@ cpp_daqiri/scripts/parse_phase3_results.py \
 | `configs/stem_{tx,rx}_spark.yaml` | two-Spark configs |
 | `configs/stem_rx_spark_hds.yaml` | two-Spark RX config with HDS |
 | `scripts/run_igx_loopback.sh` | single-box IGX loopback wrapper |
-| `scripts/run_phase*.sh` | Spark smoke and sweep wrappers |
+| `scripts/run_spark_*.sh` | Spark TX-only, TX+RX, Holoscan RX validation, and parity-sweep wrappers |

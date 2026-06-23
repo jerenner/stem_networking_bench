@@ -36,8 +36,8 @@ bool env_flag_enabled(const char* name) {
 }
 
 // Default to dual-NIC (the production stem FPGA topology) unless the YAML
-// explicitly sets num_receivers. Phase 1 of the daqiri port adds a
-// single-receiver config to validate STEM-format TX from a single Spark NIC.
+// explicitly sets num_receivers. The single-receiver config validates
+// STEM-format DAQIRI TX from a single Spark NIC against Holoscan RX.
 constexpr int kDefaultNumReceivers = 2;
 
 }  // namespace

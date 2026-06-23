@@ -2,18 +2,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
-# Phase 2 runtime gate -- RX side. Run on spark-stacked-02 (spark-201a,
-# 169.254.95.47). Starts stem_daqiri_rx in the stem_daqiri:phase2 container.
+# RX side for the TX+RX Spark gate. Run on spark-stacked-02 (spark-201a,
+# 169.254.95.47). Starts stem_daqiri_rx in the stem_daqiri:tx-rx container.
 #
 # Args:
 #   --seconds N  override total_time_to_recv
-#   --image T    container image (default stem_daqiri:phase2)
+#   --image T    container image (default stem_daqiri:tx-rx)
 #   --config P   YAML path inside the container
 
 set -euo pipefail
 
 SECONDS_ARG=""
-IMAGE="stem_daqiri:phase2"
+IMAGE="stem_daqiri:tx-rx"
 CONFIG="/opt/stem_daqiri/bin/configs/stem_rx_spark.yaml"
 
 while [[ $# -gt 0 ]]; do

@@ -22,18 +22,18 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 
 # ---------------------------------------------------------------------------
-# Phased opt-in flags. Each phase of the port flips one of these ON so that
-# every phase can be built and gated independently:
+# Capability opt-in flags. These keep the hello/link-check, TX, and RX build
+# surfaces independently testable:
 #
-#   Phase 0 (scaffold + hello-world):  both OFF (default)
-#   Phase 1 (TX implementation):       STEM_DAQIRI_BUILD_TX=ON
-#   Phase 2 (RX implementation):       STEM_DAQIRI_BUILD_RX=ON
+#   Hello/link check: both OFF (default)
+#   TX-only:          STEM_DAQIRI_BUILD_TX=ON
+#   TX+RX:            STEM_DAQIRI_BUILD_TX=ON and STEM_DAQIRI_BUILD_RX=ON
 #
 # The common CUDA kernels + pacing helpers are only built when at least one
-# of TX/RX is enabled. Phase 0 only builds the hello-world link-check binary.
+# of TX/RX is enabled. The default only builds the hello/link-check binary.
 # ---------------------------------------------------------------------------
-option(STEM_DAQIRI_BUILD_TX "Build the STEM daqiri TX binary (Phase 1+)" OFF)
-option(STEM_DAQIRI_BUILD_RX "Build the STEM daqiri RX binary (Phase 2+)" OFF)
+option(STEM_DAQIRI_BUILD_TX "Build the STEM daqiri TX binary" OFF)
+option(STEM_DAQIRI_BUILD_RX "Build the STEM daqiri RX binary" OFF)
 option(STEM_DAQIRI_ENABLE_HDF5 "Enable the RX debug HDF5 writer when HDF5 is available" ON)
 option(STEM_DAQIRI_REQUIRE_HDF5 "Require HDF5 support for parity-capable RX/replay builds" OFF)
 
@@ -87,9 +87,9 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Phase 0 hello-world: links against daqiri, calls daqiri_init with the
+# Hello/link-check binary: links against daqiri, calls daqiri_init with the
 # provided config (or skips it in --self-test mode), then shutdown. Used for
-# the Phase 0 build/link/run gate. Always built.
+# build/link/run validation. Always built.
 # ---------------------------------------------------------------------------
 add_executable(stem_daqiri_hello common/stem_daqiri_hello.cpp)
 target_include_directories(stem_daqiri_hello PRIVATE
@@ -123,7 +123,7 @@ if(STEM_DAQIRI_BUILD_TX OR STEM_DAQIRI_BUILD_RX)
 endif()
 
 # ---------------------------------------------------------------------------
-# TX binary (Phase 1)
+# TX binary
 # ---------------------------------------------------------------------------
 if(STEM_DAQIRI_BUILD_TX)
   add_executable(stem_daqiri_tx tx/stem_tx_main.cpp)
@@ -136,7 +136,7 @@ if(STEM_DAQIRI_BUILD_TX)
 endif()
 
 # ---------------------------------------------------------------------------
-# RX binary (Phase 2)
+# RX binary
 # ---------------------------------------------------------------------------
 if(STEM_DAQIRI_BUILD_RX)
   add_executable(stem_daqiri_rx rx/stem_rx_main.cpp)

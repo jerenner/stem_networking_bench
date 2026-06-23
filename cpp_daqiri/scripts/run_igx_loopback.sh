@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_RX_CONFIG="${SCRIPT_DIR}/../configs/stem_rx_igx_loopback.yaml"
 SOURCE_TX_CONFIG="${SCRIPT_DIR}/../configs/stem_tx_igx_loopback.yaml"
 
-IMAGE="stem_daqiri:phase2"
+IMAGE="stem_daqiri:tx-rx"
 RX_SECONDS="60"
 TX_SECONDS="10"
 RATE="20"

@@ -7,20 +7,19 @@
  * same wire layout and assembles the same in-memory frame tensors as the
  * original Holoscan StemReceiverOp.
  *
- * Phase 1 (TX) uses:
+ * TX uses:
  *   - stem_tx_stamp_packet (host helper that fills a host-side packet
  *     template's STEM header at offsets 4-7)
  *   - stem_tx_update_burst_headers_kernel (per-burst GPU update of the STEM
- *     header for each packet in a burst, used in Phase 3 for varying row
- *     numbers; harmless to ship in Phase 1)
+ *     header for each packet in a burst when row numbers need to vary)
  *
- * Phase 2 (RX) uses:
+ * RX uses:
  *   - stem_extract_packet_headers (port of extract_packet_headers)
  *   - stem_gather_tile_packets_by_placement (port of
  *     gather_tile_packets_by_placement; the only RX gather kernel since
  *     LBNL's FPGA emits tile-shaped payloads only)
  *
- * Phase 3 (processor) uses:
+ * The processor uses:
  *   - stem_dark_correct_uint16_to_float (port of dark_correct_uint16_to_float)
  *   - stem_compute_frame_mean_float / stem_apply_dynamic_half_column_mask_float
  *   - stem_sum_frames_float_to_frame
@@ -34,7 +33,7 @@
 namespace stem {
 
 // ---------------------------------------------------------------------------
-// Phase 2 RX-side packet metadata, kept in lock-step with the Holoscan
+// RX-side packet metadata, kept in lock-step with the Holoscan
 // definitions so the two pipelines produce identical batched tensors.
 // ---------------------------------------------------------------------------
 struct PacketHeaderInfo {
@@ -75,7 +74,7 @@ constexpr uint32_t TILE_PACKETS_PER_SOURCE =
     FULL_FRAME_TILE_PACKETS / 8u;  // 120
 
 // ---------------------------------------------------------------------------
-// Host helpers (Phase 1 TX)
+// Host TX helpers
 // ---------------------------------------------------------------------------
 
 // Stamp the STEM 64-byte custom header into a HOST-side packet template
@@ -83,12 +82,12 @@ constexpr uint32_t TILE_PACKETS_PER_SOURCE =
 // header (i.e. the byte immediately after the 42-byte Eth+IPv4+UDP header).
 // Bytes 0-3, 8-15, 24-63 are zeroed. Bytes 4-5 = row_number (u16 LE),
 // bytes 6-7 = source_id (u16 LE), bytes 16-23 = epoch_us (u64 LE) for the
-// optional Phase 3 latency stamping path.
+// optional live latency stamping path.
 void stem_tx_stamp_packet(uint8_t* stem_header_dst, uint16_t row_number,
                           uint16_t source_id, uint64_t epoch_us);
 
 // ---------------------------------------------------------------------------
-// Device helpers (Phase 3 TX header update). Updates the STEM header bytes
+// Device TX header-update helpers. Updates the STEM header bytes
 // of `pkts_in_burst` packets in-place on the GPU. Each packet's gpu_bufs[i]
 // pointer must be the start of the wire packet (i.e. byte 0 of the Eth
 // header). `header_offset` is the offset from the start of the wire packet
@@ -104,7 +103,7 @@ void stem_tx_update_burst_headers(
     cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Device helpers (Phase 2 RX)
+// Device RX helpers
 //
 // Same APIs as cpp/kernels.{cu,cuh}, ported into the stem:: namespace so the
 // daqiri RX assembles batched [frames_per_tensor, 1024, 3840] uint16 tensors
@@ -134,7 +133,7 @@ void stem_gather_tile_packets_by_placement(
     bool duplicate_prefix_to_simulate_tile_payload, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Phase 3 processor: dark-frame subtraction + valid-pixel mask in one fused
+// Processor: dark-frame subtraction + valid-pixel mask in one fused
 // kernel. Operates on a [frames, height, width] uint16 input and writes a
 // [frames, height, width] float32 output. Both arrays live on the GPU.
 // ---------------------------------------------------------------------------

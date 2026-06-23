@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
  * All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
- * Phase 1 stem_daqiri_tx: paced STEM-format TX over daqiri/DPDK on a single
+ * stem_daqiri_tx: paced STEM-format TX over daqiri/DPDK on a single
  * ConnectX-7 NIC. Modeled on
  *   third_party/daqiri/examples/raw_gpudirect_bench.cpp::tx_worker
  *
@@ -16,7 +16,7 @@
  *      packet position in a burst). After this one-time fill, the same
  *      buffer is re-sent on every subsequent burst.
  *   3. Optionally launches a CUDA kernel to update STEM headers on the GPU
- *      (Phase 3 latency stamping path; off by default in Phase 1).
+ *      for live frame assembly and latency stamping.
  *   4. send_tx_burst.
  *   5. Token-bucket sleep until enough wall-clock has elapsed for the
  *      target_rate_gbps; stop when total_time_to_send_s elapses.
@@ -83,11 +83,11 @@ struct StemTxConfig {
   // STEM knobs
   uint32_t num_sources_active = stem::NUM_SOURCES_MAX;  // 8
   uint32_t rows_per_source = stem::ROWS_PER_SOURCE;     // 128
-  // Phase 3: update STEM headers on the GPU each burst so row_number/
-  // source_id varies across bursts and the RX can frame-assemble properly.
+  // Update STEM headers on the GPU each burst so row_number/source_id varies
+  // across bursts and the RX can frame-assemble properly.
   bool update_headers_per_burst = false;
-  // Phase 3 latency stamping: write epoch_us into the STEM header of the
-  // first packet of every burst.
+  // Live latency stamping: write epoch_us into the STEM header of the first
+  // packet of every burst.
   bool stamp_epoch_us = false;
 
   // Pacing
@@ -282,7 +282,7 @@ void tx_worker(const StemTxConfig& cfg, std::atomic<bool>& stop,
     STEM_CUDA_TRY(
         cudaStreamCreateWithFlags(&header_stream, cudaStreamNonBlocking));
 
-    // GPU scratch for per-burst header updates (Phase 3 path). Allocated once.
+    // GPU scratch for per-burst header updates. Allocated once.
     uint16_t* dev_row_numbers = nullptr;
     uint16_t* dev_source_ids = nullptr;
     uint8_t** dev_pkt_ptrs = nullptr;
@@ -386,8 +386,8 @@ void tx_worker(const StemTxConfig& cfg, std::atomic<bool>& stop,
             static_cast<uint32_t>(num_pkts), 0, epoch_us, header_stream);
         STEM_CUDA_TRY(cudaStreamSynchronize(header_stream));
       } else if (cfg.stamp_epoch_us) {
-        // Phase 3 latency-stamp path that does NOT update row_numbers per
-        // burst. daqiri's memory regions on Spark are kind: host_pinned --
+        // Latency-stamp path that does NOT update row_numbers per burst.
+        // daqiri's memory regions on Spark are kind: host_pinned --
         // we can write directly with host stores; no cudaMemcpy round-trip
         // is required.
         //
@@ -463,8 +463,8 @@ int main(int argc, char** argv) {
 
   std::signal(SIGINT, on_sigint);
 
-  // CLI override for --seconds / --rate so the parity sweep in Phase 3 can
-  // reuse one YAML across multiple target rates.
+  // CLI override for --seconds / --rate so parity sweeps can reuse one YAML
+  // across multiple target rates.
   double cli_seconds = -1.0;
   double cli_rate = -1.0;
   for (int i = 2; i + 1 < argc; i += 2) {

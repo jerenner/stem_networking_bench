@@ -1,7 +1,7 @@
-# Phase 0 hello-world placeholder config. Not used to bind a NIC -- the
+# Hello/link-check placeholder config. Not used to bind a NIC -- the
 # stem_daqiri_hello binary defaults to --self-test which does NOT call
 # daqiri_init. This file exists only so build/install plumbing has a
 # concrete file to copy and verifies that yaml-cpp parsing works.
 %YAML 1.2
 ---
-note: "phase 0 placeholder; run stem_daqiri_hello --self-test to skip daqiri_init"
+note: "hello/link-check placeholder; run stem_daqiri_hello --self-test to skip daqiri_init"

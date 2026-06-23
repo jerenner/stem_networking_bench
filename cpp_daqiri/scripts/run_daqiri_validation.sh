@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-IMAGE="${DAQIRI_IMAGE:-stem_daqiri:phase3-hdf5}"
+IMAGE="${DAQIRI_IMAGE:-stem_daqiri:parity-hdf5}"
 CONTAINER="${DAQIRI_CONTAINER:-stem_daqiri_live}"
 CUDA_COMPAT_LIB="${DAQIRI_CUDA_COMPAT_LIB:-/usr/local/cuda/compat/lib}"
 KEEP_TMP=0

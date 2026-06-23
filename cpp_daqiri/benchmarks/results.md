@@ -1,8 +1,8 @@
-# Phase 3 parity gate -- daqiri vs Holoscan
+# Spark parity sweep -- daqiri vs Holoscan
 
-This file is the deliverable for the Phase 3 parity gate. It is populated
-by running the parity sweep on the two-Spark testbed and committing the
-resulting table.
+This file is the deliverable for the Spark DAQIRI-vs-Holoscan parity sweep.
+It is populated by running the sweep on the two-Spark testbed and committing
+the resulting table.
 
 ## Test bed
 
@@ -52,13 +52,13 @@ cd third_party/daqiri && \
     DAQIRI_ENGINE="dpdk" scripts/build-container.sh
 cd ../..
 
-# build Phase 3 stem_daqiri image. If the spark already has a daqiri
-# (without torch) image, pass --build-arg DAQIRI_BASE=daqiri:local to
-# avoid the slow torch rebuild.
+# build the TX+RX stem_daqiri image. If the spark already has a daqiri
+# (without torch) image, pass --build-arg DAQIRI_BASE=daqiri:local to avoid
+# the slow torch rebuild.
 docker build -f Dockerfile.daqiri \
     --build-arg STEM_DAQIRI_BUILD_TX=ON \
     --build-arg STEM_DAQIRI_BUILD_RX=ON \
-    -t stem_daqiri:phase3 .
+    -t stem_daqiri:tx-rx .
 ```
 
 The Holoscan baseline image is a separate, slower build (rebuilds libtorch
@@ -73,17 +73,17 @@ docker build -t stem_holoscan:local .
 The recommended driver is the **single-host orchestrator** introduced
 alongside this report. It launches RX over SSH, waits for DPDK init to
 finish, fires TX locally, and only then advances to the next rate, so
-the two sides never drift out of phase:
+the two sides stay aligned:
 
 ```bash
-cpp_daqiri/scripts/run_phase3_sweep_orchestrated.sh \
+cpp_daqiri/scripts/run_spark_parity_sweep_orchestrated.sh \
     --rates "10 25 50 80" --runs 1 --seconds 8 \
     --outdir cpp_daqiri/benchmarks/sweep_<utc>
 ```
 
 The orchestrator's per-rate handshake -- "wait for `Starting RX Core` in
 the container log, then fire TX" -- replaces the older
-`run_phase3_sweep_{tx,rx}.sh` pair, which assumed both side scripts
+`run_spark_parity_sweep_{tx,rx}.sh` pair, which assumed both side scripts
 would stay aligned on their own wall clocks (in practice the first
 docker run on a fresh daemon paid ~60 s of setup latency on 960b and
 the TX sweep slid behind the RX sweep by 3 iterations). The old
@@ -93,13 +93,13 @@ machines where the orchestrator's SSH dependency is undesirable.
 To repeat the sweep for the Holoscan baseline, swap the image:
 
 ```bash
-cpp_daqiri/scripts/run_phase3_sweep_rx.sh \
+cpp_daqiri/scripts/run_spark_parity_sweep_rx.sh \
     --label holoscan_rx --binary holoscan --runs 3 --seconds 10
 ```
 
 paired with the daqiri TX sweep (Holoscan understands the same STEM wire
 format). Until the Holoscan RX is taught to read `epoch_us` from the
-STEM header (see `TODO(latency)` in `cpp_daqiri/scripts/parse_phase3_results.py`),
+STEM header (see `TODO(latency)` in `cpp_daqiri/scripts/parse_spark_parity_results.py`),
 the Holoscan-side latency cells in the table below will stay `n/a`.
 
 ## Generating the parity table
@@ -107,7 +107,7 @@ the Holoscan-side latency cells in the table below will stay `n/a`.
 The parser reads TX and RX log directories and emits the markdown table:
 
 ```bash
-cpp_daqiri/scripts/parse_phase3_results.py \
+cpp_daqiri/scripts/parse_spark_parity_results.py \
     --daqiri-tx-dir   cpp_daqiri/benchmarks/sweep_<utc> \
     --daqiri-rx-dir   cpp_daqiri/benchmarks/sweep_<utc> \
     --holoscan-tx-dir cpp_daqiri/benchmarks/sweep_<utc-holoscan> \
@@ -160,14 +160,14 @@ Do NOT declare parity until every metric passes against Holoscan.
 
 2. **Raise hugepages to 2048 (4 GiB) on BOTH sparks.** 1 GiB is enough
    for the daqiri stock benchmark (8064-byte mbufs * 65K = ~520 MiB);
-   it is NOT enough for the Phase 3 sweep's expanded host-pinned RX
+   it is NOT enough for the sweep's expanded host-pinned RX
    pool (262144 mbufs * 8064 B = ~2.1 GiB).
 
 3. **Set the NIC MTU on the primary NIC to 9082 on both sparks if you
-   intend to run the Phase 0 stock-daqiri sanity test.** The kernel
+   intend to run the stock-daqiri hello/link-check sanity test.** The kernel
    default of 8046 on the management NIC silently dropped the
    stock-bench 8064-byte frames at the RX MAC. STEM frames are 7786
-   bytes so this never matters for Phase 1 / 2 / 3.
+   bytes so this never matters for the STEM TX/RX images.
 
 4. **Cross-host clock sync via systemd-timesyncd is ~200 ms loose.**
    That dominates the absolute latency numbers below. The relative
@@ -179,7 +179,7 @@ Do NOT declare parity until every metric passes against Holoscan.
 
 ## Auto-generated parity table (sweep `sweep_20260528T001208Z`)
 
-<!-- The parse_phase3_results.py output replaces everything below this line. -->
+<!-- The parse_spark_parity_results.py output replaces everything below this line. -->
 
 | Target Gbps | Achieved Gbps | Drops | Latency p50 us | Latency p99 us | FPS | Verdict |
 |------------:|:--------------|:------|---------------:|---------------:|----:|:--------|

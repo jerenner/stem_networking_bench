@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
-# Phase 3 parity-sweep orchestrator. Drives BOTH the RX (over SSH to
+# Spark parity/throughput sweep orchestrator. Drives BOTH the RX (over SSH to
 # spark-stacked-02) and the TX (locally on spark-960b) from a single
 # process so they stay synchronized per rate. Run from spark-960b.
 #
@@ -15,16 +15,15 @@
 #      budget shortly after TX stops sending).
 #   5. Copy/keep RX log under the same OUTDIR as the TX logs.
 #
-# This avoids the prior shape where the two side scripts ran on
-# uncoupled wall clocks and drifted out of phase after the first
-# slow docker invocation.
+# This avoids the prior shape where the two side scripts ran on uncoupled wall
+# clocks and drifted apart after the first slow docker invocation.
 #
 # Args:
 #   --rates "10 25 50 80"   space-separated target rates in Gbps
 #   --runs N                iterations per rate (default 1)
 #   --seconds N             TX seconds per rate (default 8). RX uses SECS+15.
 #   --outdir D              output directory (default sweep_<utc>)
-#   --image-daqiri T        container image for daqiri TX/RX (default stem_daqiri:phase3)
+#   --image-daqiri T        container image for daqiri TX/RX (default stem_daqiri:tx-rx)
 #   --rx-host H             SSH host for the RX side (default spark-stacked-02)
 
 set -euo pipefail
@@ -33,7 +32,7 @@ RATES="10 25 50 80"
 RUNS=1
 SECS=8
 RX_HOST="spark-stacked-02"
-IMAGE_DAQIRI="stem_daqiri:phase3"
+IMAGE_DAQIRI="stem_daqiri:tx-rx"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -72,8 +71,8 @@ run_one_rate() {
     #    Note we deliberately do NOT pass --rm: we want the container to stick
     #    around after exit so we can pull its full stdout before cleanup.
     ssh -o BatchMode=yes "${RX_HOST}" "
-      docker ps -aq --filter name=stem_phase3_rx | xargs -r docker rm -f >/dev/null 2>&1
-      docker run -d --name stem_phase3_rx \
+      docker ps -aq --filter name=stem_sweep_rx | xargs -r docker rm -f >/dev/null 2>&1
+      docker run -d --name stem_sweep_rx \
           --privileged --network host \
           --gpus all \
           --ulimit memlock=-1 --ulimit stack=67108864 \
@@ -90,7 +89,7 @@ run_one_rate() {
     #    before the poll loop starts.
     local waited=0
     while (( waited < 60 )); do
-        ssh -o BatchMode=yes "${RX_HOST}" 'docker logs stem_phase3_rx 2>&1' > "${rx_log}" 2>/dev/null || true
+        ssh -o BatchMode=yes "${RX_HOST}" 'docker logs stem_sweep_rx 2>&1' > "${rx_log}" 2>/dev/null || true
         if grep -q 'Starting RX Core' "${rx_log}"; then
             break
         fi
@@ -123,15 +122,15 @@ run_one_rate() {
     sleep 3
     local waited2=0
     while (( waited2 < 30 )); do
-        if ! ssh -o BatchMode=yes "${RX_HOST}" 'docker ps -q --filter name=stem_phase3_rx' 2>/dev/null | grep -q .; then
+        if ! ssh -o BatchMode=yes "${RX_HOST}" 'docker ps -q --filter name=stem_sweep_rx' 2>/dev/null | grep -q .; then
             break
         fi
         sleep 1
         waited2=$(( waited2 + 1 ))
     done
-    ssh -o BatchMode=yes "${RX_HOST}" 'docker logs stem_phase3_rx 2>&1 || true' > "${rx_log}" 2>/dev/null
+    ssh -o BatchMode=yes "${RX_HOST}" 'docker logs stem_sweep_rx 2>&1 || true' > "${rx_log}" 2>/dev/null
     # Now safe to remove the container; the log has been captured.
-    ssh -o BatchMode=yes "${RX_HOST}" 'docker rm -f stem_phase3_rx >/dev/null 2>&1 || true'
+    ssh -o BatchMode=yes "${RX_HOST}" 'docker rm -f stem_sweep_rx >/dev/null 2>&1 || true'
 }
 
 for rate in ${RATES}; do

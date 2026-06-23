@@ -1,4 +1,4 @@
-# Phase 0 daqiri default benchmark, RX side (run on spark-201a = spark-stacked-02).
+# Stock daqiri default benchmark, RX side (run on spark-201a = spark-stacked-02).
 #
 # Pairs with daqiri_default_tx_spark960b.yaml. See that file's header for the
 # full topology description and run instructions.

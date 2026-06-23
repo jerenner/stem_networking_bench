@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
-# Phase 1 runtime gate -- RX side. Run on spark-stacked-02 (spark-201a,
+# Holoscan RX validator for the TX-only Spark gate. Run on spark-stacked-02 (spark-201a,
 # 169.254.95.47). Starts the existing Holoscan stem_networking_bench
 # binary against cpp/run_with_network_fpga_1rcv.yaml so it acts as the
 # STEM frame assembler that validates the daqiri TX.

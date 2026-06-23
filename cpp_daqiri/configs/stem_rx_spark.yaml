@@ -1,4 +1,4 @@
-# Phase 2+ STEM RX config for stem_daqiri_rx. Run on
+# STEM RX config for stem_daqiri_rx. Run on
 #   spark-stacked-02 == spark-201a (169.254.95.47, MAC 4c:bb:47:2e:20:1b)
 # The peer TX is:
 #   spark-stacked-01 == spark-960b (169.254.100.253, MAC 4c:bb:47:2d:96:0c)
@@ -7,12 +7,12 @@
 # (third_party/daqiri/examples/daqiri_bench_raw_tx_rx_spark.yaml). Memory
 # regions use `kind: host_pinned` per Spark's GPUDirect path on GB10.
 #
-# To run inside the stem_daqiri:phase2 container on spark-201a:
+# To run inside the stem_daqiri:tx-rx TX+RX container on spark-201a:
 #
 #   docker run --rm -it --privileged --network host \
 #       --gpus all --ulimit memlock=-1 --ulimit stack=67108864 \
 #       -v /dev/hugepages:/dev/hugepages \
-#       stem_daqiri:phase2 \
+#       stem_daqiri:tx-rx \
 #       /opt/stem_daqiri/bin/stem_daqiri_rx \
 #           /opt/stem_daqiri/bin/configs/stem_rx_spark.yaml --seconds 30
 #
@@ -75,7 +75,7 @@ stem_rx:
   batch_close_slack_packets: 512
   total_time_to_recv: 30.0
 
-  # Phase 3 latency capture. Reads epoch_us stamped by the TX into the
+  # Live latency capture. Reads epoch_us stamped by the TX into the
   # first packet of every burst, computes now - epoch_us, and prints
   # p50/p90/p99/p999 at end.
   capture_latency: true

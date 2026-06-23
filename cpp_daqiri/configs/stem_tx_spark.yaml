@@ -1,4 +1,4 @@
-# Phase 1+ STEM TX config for stem_daqiri_tx. Run on
+# STEM TX config for stem_daqiri_tx. Run on
 #   spark-stacked-01 == spark-960b (169.254.100.253, MAC 4c:bb:47:2d:96:0c)
 # The peer ConnectX-7 NIC is:
 #   spark-stacked-02 == spark-201a (169.254.95.47,  MAC 4c:bb:47:2e:20:1b)
@@ -10,12 +10,12 @@
 # does not load nvidia_peermem and CUDA reports DMA_BUF_SUPPORTED=0 -- the
 # canonical Spark GPUDirect path is host_pinned.
 #
-# To run inside the stem_daqiri:phase1 container on spark-960b:
+# To run inside the stem_daqiri:tx-only container on spark-960b:
 #
 #   docker run --rm -it --privileged --network host \
 #       --gpus all --ulimit memlock=-1 --ulimit stack=67108864 \
 #       -v /dev/hugepages:/dev/hugepages \
-#       stem_daqiri:phase1 \
+#       stem_daqiri:tx-only \
 #       /opt/stem_daqiri/bin/stem_daqiri_tx \
 #           /opt/stem_daqiri/bin/configs/stem_tx_spark.yaml --seconds 10
 #
@@ -89,7 +89,7 @@ stem_tx:
   # as an "incomplete batch" warning.
   update_headers_per_burst: true
 
-  # Phase 3 latency stamping: every burst writes wall-clock epoch_us into
+  # Live latency stamping: every burst writes wall-clock epoch_us into
   # packet 0's STEM header. With update_headers_per_burst: true the GPU
   # header-update kernel writes the stamp directly; with the per-host
   # fallback (no kernel) the TX host-stores it. Either path also zeroes
@@ -101,8 +101,8 @@ stem_tx:
 
   # Pacing (token-bucket). target_rate_gbps <= 0 disables pacing.
   # Override on the command line with --seconds N --rate GBPS.
-  # 20 Gbps is the Phase 2 smoke-test setpoint -- well within the receive
-  # path's capacity and easy to debug. Phase 3 sweeps push this to 50/100.
+  # 20 Gbps is the Spark smoke-test setpoint -- well within the receive
+  # path's capacity and easy to debug. Throughput sweeps push this to 50/100.
   target_rate_gbps: 20.0
   total_time_to_send: 10.0
   total_bytes_cap: 0

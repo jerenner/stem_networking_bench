@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
  * All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
- * Phase 0 build/link/run gate. Loads a YAML config, calls daqiri_init,
+ * Hello/link-check build/run gate. Loads a YAML config, calls daqiri_init,
  * prints daqiri stats, then calls daqiri::shutdown. Used to verify that
  * the cpp_daqiri build links cleanly against daqiri and that daqiri can
  * initialize against a minimal config inside the container.

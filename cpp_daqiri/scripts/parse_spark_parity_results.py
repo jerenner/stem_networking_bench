@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved. SPDX-License-Identifier: Apache-2.0
-"""Parse Phase 3 parity-sweep TX/RX logs into a single markdown table.
+"""Parse Spark DAQIRI-vs-Holoscan parity-sweep TX/RX logs.
 
 Usage:
-    parse_phase3_results.py \
+    parse_spark_parity_results.py \
         --daqiri-tx-dir   cpp_daqiri/benchmarks/logs_tx_<utc>   \
         --daqiri-rx-dir   cpp_daqiri/benchmarks/logs_rx_<utc>   \
         --holoscan-tx-dir cpp_daqiri/benchmarks/logs_tx_<utc>   \
         --holoscan-rx-dir cpp_daqiri/benchmarks/logs_rx_<utc>   \
         --output cpp_daqiri/benchmarks/results.md
 
-The script accepts log filenames produced by run_phase3_sweep_{tx,rx}.sh:
+The script accepts log filenames produced by run_spark_parity_sweep_{tx,rx}.sh:
     <label>_<rate>gbps_run<N>.log
 
 For each rate it computes per-side mean Gbps, drops, fps, p50/p99 latency
@@ -179,6 +179,10 @@ def _fmt(val: Optional[float], spec: str = "{:.3f}") -> str:
     return spec.format(val) if val is not None else "n/a"
 
 
+def _fmt_count(val: Optional[float]) -> str:
+    return f"{val:.0f}" if val is not None else "n/a"
+
+
 def _cmp(d: Optional[float], h: Optional[float], lower_is_better: bool) -> str:
     if d is None or h is None:
         return "-"
@@ -208,9 +212,13 @@ def _parity_row(rate: int,
         rx_pkts = rx_bytes / 7786.0 if rx_bytes else 0.0
         return max(0.0, tx_pkts - rx_pkts)
 
+    def _sum_if_present(xs: List[float]) -> Optional[float]:
+        return sum(xs) if xs else None
+
     d_drops = (_wire_loss(d_tx, d_rx) +
                sum(d_rx.get("drops_window", []) + d_rx.get("drops_src", [])))
-    h_drops = sum(h_rx.get("drops_window", []) + h_rx.get("drops_src", []))
+    h_drops = _sum_if_present(
+        h_rx.get("drops_window", []) + h_rx.get("drops_src", []))
     d_p50 = _mean(d_rx.get("lat_p50", []))
     h_p50 = _mean(h_rx.get("lat_p50", []))
     d_p99 = _mean(d_rx.get("lat_p99", []))
@@ -221,11 +229,11 @@ def _parity_row(rate: int,
     return (
         f"| {rate} "
         f"| {_fmt(d_gbps)} / {_fmt(h_gbps)} "
-        f"| {d_drops:.0f} / {h_drops:.0f} "
+        f"| {_fmt_count(d_drops)} / {_fmt_count(h_drops)} "
         f"| {_fmt(d_p50, '{:.1f}')} / {_fmt(h_p50, '{:.1f}')} "
         f"| {_fmt(d_p99, '{:.1f}')} / {_fmt(h_p99, '{:.1f}')} "
         f"| {_fmt(d_fps, '{:.2f}')} / {_fmt(h_fps, '{:.2f}')} "
-        f"| Gbps {_cmp(d_gbps, h_gbps, False)}, drops {_cmp(float(d_drops), float(h_drops), True)}, "
+        f"| Gbps {_cmp(d_gbps, h_gbps, False)}, drops {_cmp(d_drops, h_drops, True)}, "
         f"p50 {_cmp(d_p50, h_p50, True)}, p99 {_cmp(d_p99, h_p99, True)}, "
         f"fps {_cmp(d_fps, h_fps, False)} |"
     )
@@ -269,7 +277,7 @@ def main() -> int:
 
     rates = sorted(set(daqiri_rx) | set(holo_rx))
     lines = [
-        "# Phase 3 parity gate -- daqiri vs Holoscan",
+        "# Spark parity sweep -- daqiri vs Holoscan",
         "",
         "Each cell is `daqiri / holoscan` (means across runs). PASS means daqiri",
         "matches-or-beats Holoscan on that metric.",

@@ -1,9 +1,9 @@
-# Phase 0 daqiri default benchmark, TX side (run on spark-960b = spark-stacked-01).
+# Stock daqiri default benchmark, TX side (run on spark-960b = spark-stacked-01).
 #
 # This config drives daqiri's stock daqiri_bench_raw_gpudirect binary -- it
 # is NOT a stem_daqiri config. It is used purely to validate that the two
 # Sparks can move bytes between each other before we write any STEM-specific
-# TX/RX code in Phase 1.
+# TX/RX code in the STEM DAQIRI wrappers.
 #
 # Topology:
 #   spark-960b (TX, 169.254.100.253, MAC 4c:bb:47:2d:96:0c)

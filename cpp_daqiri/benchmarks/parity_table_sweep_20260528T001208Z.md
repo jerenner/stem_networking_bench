@@ -1,4 +1,4 @@
-# Phase 3 parity gate -- daqiri vs Holoscan
+# Spark parity sweep -- daqiri vs Holoscan
 
 Each cell is `daqiri / holoscan` (means across runs). PASS means daqiri
 matches-or-beats Holoscan on that metric.

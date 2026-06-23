@@ -3,7 +3,7 @@
  * All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * CUDA kernels for the daqiri-based STEM pipeline. See stem_kernels.h for
- * the public surface and which phase each kernel is used by.
+ * the public surface and per-kernel TX/RX/processor roles.
  */
 
 #include <cstring>
@@ -27,7 +27,7 @@ void check_cuda_launch(const char* kernel_name) {
 }  // namespace
 
 // ===========================================================================
-// Phase 1 TX -- host-side STEM header stamp
+// TX -- host-side STEM header stamp
 // ===========================================================================
 void stem_tx_stamp_packet(uint8_t* stem_header_dst, uint16_t row_number,
                           uint16_t source_id, uint64_t epoch_us) {
@@ -49,15 +49,15 @@ void stem_tx_stamp_packet(uint8_t* stem_header_dst, uint16_t row_number,
 }
 
 // ===========================================================================
-// Phase 3 TX -- in-place per-burst GPU header update.
+// TX -- in-place per-burst GPU header update.
 //
 // Each thread block handles one packet i in the burst. Writes the row_number
 // and source_id bytes (and optionally epoch_us for packet 0). For
 // pkt_idx > 0 the kernel ALSO zeroes the epoch_us slot, so the RX never
 // sees a stale stamp left behind by a previous burst when DPDK rotates
 // this buffer through position 0 -> ... -> position k. Without this the
-// Phase 3 latency p50/p99 would reflect mbuf pool rotation, not the
-// real end-to-end latency.
+// live latency p50/p99 would reflect mbuf pool rotation, not the real
+// end-to-end latency.
 // ===========================================================================
 __global__ void stem_tx_update_burst_headers_kernel(
     uint8_t** gpu_bufs, const uint16_t* row_numbers, const uint16_t* source_ids,
@@ -107,7 +107,7 @@ void stem_tx_update_burst_headers(
 }
 
 // ===========================================================================
-// Phase 2 RX -- shared device helper for STEM row layout.
+// RX -- shared device helper for STEM row layout.
 //
 // Layout (lifted verbatim from cpp/kernels.cu source_id_to_global_row):
 //   - source IDs 0..3 fill rows 511..0 in interleaved groups of 4 ordered
@@ -127,7 +127,7 @@ source_id_to_global_row(uint32_t source_id, uint32_t row_offset) {
 }
 
 // ===========================================================================
-// Phase 2 RX -- header extraction
+// RX -- header extraction
 // ===========================================================================
 __global__ void stem_extract_packet_headers_kernel(uint8_t** src_ptrs,
                                                    PacketHeaderInfo* headers,
@@ -169,7 +169,7 @@ void stem_extract_packet_headers(uint8_t** src_ptrs, PacketHeaderInfo* headers,
 }
 
 // ===========================================================================
-// Phase 2 RX -- tile-readout placement gather.
+// RX -- tile-readout placement gather.
 //
 // Ported 1:1 from cpp/kernels.cu::tile_geometry +
 // gather_tile_packets_by_placement (upstream jerenner/stem_networking_bench
@@ -283,7 +283,7 @@ void stem_gather_tile_packets_by_placement(
 }
 
 // ===========================================================================
-// Phase 3 processor -- dark-frame subtract + valid-pixel mask, uint16 -> fp32
+// Processor -- dark-frame subtract + valid-pixel mask, uint16 -> fp32
 // ===========================================================================
 __global__ void stem_dark_correct_uint16_to_float_kernel(
     const uint16_t* input, const float* dark_frame,

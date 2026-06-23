@@ -1,4 +1,4 @@
-# Phase 2+ STEM RX HDS config for DGX Spark / GB10. This uses daqiri
+# STEM RX HDS config for DGX Spark / GB10. This uses daqiri
 # header/data split so the first 106 bytes land in a CPU-readable header
 # segment and the 7680-byte test payload lands in a separate payload segment.
 #
