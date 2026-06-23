@@ -150,6 +150,113 @@ The loopback RX config defaults to `writer.noop: true` and leaves the optional
 dark/mask processor off so this command measures RX/TX throughput without disk
 I/O or extra processing on the hot path.
 
+## DAQIRI PCAP Capture
+
+DAQIRI also ships a raw packet capture utility, independent of
+`stem_daqiri_rx`. The upstream DAQIRI docs describe
+`daqiri_example_pcap_writer` as an RX-first pcap writer: it receives DAQIRI raw
+bursts, writes a classic Ethernet `.pcap`, and closes the file so tools such as
+`tcpdump -r` or Wireshark can read it. The command shape is:
+
+```bash
+daqiri_example_pcap_writer <pcap-yaml> <output.pcap> [--tx]
+```
+
+Use `--tx` only for DAQIRI's self-contained demo transmitter. For tcpdump-like
+capture from the FPGA or an external sender, omit `--tx`; if the YAML still
+contains `bench_tx`, the example prints that the transmitter is disabled.
+Remove any unused TX interface placeholders from an RX-only YAML unless they
+have been filled with valid values.
+
+In the STEM DAQIRI container, the utility comes from the base DAQIRI install:
+
+```bash
+docker run --rm -it \
+    --privileged --network host \
+    --gpus all \
+    --ulimit memlock=-1 --ulimit stack=67108864 \
+    --mount type=bind,source=/dev/hugepages,target=/dev/hugepages \
+    --mount type=bind,source=/tmp,target=/capture \
+    --mount type=bind,source="$PWD/cpp_daqiri/configs/pcap_capture.yaml",target=/cfg/pcap_capture.yaml,readonly \
+    stem_daqiri:tx-rx \
+    timeout --signal=INT --preserve-status 10s \
+    /opt/daqiri/bin/daqiri_example_pcap_writer \
+        /cfg/pcap_capture.yaml \
+        /capture/stem-fpga.pcap
+```
+
+The `timeout --signal=INT --preserve-status 10s` wrapper bounds the capture and
+lets the example close the pcap cleanly; omit it for an interactive capture
+that runs until Ctrl+C. The example mounts host `/tmp` for a short smoke
+capture; substitute a fast NVMe-backed directory for longer captures.
+
+Use a pcap-specific DAQIRI YAML, not `stem_rx_*.yaml`; the pcap writer expects
+`bench_rx`. Start from DAQIRI's
+`third_party/daqiri/examples/daqiri_example_pcap_writer_tx_rx.yaml` or the
+installed `/opt/daqiri/bin/daqiri_example_pcap_writer_tx_rx.yaml`, then adapt it
+for STEM traffic:
+
+- Set `bench_rx.interface_name` to the RX interface.
+- For RX-only capture, remove `bench_tx` and any unused TX-only interface or
+  replace all TX placeholders with valid loopback values.
+- Set the RX interface PCIe address, queue core, and flow match for the FPGA
+  source and UDP port.
+- Set the RX memory-region `buf_size` to at least the 7786 B STEM packet size;
+  use 8064 to match current STEM configs, or 8192 only after native tile payloads
+  are confirmed.
+- Mount the output directory into the container. A `--rm` container loses an
+  unmounted `/tmp` capture when it exits.
+
+The pcap writer is a diagnostic capture path, not the production frame pipeline:
+it records raw packets before STEM assembly, does not apply dark/mask processing,
+and may be limited by device-to-host copy bandwidth or storage I/O.
+
+To validate the capture path with this repository's STEM TX, run the pcap
+writer detached, wait for the RX core, then send a short loopback burst:
+
+```bash
+PCAP=/tmp/stem-tx-loopback.pcap
+docker rm -f stem_pcap_rx >/dev/null 2>&1 || true
+
+docker run -d --name stem_pcap_rx \
+    --privileged --network host \
+    --gpus all \
+    --ulimit memlock=-1 --ulimit stack=67108864 \
+    --mount type=bind,source=/dev/hugepages,target=/dev/hugepages \
+    --mount type=bind,source=/tmp,target=/capture \
+    --mount type=bind,source="$PWD/cpp_daqiri/configs/pcap_capture.yaml",target=/cfg/pcap_capture.yaml,readonly \
+    stem_daqiri:tx-rx \
+    timeout --signal=INT --preserve-status 20s \
+    /opt/daqiri/bin/daqiri_example_pcap_writer \
+        /cfg/pcap_capture.yaml \
+        "/capture/$(basename "$PCAP")"
+
+for _ in $(seq 1 60); do
+    docker logs stem_pcap_rx 2>&1 | grep -q "Starting RX Core" && break
+    sleep 1
+done
+
+docker run --rm \
+    --privileged --network host \
+    --gpus all \
+    --ulimit memlock=-1 --ulimit stack=67108864 \
+    --mount type=bind,source=/dev/hugepages,target=/dev/hugepages \
+    --mount type=bind,source="$PWD/cpp_daqiri/configs/stem_tx_igx_loopback.yaml",target=/cfg/stem_tx_igx_loopback.yaml,readonly \
+    stem_daqiri:tx-rx \
+    /opt/stem_daqiri/bin/stem_daqiri_tx \
+        /cfg/stem_tx_igx_loopback.yaml \
+        --seconds 0.1 \
+        --rate 1
+
+docker wait stem_pcap_rx
+tcpdump -nn -r "$PCAP" -c 3 -e -vv
+docker rm stem_pcap_rx
+```
+
+The captured packets should be Ethernet/IPv4/UDP frames from
+`48:b0:2d:f4:04:23` to `48:b0:2d:f4:04:24`, UDP `4096 -> 4096`, with Ethernet
+length 7786 and IPv4 length 7772.
+
 For repeatable validation, use the DAQIRI validation script:
 
 ```bash
