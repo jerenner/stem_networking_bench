@@ -26,6 +26,7 @@
  */
 #include <arpa/inet.h>
 #include <cuda_runtime.h>
+#include <daqiri/daqiri.h>
 #include <yaml-cpp/yaml.h>
 
 #include <atomic>
@@ -35,18 +36,29 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
-#include <daqiri/daqiri.h>
-
 #include "stem_kernels.h"
-#include "stem_packet.h"
 #include "stem_pacing.h"
+#include "stem_packet.h"
 
 namespace {
+
+inline void stem_cuda_check(cudaError_t err, const char* stmt, const char* file,
+                            int line) {
+  if (err == cudaSuccess) { return; }
+  throw std::runtime_error(std::string("STEM_CUDA_TRY failed at ") + file +
+                           ":" + std::to_string(line) + ": " + stmt + " -> " +
+                           cudaGetErrorString(err) + " (" +
+                           std::to_string(static_cast<int>(err)) + ")");
+}
+
+#define STEM_CUDA_TRY(stmt) \
+  do { stem_cuda_check((stmt), #stmt, __FILE__, __LINE__); } while (0)
 
 // ===========================================================================
 // stem_tx YAML block parser. Mirrors daqiri::bench::RawBenchTxConfig but
@@ -57,26 +69,26 @@ struct StemTxConfig {
 
   // daqiri TX wire layout: header_size = Eth+IPv4+UDP = 42; payload_size
   // = STEM 64B header + 7680B row payload = 7744.
-  uint32_t batch_size   = 1024;
-  uint32_t header_size  = stem::TX_DAQIRI_HEADER_SIZE;
+  uint32_t batch_size = 1024;
+  uint32_t header_size = stem::TX_DAQIRI_HEADER_SIZE;
   uint32_t payload_size = stem::TX_DAQIRI_PAYLOAD_SIZE;
 
-  std::string ip_src_addr  = "169.254.100.253";
-  std::string ip_dst_addr  = "169.254.95.47";
+  std::string ip_src_addr = "169.254.100.253";
+  std::string ip_dst_addr = "169.254.95.47";
   std::string eth_src_addr = "00:00:00:00:00:00";
   std::string eth_dst_addr = "00:00:00:00:00:00";
-  uint16_t    udp_src_port = 4096;
-  uint16_t    udp_dst_port = 4096;
+  uint16_t udp_src_port = 4096;
+  uint16_t udp_dst_port = 4096;
 
   // STEM knobs
-  uint32_t num_sources_active = stem::NUM_SOURCES_MAX;   // 8
-  uint32_t rows_per_source    = stem::ROWS_PER_SOURCE;   // 128
+  uint32_t num_sources_active = stem::NUM_SOURCES_MAX;  // 8
+  uint32_t rows_per_source = stem::ROWS_PER_SOURCE;     // 128
   // Phase 3: update STEM headers on the GPU each burst so row_number/
   // source_id varies across bursts and the RX can frame-assemble properly.
-  bool     update_headers_per_burst = false;
+  bool update_headers_per_burst = false;
   // Phase 3 latency stamping: write epoch_us into the STEM header of the
   // first packet of every burst.
-  bool     stamp_epoch_us = false;
+  bool stamp_epoch_us = false;
 
   // Pacing
   stem::PacingConfig pacing;
@@ -90,17 +102,18 @@ StemTxConfig parse_stem_tx_cfg(const YAML::Node& root) {
   }
   const auto tx = root["stem_tx"];
   cfg.interface_name = tx["interface_name"].as<std::string>(cfg.interface_name);
-  cfg.batch_size     = tx["batch_size"].as<uint32_t>(cfg.batch_size);
-  cfg.header_size    = tx["header_size"].as<uint32_t>(cfg.header_size);
-  cfg.payload_size   = tx["payload_size"].as<uint32_t>(cfg.payload_size);
-  cfg.ip_src_addr    = tx["ip_src_addr"].as<std::string>(cfg.ip_src_addr);
-  cfg.ip_dst_addr    = tx["ip_dst_addr"].as<std::string>(cfg.ip_dst_addr);
-  cfg.eth_src_addr   = tx["eth_src_addr"].as<std::string>(cfg.eth_src_addr);
-  cfg.eth_dst_addr   = tx["eth_dst_addr"].as<std::string>(cfg.eth_dst_addr);
-  cfg.udp_src_port   = tx["udp_src_port"].as<uint16_t>(cfg.udp_src_port);
-  cfg.udp_dst_port   = tx["udp_dst_port"].as<uint16_t>(cfg.udp_dst_port);
-  cfg.num_sources_active = tx["num_sources_active"].as<uint32_t>(cfg.num_sources_active);
-  cfg.rows_per_source    = tx["rows_per_source"].as<uint32_t>(cfg.rows_per_source);
+  cfg.batch_size = tx["batch_size"].as<uint32_t>(cfg.batch_size);
+  cfg.header_size = tx["header_size"].as<uint32_t>(cfg.header_size);
+  cfg.payload_size = tx["payload_size"].as<uint32_t>(cfg.payload_size);
+  cfg.ip_src_addr = tx["ip_src_addr"].as<std::string>(cfg.ip_src_addr);
+  cfg.ip_dst_addr = tx["ip_dst_addr"].as<std::string>(cfg.ip_dst_addr);
+  cfg.eth_src_addr = tx["eth_src_addr"].as<std::string>(cfg.eth_src_addr);
+  cfg.eth_dst_addr = tx["eth_dst_addr"].as<std::string>(cfg.eth_dst_addr);
+  cfg.udp_src_port = tx["udp_src_port"].as<uint16_t>(cfg.udp_src_port);
+  cfg.udp_dst_port = tx["udp_dst_port"].as<uint16_t>(cfg.udp_dst_port);
+  cfg.num_sources_active =
+      tx["num_sources_active"].as<uint32_t>(cfg.num_sources_active);
+  cfg.rows_per_source = tx["rows_per_source"].as<uint32_t>(cfg.rows_per_source);
   cfg.update_headers_per_burst =
       tx["update_headers_per_burst"].as<bool>(cfg.update_headers_per_burst);
   cfg.stamp_epoch_us = tx["stamp_epoch_us"].as<bool>(cfg.stamp_epoch_us);
@@ -128,8 +141,7 @@ void on_sigint(int) { g_stop_requested = 1; }
 // daqiri hands out a GPU buffer for packet position i in any future burst,
 // we memcpy template[i % template_count] into it.
 // ---------------------------------------------------------------------------
-void build_templates(const StemTxConfig& cfg,
-                     uint32_t          burst_size,
+void build_templates(const StemTxConfig& cfg, uint32_t burst_size,
                      std::vector<std::vector<uint8_t>>* templates,
                      uint16_t hdr_eth_offset) {
   templates->clear();
@@ -169,7 +181,8 @@ void build_templates(const StemTxConfig& cfg,
       // Eth (14 bytes): dst (6) + src (6) + ethertype (2)
       std::memcpy(p + 0, eth_dst, 6);
       std::memcpy(p + 6, eth_src, 6);
-      p[12] = 0x08; p[13] = 0x00;  // ETH_P_IP
+      p[12] = 0x08;
+      p[13] = 0x00;  // ETH_P_IP
 
       // IPv4 (20 bytes)
       p[14] = 0x45;  // version=4, ihl=5
@@ -178,11 +191,14 @@ void build_templates(const StemTxConfig& cfg,
           static_cast<uint16_t>(cfg.header_size + cfg.payload_size - 14);
       p[16] = static_cast<uint8_t>((ip_total_len >> 8) & 0xff);
       p[17] = static_cast<uint8_t>(ip_total_len & 0xff);
-      p[18] = 0; p[19] = 0;          // identification
-      p[20] = 0x40; p[21] = 0x00;     // flags=DF, frag offset = 0
-      p[22] = 64;                      // ttl
-      p[23] = 17;                      // udp
-      p[24] = 0; p[25] = 0;            // header checksum (computed below)
+      p[18] = 0;
+      p[19] = 0;  // identification
+      p[20] = 0x40;
+      p[21] = 0x00;  // flags=DF, frag offset = 0
+      p[22] = 64;    // ttl
+      p[23] = 17;    // udp
+      p[24] = 0;
+      p[25] = 0;  // header checksum (computed below)
       p[26] = static_cast<uint8_t>((ip_src_host >> 24) & 0xff);
       p[27] = static_cast<uint8_t>((ip_src_host >> 16) & 0xff);
       p[28] = static_cast<uint8_t>((ip_src_host >> 8) & 0xff);
@@ -212,25 +228,26 @@ void build_templates(const StemTxConfig& cfg,
       p[37] = static_cast<uint8_t>(cfg.udp_dst_port & 0xff);
       p[38] = static_cast<uint8_t>((udp_len >> 8) & 0xff);
       p[39] = static_cast<uint8_t>(udp_len & 0xff);
-      p[40] = 0; p[41] = 0;  // udp checksum (optional for IPv4; leave 0)
+      p[40] = 0;
+      p[41] = 0;  // udp checksum (optional for IPv4; leave 0)
     }
 
     // STEM custom 64-byte header at offset = header_size (42).
     const uint32_t source_id = i % cfg.num_sources_active;
-    const uint32_t row_offset = (i / cfg.num_sources_active) % cfg.rows_per_source;
+    const uint32_t row_offset =
+        (i / cfg.num_sources_active) % cfg.rows_per_source;
     const uint16_t row_number = static_cast<uint16_t>(row_offset);
     stem::stem_tx_stamp_packet(pkt.data() + cfg.header_size, row_number,
                                static_cast<uint16_t>(source_id),
                                /*epoch_us=*/0);
 
     // STEM payload: deterministic uint16 ramp so loss is visible in dumps.
-    auto* payload16 = reinterpret_cast<uint16_t*>(
-        pkt.data() + cfg.header_size + stem::STEM_HEADER_SIZE);
+    auto* payload16 = reinterpret_cast<uint16_t*>(pkt.data() + cfg.header_size +
+                                                  stem::STEM_HEADER_SIZE);
     const uint32_t samples = stem::STEM_PAYLOAD_SIZE / sizeof(uint16_t);
     for (uint32_t s = 0; s < samples; ++s) {
-      payload16[s] = static_cast<uint16_t>((source_id << 12) |
-                                           (row_offset & 0xff) |
-                                           ((s & 0xf) << 8));
+      payload16[s] = static_cast<uint16_t>(
+          (source_id << 12) | (row_offset & 0xff) | ((s & 0xf) << 8));
     }
 
     templates->push_back(std::move(pkt));
@@ -240,184 +257,199 @@ void build_templates(const StemTxConfig& cfg,
 // ---------------------------------------------------------------------------
 // TX worker.
 // ---------------------------------------------------------------------------
-void tx_worker(const StemTxConfig& cfg, std::atomic<bool>& stop) {
-  const int port_id = daqiri::get_port_id(cfg.interface_name);
-  if (port_id < 0) {
-    std::cerr << "Invalid TX interface_name: " << cfg.interface_name << "\n";
-    stop.store(true);
-    return;
-  }
-
-  std::vector<std::vector<uint8_t>> templates;
-  build_templates(cfg, cfg.batch_size, &templates, 0);
-
-  // Cache: maps each unique GPU buffer ptr we've ever seen to the index
-  // of the template that was copied into it. After all unique buffers have
-  // been initialized, we never memcpy again -- daqiri recycles the same
-  // pool of buffers and we just keep sending them.
-  std::unordered_map<void*, uint32_t> initialized_buffers;
-  initialized_buffers.reserve(cfg.batch_size * 4);
-
-  cudaStream_t header_stream = nullptr;
-  cudaStreamCreateWithFlags(&header_stream, cudaStreamNonBlocking);
-
-  // GPU scratch for per-burst header updates (Phase 3 path). Allocated once.
-  uint16_t* dev_row_numbers = nullptr;
-  uint16_t* dev_source_ids = nullptr;
-  uint8_t** dev_pkt_ptrs = nullptr;
-  if (cfg.update_headers_per_burst) {
-    cudaMalloc(&dev_row_numbers, cfg.batch_size * sizeof(uint16_t));
-    cudaMalloc(&dev_source_ids, cfg.batch_size * sizeof(uint16_t));
-    cudaMalloc(&dev_pkt_ptrs, cfg.batch_size * sizeof(uint8_t*));
-  }
-  std::vector<uint16_t> host_row_numbers(cfg.batch_size, 0);
-  std::vector<uint16_t> host_source_ids(cfg.batch_size, 0);
-  std::vector<uint8_t*> host_pkt_ptrs(cfg.batch_size, nullptr);
-
-  uint64_t global_pkt_counter = 0;
-  uint64_t total_packets = 0;
-  stem::Pacer pacer(cfg.pacing.target_rate_gbps);
-  pacer.start();
-
-  while (!stop.load() && !g_stop_requested) {
-    if (stem::should_stop(cfg.pacing, pacer)) { break; }
-
-    auto* msg = daqiri::create_tx_burst_params();
-    daqiri::set_header(msg, static_cast<uint16_t>(port_id), 0, cfg.batch_size, 1);
-
-    if (!daqiri::is_tx_burst_available(msg)) {
-      daqiri::free_tx_metadata(msg);
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
-      continue;
+void tx_worker(const StemTxConfig& cfg, std::atomic<bool>& stop,
+               std::atomic<uint64_t>& worker_errors) {
+  try {
+    const int port_id = daqiri::get_port_id(cfg.interface_name);
+    if (port_id < 0) {
+      std::cerr << "Invalid TX interface_name: " << cfg.interface_name << "\n";
+      worker_errors.fetch_add(1, std::memory_order_relaxed);
+      stop.store(true);
+      return;
     }
 
-    if (daqiri::get_tx_packet_burst(msg) != daqiri::Status::SUCCESS) {
-      daqiri::free_tx_metadata(msg);
-      continue;
+    std::vector<std::vector<uint8_t>> templates;
+    build_templates(cfg, cfg.batch_size, &templates, 0);
+
+    // Cache: maps each unique GPU buffer ptr we've ever seen to the index
+    // of the template that was copied into it. After all unique buffers have
+    // been initialized, we never memcpy again -- daqiri recycles the same
+    // pool of buffers and we just keep sending them.
+    std::unordered_map<void*, uint32_t> initialized_buffers;
+    initialized_buffers.reserve(cfg.batch_size * 4);
+
+    cudaStream_t header_stream = nullptr;
+    STEM_CUDA_TRY(
+        cudaStreamCreateWithFlags(&header_stream, cudaStreamNonBlocking));
+
+    // GPU scratch for per-burst header updates (Phase 3 path). Allocated once.
+    uint16_t* dev_row_numbers = nullptr;
+    uint16_t* dev_source_ids = nullptr;
+    uint8_t** dev_pkt_ptrs = nullptr;
+    if (cfg.update_headers_per_burst) {
+      STEM_CUDA_TRY(
+          cudaMalloc(&dev_row_numbers, cfg.batch_size * sizeof(uint16_t)));
+      STEM_CUDA_TRY(
+          cudaMalloc(&dev_source_ids, cfg.batch_size * sizeof(uint16_t)));
+      STEM_CUDA_TRY(
+          cudaMalloc(&dev_pkt_ptrs, cfg.batch_size * sizeof(uint8_t*)));
     }
+    std::vector<uint16_t> host_row_numbers(cfg.batch_size, 0);
+    std::vector<uint16_t> host_source_ids(cfg.batch_size, 0);
+    std::vector<uint8_t*> host_pkt_ptrs(cfg.batch_size, nullptr);
 
-    const auto num_pkts = static_cast<int>(daqiri::get_num_packets(msg));
-    bool failed = false;
-    uint64_t burst_bytes = 0;
+    uint64_t global_pkt_counter = 0;
+    uint64_t total_packets = 0;
+    stem::Pacer pacer(cfg.pacing.target_rate_gbps);
+    pacer.start();
 
-    for (int i = 0; i < num_pkts; ++i) {
-      auto* gpu_pkt = static_cast<uint8_t*>(daqiri::get_segment_packet_ptr(msg, 0, i));
-      const uint32_t tpl_idx = static_cast<uint32_t>(i) % templates.size();
-      const auto& tpl = templates[tpl_idx];
+    while (!stop.load() && !g_stop_requested) {
+      if (stem::should_stop(cfg.pacing, pacer)) { break; }
 
-      auto it = initialized_buffers.find(gpu_pkt);
-      if (it == initialized_buffers.end()) {
-        if (cudaMemcpy(gpu_pkt, tpl.data(), tpl.size(),
-                       cudaMemcpyHostToDevice) != cudaSuccess) {
-          failed = true;
-          break;
+      auto* msg = daqiri::create_tx_burst_params();
+      daqiri::set_header(msg, static_cast<uint16_t>(port_id), 0, cfg.batch_size,
+                         1);
+
+      if (!daqiri::is_tx_burst_available(msg)) {
+        daqiri::free_tx_metadata(msg);
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        continue;
+      }
+
+      if (daqiri::get_tx_packet_burst(msg) != daqiri::Status::SUCCESS) {
+        daqiri::free_tx_metadata(msg);
+        continue;
+      }
+
+      const auto num_pkts = static_cast<int>(daqiri::get_num_packets(msg));
+      uint64_t burst_bytes = 0;
+
+      for (int i = 0; i < num_pkts; ++i) {
+        auto* gpu_pkt =
+            static_cast<uint8_t*>(daqiri::get_segment_packet_ptr(msg, 0, i));
+        const uint32_t tpl_idx = static_cast<uint32_t>(i) % templates.size();
+        const auto& tpl = templates[tpl_idx];
+
+        if (gpu_pkt == nullptr) {
+          throw std::runtime_error("daqiri returned a null TX packet pointer");
         }
-        initialized_buffers.emplace(gpu_pkt, tpl_idx);
-      }
 
-      if (daqiri::set_packet_lengths(
-              msg, i,
-              {static_cast<int>(cfg.header_size + cfg.payload_size)}) !=
-          daqiri::Status::SUCCESS) {
-        failed = true;
-        break;
+        auto it = initialized_buffers.find(gpu_pkt);
+        if (it == initialized_buffers.end()) {
+          STEM_CUDA_TRY(cudaMemcpy(gpu_pkt, tpl.data(), tpl.size(),
+                                   cudaMemcpyHostToDevice));
+          initialized_buffers.emplace(gpu_pkt, tpl_idx);
+        }
+
+        if (daqiri::set_packet_lengths(
+                msg, i,
+                {static_cast<int>(cfg.header_size + cfg.payload_size)}) !=
+            daqiri::Status::SUCCESS) {
+          throw std::runtime_error("daqiri::set_packet_lengths failed");
+        }
+        burst_bytes += cfg.header_size + cfg.payload_size;
+
+        if (cfg.update_headers_per_burst) {
+          const uint64_t k = global_pkt_counter + static_cast<uint64_t>(i);
+          const uint32_t source_id =
+              static_cast<uint32_t>(k % cfg.num_sources_active);
+          const uint64_t row_global =
+              (k / cfg.num_sources_active) % stem::ROW_NUMBER_WRAP;
+          host_row_numbers[i] = static_cast<uint16_t>(row_global);
+          host_source_ids[i] = static_cast<uint16_t>(source_id);
+          host_pkt_ptrs[i] = gpu_pkt + cfg.header_size;  // start of STEM hdr
+        }
       }
-      burst_bytes += cfg.header_size + cfg.payload_size;
 
       if (cfg.update_headers_per_burst) {
-        const uint64_t k = global_pkt_counter + static_cast<uint64_t>(i);
-        const uint32_t source_id = static_cast<uint32_t>(
-            k % cfg.num_sources_active);
-        const uint64_t row_global =
-            (k / cfg.num_sources_active) % stem::ROW_NUMBER_WRAP;
-        host_row_numbers[i] = static_cast<uint16_t>(row_global);
-        host_source_ids[i]  = static_cast<uint16_t>(source_id);
-        host_pkt_ptrs[i]    = gpu_pkt + cfg.header_size;  // start of STEM hdr
+        STEM_CUDA_TRY(cudaMemcpyAsync(dev_row_numbers, host_row_numbers.data(),
+                                      num_pkts * sizeof(uint16_t),
+                                      cudaMemcpyHostToDevice, header_stream));
+        STEM_CUDA_TRY(cudaMemcpyAsync(dev_source_ids, host_source_ids.data(),
+                                      num_pkts * sizeof(uint16_t),
+                                      cudaMemcpyHostToDevice, header_stream));
+        STEM_CUDA_TRY(cudaMemcpyAsync(dev_pkt_ptrs, host_pkt_ptrs.data(),
+                                      num_pkts * sizeof(uint8_t*),
+                                      cudaMemcpyHostToDevice, header_stream));
+        const uint64_t epoch_us =
+            cfg.stamp_epoch_us
+                ? std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count()
+                : 0;
+        // The kernel writes row_number/source_id for every packet and
+        // additionally zeroes epoch_us for every pkt_idx > 0 so a buffer
+        // that DPDK rotated out of position 0 doesn't surface a stale
+        // stamp at the RX.
+        stem::stem_tx_update_burst_headers(
+            dev_pkt_ptrs, dev_row_numbers, dev_source_ids,
+            static_cast<uint32_t>(num_pkts), 0, epoch_us, header_stream);
+        STEM_CUDA_TRY(cudaStreamSynchronize(header_stream));
+      } else if (cfg.stamp_epoch_us) {
+        // Phase 3 latency-stamp path that does NOT update row_numbers per
+        // burst. daqiri's memory regions on Spark are kind: host_pinned --
+        // we can write directly with host stores; no cudaMemcpy round-trip
+        // is required.
+        //
+        // Crucially we ALSO zero epoch_us in positions 1..N-1 so a buffer
+        // that DPDK rotated out of position 0 doesn't surface a stale stamp
+        // at the RX.
+        const uint64_t epoch_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        static const uint64_t kZeroEpoch = 0;
+        for (int i = 0; i < num_pkts; ++i) {
+          auto* pkt =
+              static_cast<uint8_t*>(daqiri::get_segment_packet_ptr(msg, 0, i));
+          if (pkt == nullptr) { continue; }
+          std::memcpy(pkt + cfg.header_size + stem::STEM_HDR_OFF_EPOCH_US,
+                      (i == 0) ? &epoch_us : &kZeroEpoch, sizeof(uint64_t));
+        }
       }
-    }
 
-    if (failed) {
-      daqiri::free_all_packets_and_burst_tx(msg);
-      continue;
+      daqiri::send_tx_burst(msg);
+      pacer.record_burst(burst_bytes);
+      total_packets += num_pkts;
+      global_pkt_counter += num_pkts;
+      pacer.wait_for_next_burst();
     }
 
     if (cfg.update_headers_per_burst) {
-      cudaMemcpyAsync(dev_row_numbers, host_row_numbers.data(),
-                      num_pkts * sizeof(uint16_t),
-                      cudaMemcpyHostToDevice, header_stream);
-      cudaMemcpyAsync(dev_source_ids, host_source_ids.data(),
-                      num_pkts * sizeof(uint16_t),
-                      cudaMemcpyHostToDevice, header_stream);
-      cudaMemcpyAsync(dev_pkt_ptrs, host_pkt_ptrs.data(),
-                      num_pkts * sizeof(uint8_t*),
-                      cudaMemcpyHostToDevice, header_stream);
-      const uint64_t epoch_us = cfg.stamp_epoch_us
-          ? std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count()
-          : 0;
-      // The kernel writes row_number/source_id for every packet and
-      // additionally zeroes epoch_us for every pkt_idx > 0 so a buffer
-      // that DPDK rotated out of position 0 doesn't surface a stale
-      // stamp at the RX.
-      stem::stem_tx_update_burst_headers(
-          dev_pkt_ptrs, dev_row_numbers, dev_source_ids,
-          static_cast<uint32_t>(num_pkts), 0, epoch_us, header_stream);
-      cudaStreamSynchronize(header_stream);
-    } else if (cfg.stamp_epoch_us) {
-      // Phase 3 latency-stamp path that does NOT update row_numbers per
-      // burst. daqiri's memory regions on Spark are kind: host_pinned --
-      // we can write directly with host stores; no cudaMemcpy round-trip
-      // is required.
-      //
-      // Crucially we ALSO zero epoch_us in positions 1..N-1 so a buffer
-      // that DPDK rotated out of position 0 doesn't surface a stale stamp
-      // at the RX.
-      const uint64_t epoch_us =
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::system_clock::now().time_since_epoch()).count();
-      static const uint64_t kZeroEpoch = 0;
-      for (int i = 0; i < num_pkts; ++i) {
-        auto* pkt = static_cast<uint8_t*>(
-            daqiri::get_segment_packet_ptr(msg, 0, i));
-        if (pkt == nullptr) { continue; }
-        std::memcpy(
-            pkt + cfg.header_size + stem::STEM_HDR_OFF_EPOCH_US,
-            (i == 0) ? &epoch_us : &kZeroEpoch,
-            sizeof(uint64_t));
-      }
+      STEM_CUDA_TRY(cudaFree(dev_row_numbers));
+      STEM_CUDA_TRY(cudaFree(dev_source_ids));
+      STEM_CUDA_TRY(cudaFree(dev_pkt_ptrs));
     }
+    STEM_CUDA_TRY(cudaStreamDestroy(header_stream));
 
-    daqiri::send_tx_burst(msg);
-    pacer.record_burst(burst_bytes);
-    total_packets += num_pkts;
-    global_pkt_counter += num_pkts;
-    pacer.wait_for_next_burst();
+    const double secs = pacer.elapsed_seconds();
+    const double gbps = secs > 0
+                            ? static_cast<double>(pacer.total_bytes_emitted()) *
+                                  8.0 / (secs * 1e9)
+                            : 0.0;
+    const double pps =
+        secs > 0 ? static_cast<double>(total_packets) / secs : 0.0;
+    std::printf("stem_daqiri_tx complete:\n");
+    std::printf("  duration       : %.3f s\n", secs);
+    std::printf("  bytes sent     : %lu\n",
+                static_cast<unsigned long>(pacer.total_bytes_emitted()));
+    std::printf("  packets sent   : %lu\n",
+                static_cast<unsigned long>(total_packets));
+    std::printf("  achieved Gbps  : %.3f\n", gbps);
+    std::printf("  achieved pps   : %.3f\n", pps);
+    std::printf("  target Gbps    : %.3f (0 = unbounded)\n",
+                cfg.pacing.target_rate_gbps);
+  } catch (const std::exception& e) {
+    std::cerr << "stem_daqiri_tx worker failed on '" << cfg.interface_name
+              << "': " << e.what() << "\n";
+    worker_errors.fetch_add(1, std::memory_order_relaxed);
+    stop.store(true);
+  } catch (...) {
+    std::cerr << "stem_daqiri_tx worker failed on '" << cfg.interface_name
+              << "': unknown exception\n";
+    worker_errors.fetch_add(1, std::memory_order_relaxed);
+    stop.store(true);
   }
-
-  if (cfg.update_headers_per_burst) {
-    cudaFree(dev_row_numbers);
-    cudaFree(dev_source_ids);
-    cudaFree(dev_pkt_ptrs);
-  }
-  cudaStreamDestroy(header_stream);
-
-  const double secs = pacer.elapsed_seconds();
-  const double gbps = secs > 0
-      ? static_cast<double>(pacer.total_bytes_emitted()) * 8.0 / (secs * 1e9)
-      : 0.0;
-  const double pps = secs > 0
-      ? static_cast<double>(total_packets) / secs
-      : 0.0;
-  std::printf("stem_daqiri_tx complete:\n");
-  std::printf("  duration       : %.3f s\n", secs);
-  std::printf("  bytes sent     : %lu\n",
-              static_cast<unsigned long>(pacer.total_bytes_emitted()));
-  std::printf("  packets sent   : %lu\n",
-              static_cast<unsigned long>(total_packets));
-  std::printf("  achieved Gbps  : %.3f\n", gbps);
-  std::printf("  achieved pps   : %.3f\n", pps);
-  std::printf("  target Gbps    : %.3f (0 = unbounded)\n",
-              cfg.pacing.target_rate_gbps);
 }
 
 }  // namespace
@@ -434,11 +466,14 @@ int main(int argc, char** argv) {
   // CLI override for --seconds / --rate so the parity sweep in Phase 3 can
   // reuse one YAML across multiple target rates.
   double cli_seconds = -1.0;
-  double cli_rate    = -1.0;
+  double cli_rate = -1.0;
   for (int i = 2; i + 1 < argc; i += 2) {
     const std::string flag = argv[i];
-    if (flag == "--seconds") { cli_seconds = std::stod(argv[i + 1]); }
-    else if (flag == "--rate") { cli_rate = std::stod(argv[i + 1]); }
+    if (flag == "--seconds") {
+      cli_seconds = std::stod(argv[i + 1]);
+    } else if (flag == "--rate") {
+      cli_rate = std::stod(argv[i + 1]);
+    }
   }
 
   const auto root = YAML::LoadFile(argv[1]);
@@ -449,20 +484,25 @@ int main(int argc, char** argv) {
 
   StemTxConfig cfg = parse_stem_tx_cfg(root);
   if (cli_seconds >= 0.0) { cfg.pacing.total_time_to_send_s = cli_seconds; }
-  if (cli_rate    >= 0.0) { cfg.pacing.target_rate_gbps     = cli_rate; }
+  if (cli_rate >= 0.0) { cfg.pacing.target_rate_gbps = cli_rate; }
 
   std::cout << "stem_daqiri_tx starting on '" << cfg.interface_name
             << "' -> target=" << cfg.pacing.target_rate_gbps
             << " Gbps duration=" << cfg.pacing.total_time_to_send_s
             << " s batch=" << cfg.batch_size
-            << " packet=" << (cfg.header_size + cfg.payload_size)
-            << "B\n";
+            << " packet=" << (cfg.header_size + cfg.payload_size) << "B\n";
 
   std::atomic<bool> stop{false};
-  std::thread t(tx_worker, cfg, std::ref(stop));
+  std::atomic<uint64_t> worker_errors{0};
+  std::thread t(tx_worker, cfg, std::ref(stop), std::ref(worker_errors));
   t.join();
 
   daqiri::print_stats();
   daqiri::shutdown();
+  if (worker_errors.load(std::memory_order_relaxed) > 0) {
+    std::cerr << "stem_daqiri_tx failed: worker_errors="
+              << worker_errors.load(std::memory_order_relaxed) << "\n";
+    return 1;
+  }
   return 0;
 }

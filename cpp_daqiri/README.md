@@ -141,10 +141,16 @@ For repeatable validation, use the DAQIRI validation script:
 # Deterministic replay/processor/writer suite; does not need live NICs.
 cpp_daqiri/scripts/run_daqiri_validation.sh hdf5
 
+# Parser and failure-mode checks; does not need live NICs.
+cpp_daqiri/scripts/run_daqiri_validation.sh config
+
 # Live IGX loopback tests against a running stem_daqiri_live container.
 cpp_daqiri/scripts/run_daqiri_validation.sh live-smoke  # non-HDS, 1 Gbps
 cpp_daqiri/scripts/run_daqiri_validation.sh live-wire   # non-HDS, unbounded TX
 cpp_daqiri/scripts/run_daqiri_validation.sh hds-smoke   # HDS, 1 Gbps
+cpp_daqiri/scripts/run_daqiri_validation.sh hds-wire    # HDS, unbounded stress
+cpp_daqiri/scripts/run_daqiri_validation.sh live-writer # writer.noop:false
+cpp_daqiri/scripts/run_daqiri_validation.sh live-pixel  # non-HDS/HDS HDF5 compare
 ```
 
 If you prefer a long-running container for manual `docker exec` testing,
@@ -224,10 +230,11 @@ tile payloads, update the RX buffer sizes, MTU/packet-size notes, and
 For an HDF5 smoke run, copy the RX config, set `writer.noop: false`, and run at
 a low rate. The HDF5 writer is a debug sink, not the throughput default.
 Use `scripts/compare_h5_outputs.py` to make the HDS/non-HDS parity check a
-pixel-level gate. Exact comparisons are strongest for deterministic replay or
-`processor.noop:true` uint16 gather output. Reduced float `/processed` output
-from DAQIRI vs Holoscan should use relative tolerance because DAQIRI's CUDA
-sum order is not bit-identical to `torch::sum(0)`:
+pixel-level gate. The HDF5 replay path accepts `uint16` or `float32`
+`[frames,H,W]` input datasets. Exact comparisons are strongest for
+deterministic replay or `processor.noop:true` uint16 gather output. Reduced
+float `/processed` output from DAQIRI vs Holoscan should use relative tolerance
+because DAQIRI's CUDA sum order is not bit-identical to `torch::sum(0)`:
 
 ```bash
 python3 cpp_daqiri/scripts/compare_h5_outputs.py \
@@ -250,6 +257,10 @@ Holoscan's checked-in configs leave `split_boundary: false`, and the Holoscan
 HDS code consumes one RX queue with two segments rather than a separate
 two-queue header/payload pairing. Do not add a DAQIRI-only two-queue HDS path
 unless Holoscan grows an equivalent path to compare against.
+`run_daqiri_validation.sh hds-wire` is a stress coverage command: it still
+requires HDS layout verification, frames assembled, and zero sink drops/errors,
+but DPDK missed/out-of-buffer counters are reported rather than treated as a
+zero-drop throughput gate.
 Multi-receiver DAQIRI output is currently allowed only with `writer.noop:true`;
 HDF5 output is refused because receiver streams would otherwise interleave by
 arrival order in one dataset.
@@ -332,7 +343,8 @@ cpp_daqiri/scripts/parse_phase3_results.py \
 | `configs/stem_rx_igx_production.yaml` | IGX RX-only production config |
 | `configs/stem_rx_igx_loopback.yaml` | IGX hardware-loopback RX config |
 | `configs/stem_rx_igx_loopback_hds.yaml` | IGX hardware-loopback RX config with HDS |
-| `configs/stem_replay_hdf5.yaml` | finite uint16 HDF5 replay config for processor parity |
+| `configs/stem_replay_hdf5.yaml` | finite uint16/float32 HDF5 replay config for processor parity |
+| `scripts/run_daqiri_validation.sh` | repeatable HDF5, config, live, writer, and HDS validation gates |
 | `configs/stem_tx_igx_loopback.yaml` | IGX hardware-loopback TX config |
 | `configs/stem_{tx,rx}_spark.yaml` | two-Spark configs |
 | `configs/stem_rx_spark_hds.yaml` | two-Spark RX config with HDS |

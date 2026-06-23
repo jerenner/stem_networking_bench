@@ -6,20 +6,31 @@
  * the public surface and which phase each kernel is used by.
  */
 
+#include <cstring>
+#include <stdexcept>
+#include <string>
+
 #include "stem_kernels.h"
 #include "stem_packet.h"
 
-#include <cstring>
-
 namespace stem {
+
+namespace {
+
+void check_cuda_launch(const char* kernel_name) {
+  const cudaError_t err = cudaGetLastError();
+  if (err == cudaSuccess) { return; }
+  throw std::runtime_error(std::string(kernel_name) +
+                           " launch failed: " + cudaGetErrorString(err));
+}
+
+}  // namespace
 
 // ===========================================================================
 // Phase 1 TX -- host-side STEM header stamp
 // ===========================================================================
-void stem_tx_stamp_packet(uint8_t* stem_header_dst,
-                          uint16_t row_number,
-                          uint16_t source_id,
-                          uint64_t epoch_us) {
+void stem_tx_stamp_packet(uint8_t* stem_header_dst, uint16_t row_number,
+                          uint16_t source_id, uint64_t epoch_us) {
   std::memset(stem_header_dst, 0, STEM_HEADER_SIZE);
   // Bytes 4-5: row_number (little-endian on aarch64/x86; we write byte-wise
   // so the wire layout is portable).
@@ -48,12 +59,10 @@ void stem_tx_stamp_packet(uint8_t* stem_header_dst,
 // Phase 3 latency p50/p99 would reflect mbuf pool rotation, not the
 // real end-to-end latency.
 // ===========================================================================
-__global__ void stem_tx_update_burst_headers_kernel(uint8_t** gpu_bufs,
-                                                    const uint16_t* row_numbers,
-                                                    const uint16_t* source_ids,
-                                                    uint32_t pkts_in_burst,
-                                                    uint16_t header_offset,
-                                                    uint64_t epoch_us_for_first) {
+__global__ void stem_tx_update_burst_headers_kernel(
+    uint8_t** gpu_bufs, const uint16_t* row_numbers, const uint16_t* source_ids,
+    uint32_t pkts_in_burst, uint16_t header_offset,
+    uint64_t epoch_us_for_first) {
   const uint32_t pkt_idx = blockIdx.x;
   if (pkt_idx >= pkts_in_burst) return;
 
@@ -66,8 +75,8 @@ __global__ void stem_tx_update_burst_headers_kernel(uint8_t** gpu_bufs,
     const uint16_t sid = source_ids[pkt_idx];
     hdr[STEM_HDR_OFF_ROW_NUMBER_LO] = static_cast<uint8_t>(rn & 0xff);
     hdr[STEM_HDR_OFF_ROW_NUMBER_HI] = static_cast<uint8_t>((rn >> 8) & 0xff);
-    hdr[STEM_HDR_OFF_SOURCE_ID_LO]  = static_cast<uint8_t>(sid & 0xff);
-    hdr[STEM_HDR_OFF_SOURCE_ID_HI]  = static_cast<uint8_t>((sid >> 8) & 0xff);
+    hdr[STEM_HDR_OFF_SOURCE_ID_LO] = static_cast<uint8_t>(sid & 0xff);
+    hdr[STEM_HDR_OFF_SOURCE_ID_HI] = static_cast<uint8_t>((sid >> 8) & 0xff);
 
     if (pkt_idx == 0) {
       if (epoch_us_for_first != 0) {
@@ -86,17 +95,15 @@ __global__ void stem_tx_update_burst_headers_kernel(uint8_t** gpu_bufs,
   }
 }
 
-void stem_tx_update_burst_headers(uint8_t** gpu_bufs,
-                                  const uint16_t* row_numbers,
-                                  const uint16_t* source_ids,
-                                  uint32_t pkts_in_burst,
-                                  uint16_t header_offset,
-                                  uint64_t epoch_us_for_first,
-                                  cudaStream_t stream) {
+void stem_tx_update_burst_headers(
+    uint8_t** gpu_bufs, const uint16_t* row_numbers, const uint16_t* source_ids,
+    uint32_t pkts_in_burst, uint16_t header_offset, uint64_t epoch_us_for_first,
+    cudaStream_t stream) {
   if (pkts_in_burst == 0) { return; }
   stem_tx_update_burst_headers_kernel<<<pkts_in_burst, 32, 0, stream>>>(
-      gpu_bufs, row_numbers, source_ids, pkts_in_burst,
-      header_offset, epoch_us_for_first);
+      gpu_bufs, row_numbers, source_ids, pkts_in_burst, header_offset,
+      epoch_us_for_first);
+  check_cuda_launch("stem_tx_update_burst_headers_kernel");
 }
 
 // ===========================================================================
@@ -108,8 +115,8 @@ void stem_tx_update_burst_headers(uint8_t** gpu_bufs,
 //   - source IDs 4..7 fill rows 512..1023 in interleaved groups of 4
 //     ordered as (4, 5, 6, 7) read top-to-bottom.
 // ===========================================================================
-__device__ __forceinline__
-int32_t source_id_to_global_row(uint32_t source_id, uint32_t row_offset) {
+__device__ __forceinline__ int32_t
+source_id_to_global_row(uint32_t source_id, uint32_t row_offset) {
   if (source_id < 4) {
     return 511 - static_cast<int32_t>(row_offset * 4 + source_id);
   }
@@ -135,30 +142,30 @@ __global__ void stem_extract_packet_headers_kernel(uint8_t** src_ptrs,
 
   uint8_t* src = src_ptrs[pkt_idx];
   if (src != nullptr) {
-    h.row_number = (static_cast<uint16_t>(src[5]) << 8) |
-                   static_cast<uint16_t>(src[4]);
-    h.source_id  = (static_cast<uint16_t>(src[7]) << 8) |
-                   static_cast<uint16_t>(src[6]);
+    h.row_number =
+        (static_cast<uint16_t>(src[5]) << 8) | static_cast<uint16_t>(src[4]);
+    h.source_id =
+        (static_cast<uint16_t>(src[7]) << 8) | static_cast<uint16_t>(src[6]);
     h.frame_index = h.row_number / ROWS_PER_SOURCE;
-    h.row_offset  = h.row_number % ROWS_PER_SOURCE;
+    h.row_offset = h.row_number % ROWS_PER_SOURCE;
     h.global_row = static_cast<int16_t>(
         source_id_to_global_row(h.source_id, h.row_offset));
     for (uint32_t i = 0; i < sizeof(uint64_t); ++i) {
-      h.epoch_us |= static_cast<uint64_t>(src[STEM_HDR_OFF_EPOCH_US + i]) << (i * 8);
+      h.epoch_us |= static_cast<uint64_t>(src[STEM_HDR_OFF_EPOCH_US + i])
+                    << (i * 8);
     }
   }
   headers[pkt_idx] = h;
 }
 
-void stem_extract_packet_headers(uint8_t** src_ptrs,
-                                 PacketHeaderInfo* headers,
-                                 uint32_t num_pkts,
-                                 cudaStream_t stream) {
+void stem_extract_packet_headers(uint8_t** src_ptrs, PacketHeaderInfo* headers,
+                                 uint32_t num_pkts, cudaStream_t stream) {
   if (num_pkts == 0) { return; }
   const uint32_t threads = 256;
   const uint32_t blocks = (num_pkts + threads - 1) / threads;
   stem_extract_packet_headers_kernel<<<blocks, threads, 0, stream>>>(
       src_ptrs, headers, num_pkts);
+  check_cuda_launch("stem_extract_packet_headers_kernel");
 }
 
 // ===========================================================================
@@ -180,19 +187,19 @@ __device__ __forceinline__ bool tile_geometry(uint32_t tile_index,
                                               uint32_t& tile_width) {
   constexpr uint32_t kZlpTileCols = TILE_ZLP_COLUMNS / TILE_ZLP_TILE_WIDTH;
   constexpr uint32_t kZlpTileRows = FRAME_HEIGHT / TILE_ZLP_TILE_HEIGHT;
-  constexpr uint32_t kZlpTiles    = kZlpTileCols * kZlpTileRows;
+  constexpr uint32_t kZlpTiles = kZlpTileCols * kZlpTileRows;
   constexpr uint32_t kCoreColumns = FRAME_WIDTH - TILE_ZLP_COLUMNS;
   constexpr uint32_t kCoreTileCols = kCoreColumns / TILE_CORE_TILE_WIDTH;
   constexpr uint32_t kCoreTileRows = FRAME_HEIGHT / TILE_CORE_TILE_HEIGHT;
-  constexpr uint32_t kCoreTiles    = kCoreTileCols * kCoreTileRows;
+  constexpr uint32_t kCoreTiles = kCoreTileCols * kCoreTileRows;
 
   if (tile_index < kZlpTiles) {
     const uint32_t tile_row = tile_index / kZlpTileCols;
     const uint32_t tile_col = tile_index % kZlpTileCols;
-    row_start   = tile_row * TILE_ZLP_TILE_HEIGHT;
-    col_start   = tile_col * TILE_ZLP_TILE_WIDTH;
+    row_start = tile_row * TILE_ZLP_TILE_HEIGHT;
+    col_start = tile_col * TILE_ZLP_TILE_WIDTH;
     tile_height = TILE_ZLP_TILE_HEIGHT;
-    tile_width  = TILE_ZLP_TILE_WIDTH;
+    tile_width = TILE_ZLP_TILE_WIDTH;
     return true;
   }
 
@@ -201,23 +208,17 @@ __device__ __forceinline__ bool tile_geometry(uint32_t tile_index,
 
   const uint32_t tile_row = core_index / kCoreTileCols;
   const uint32_t tile_col = core_index % kCoreTileCols;
-  row_start   = tile_row * TILE_CORE_TILE_HEIGHT;
-  col_start   = TILE_ZLP_COLUMNS + tile_col * TILE_CORE_TILE_WIDTH;
+  row_start = tile_row * TILE_CORE_TILE_HEIGHT;
+  col_start = TILE_ZLP_COLUMNS + tile_col * TILE_CORE_TILE_WIDTH;
   tile_height = TILE_CORE_TILE_HEIGHT;
-  tile_width  = TILE_CORE_TILE_WIDTH;
+  tile_width = TILE_CORE_TILE_WIDTH;
   return true;
 }
 
 __global__ void stem_gather_tile_packets_by_placement_kernel(
-    uint8_t** src_ptrs,
-    const PacketPlacement* placements,
-    uint8_t* dst_base,
-    uint16_t available_payload_len,
-    uint16_t header_len,
-    uint32_t num_pkts,
-    uint32_t frames,
-    uint32_t frame_height,
-    uint32_t frame_width,
+    uint8_t** src_ptrs, const PacketPlacement* placements, uint8_t* dst_base,
+    uint16_t available_payload_len, uint16_t header_len, uint32_t num_pkts,
+    uint32_t frames, uint32_t frame_height, uint32_t frame_width,
     bool duplicate_prefix_to_simulate_tile_payload) {
   const uint32_t pkt_idx = blockIdx.x;
   if (pkt_idx >= num_pkts) { return; }
@@ -225,11 +226,12 @@ __global__ void stem_gather_tile_packets_by_placement_kernel(
   const PacketPlacement placement = placements[pkt_idx];
   if (!placement.valid || placement.relative_frame >= frames) { return; }
 
-  uint32_t row_start  = 0;
-  uint32_t col_start  = 0;
-  uint32_t tile_h     = 0;
-  uint32_t tile_w     = 0;
-  if (!tile_geometry(placement.tile_index, row_start, col_start, tile_h, tile_w)) {
+  uint32_t row_start = 0;
+  uint32_t col_start = 0;
+  uint32_t tile_h = 0;
+  uint32_t tile_w = 0;
+  if (!tile_geometry(placement.tile_index, row_start, col_start, tile_h,
+                     tile_w)) {
     return;
   }
   if (row_start + tile_h > frame_height || col_start + tile_w > frame_width) {
@@ -240,16 +242,13 @@ __global__ void stem_gather_tile_packets_by_placement_kernel(
   if (src == nullptr) { return; }
 
   const uint16_t* payload = reinterpret_cast<const uint16_t*>(src + header_len);
-  uint16_t*       output  = reinterpret_cast<uint16_t*>(dst_base);
-  const uint32_t  available_samples =
-      available_payload_len / sizeof(uint16_t);
-  const uint64_t  frame_offset =
+  uint16_t* output = reinterpret_cast<uint16_t*>(dst_base);
+  const uint32_t available_samples = available_payload_len / sizeof(uint16_t);
+  const uint64_t frame_offset =
       static_cast<uint64_t>(placement.relative_frame) *
-      static_cast<uint64_t>(frame_height) *
-      static_cast<uint64_t>(frame_width);
+      static_cast<uint64_t>(frame_height) * static_cast<uint64_t>(frame_width);
 
-  for (uint32_t sample_idx = threadIdx.x;
-       sample_idx < TILE_SAMPLES;
+  for (uint32_t sample_idx = threadIdx.x; sample_idx < TILE_SAMPLES;
        sample_idx += blockDim.x) {
     uint32_t src_sample_idx = sample_idx;
     if (duplicate_prefix_to_simulate_tile_payload &&
@@ -262,61 +261,41 @@ __global__ void stem_gather_tile_packets_by_placement_kernel(
     const uint32_t local_col = sample_idx - local_row * tile_w;
     if (local_row >= tile_h) { continue; }
 
-    const uint64_t dst_idx =
-        frame_offset +
-        static_cast<uint64_t>(row_start + local_row) *
-            static_cast<uint64_t>(frame_width) +
-        static_cast<uint64_t>(col_start + local_col);
+    const uint64_t dst_idx = frame_offset +
+                             static_cast<uint64_t>(row_start + local_row) *
+                                 static_cast<uint64_t>(frame_width) +
+                             static_cast<uint64_t>(col_start + local_col);
     output[dst_idx] = payload[src_sample_idx];
   }
 }
 
 void stem_gather_tile_packets_by_placement(
-    uint8_t** src_ptrs,
-    const PacketPlacement* placements,
-    uint8_t* dst_base,
-    uint16_t available_payload_len,
-    uint16_t header_len,
-    uint32_t num_pkts,
-    uint32_t frames,
-    uint32_t frame_height,
-    uint32_t frame_width,
-    bool duplicate_prefix_to_simulate_tile_payload,
-    cudaStream_t stream) {
+    uint8_t** src_ptrs, const PacketPlacement* placements, uint8_t* dst_base,
+    uint16_t available_payload_len, uint16_t header_len, uint32_t num_pkts,
+    uint32_t frames, uint32_t frame_height, uint32_t frame_width,
+    bool duplicate_prefix_to_simulate_tile_payload, cudaStream_t stream) {
   if (num_pkts == 0) { return; }
   stem_gather_tile_packets_by_placement_kernel<<<num_pkts, 256, 0, stream>>>(
-      src_ptrs,
-      placements,
-      dst_base,
-      available_payload_len,
-      header_len,
-      num_pkts,
-      frames,
-      frame_height,
-      frame_width,
+      src_ptrs, placements, dst_base, available_payload_len, header_len,
+      num_pkts, frames, frame_height, frame_width,
       duplicate_prefix_to_simulate_tile_payload);
+  check_cuda_launch("stem_gather_tile_packets_by_placement_kernel");
 }
 
 // ===========================================================================
 // Phase 3 processor -- dark-frame subtract + valid-pixel mask, uint16 -> fp32
 // ===========================================================================
-__global__ void stem_dark_correct_uint16_to_float_kernel(const uint16_t* input,
-                                                         const float* dark_frame,
-                                                         const float* valid_pixel_mask,
-                                                         float* output,
-                                                         uint32_t frames,
-                                                         uint32_t frame_pixels,
-                                                         bool subtract_dark,
-                                                         bool apply_valid_pixel_mask) {
+__global__ void stem_dark_correct_uint16_to_float_kernel(
+    const uint16_t* input, const float* dark_frame,
+    const float* valid_pixel_mask, float* output, uint32_t frames,
+    uint32_t frame_pixels, bool subtract_dark, bool apply_valid_pixel_mask) {
   const uint32_t pixel_stride = blockDim.x * gridDim.x;
 
   for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
-       pixel_idx < frame_pixels;
-       pixel_idx += pixel_stride) {
+       pixel_idx < frame_pixels; pixel_idx += pixel_stride) {
     const float dark_value = subtract_dark ? dark_frame[pixel_idx] : 0.0f;
-    const float mask_value = apply_valid_pixel_mask
-                                 ? valid_pixel_mask[pixel_idx]
-                                 : 1.0f;
+    const float mask_value =
+        apply_valid_pixel_mask ? valid_pixel_mask[pixel_idx] : 1.0f;
 
     for (uint32_t frame = 0; frame < frames; ++frame) {
       const uint64_t idx =
@@ -326,16 +305,11 @@ __global__ void stem_dark_correct_uint16_to_float_kernel(const uint16_t* input,
   }
 }
 
-void stem_dark_correct_uint16_to_float(const uint16_t* input,
-                                       const float* dark_frame,
-                                       const float* valid_pixel_mask,
-                                       float* output,
-                                       uint32_t frames,
-                                       uint32_t height,
-                                       uint32_t width,
-                                       bool subtract_dark,
-                                       bool apply_valid_pixel_mask,
-                                       cudaStream_t stream) {
+void stem_dark_correct_uint16_to_float(
+    const uint16_t* input, const float* dark_frame,
+    const float* valid_pixel_mask, float* output, uint32_t frames,
+    uint32_t height, uint32_t width, bool subtract_dark,
+    bool apply_valid_pixel_mask, cudaStream_t stream) {
   const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
   const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
   if (total_values == 0) { return; }
@@ -346,9 +320,50 @@ void stem_dark_correct_uint16_to_float(const uint16_t* input,
       required_blocks > 65535ULL ? 65535ULL : required_blocks);
 
   stem_dark_correct_uint16_to_float_kernel<<<blocks, threads, 0, stream>>>(
-      input, dark_frame, valid_pixel_mask, output,
-      frames, static_cast<uint32_t>(frame_pixels),
-      subtract_dark, apply_valid_pixel_mask);
+      input, dark_frame, valid_pixel_mask, output, frames,
+      static_cast<uint32_t>(frame_pixels), subtract_dark,
+      apply_valid_pixel_mask);
+  check_cuda_launch("stem_dark_correct_uint16_to_float_kernel");
+}
+
+__global__ void stem_dark_correct_float_to_float_kernel(
+    const float* input, const float* dark_frame, const float* valid_pixel_mask,
+    float* output, uint32_t frames, uint32_t frame_pixels, bool subtract_dark,
+    bool apply_valid_pixel_mask) {
+  const uint32_t pixel_stride = blockDim.x * gridDim.x;
+
+  for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       pixel_idx < frame_pixels; pixel_idx += pixel_stride) {
+    const float dark_value = subtract_dark ? dark_frame[pixel_idx] : 0.0f;
+    const float mask_value =
+        apply_valid_pixel_mask ? valid_pixel_mask[pixel_idx] : 1.0f;
+
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+      const uint64_t idx =
+          static_cast<uint64_t>(frame) * frame_pixels + pixel_idx;
+      output[idx] = (input[idx] - dark_value) * mask_value;
+    }
+  }
+}
+
+void stem_dark_correct_float_to_float(
+    const float* input, const float* dark_frame, const float* valid_pixel_mask,
+    float* output, uint32_t frames, uint32_t height, uint32_t width,
+    bool subtract_dark, bool apply_valid_pixel_mask, cudaStream_t stream) {
+  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
+  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
+  if (total_values == 0) { return; }
+
+  const uint32_t threads = 256;
+  const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
+  const uint32_t blocks = static_cast<uint32_t>(
+      required_blocks > 65535ULL ? 65535ULL : required_blocks);
+
+  stem_dark_correct_float_to_float_kernel<<<blocks, threads, 0, stream>>>(
+      input, dark_frame, valid_pixel_mask, output, frames,
+      static_cast<uint32_t>(frame_pixels), subtract_dark,
+      apply_valid_pixel_mask);
+  check_cuda_launch("stem_dark_correct_float_to_float_kernel");
 }
 
 __global__ void stem_compute_frame_mean_float_kernel(const float* input,
@@ -358,8 +373,7 @@ __global__ void stem_compute_frame_mean_float_kernel(const float* input,
   const uint32_t pixel_stride = blockDim.x * gridDim.x;
 
   for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
-       pixel_idx < frame_pixels;
-       pixel_idx += pixel_stride) {
+       pixel_idx < frame_pixels; pixel_idx += pixel_stride) {
     float sum = 0.0f;
     for (uint32_t frame = 0; frame < frames; ++frame) {
       const uint64_t idx =
@@ -370,12 +384,9 @@ __global__ void stem_compute_frame_mean_float_kernel(const float* input,
   }
 }
 
-void stem_compute_frame_mean_float(const float* input,
-                                   float* mean,
-                                   uint32_t frames,
-                                   uint32_t height,
-                                   uint32_t width,
-                                   cudaStream_t stream) {
+void stem_compute_frame_mean_float(const float* input, float* mean,
+                                   uint32_t frames, uint32_t height,
+                                   uint32_t width, cudaStream_t stream) {
   const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
   const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
   if (total_values == 0) { return; }
@@ -387,6 +398,7 @@ void stem_compute_frame_mean_float(const float* input,
 
   stem_compute_frame_mean_float_kernel<<<blocks, threads, 0, stream>>>(
       input, mean, frames, static_cast<uint32_t>(frame_pixels));
+  check_cuda_launch("stem_compute_frame_mean_float_kernel");
 }
 
 __device__ __forceinline__ float stem_median_from_small_window(float* values,
@@ -408,13 +420,8 @@ __device__ __forceinline__ float stem_median_from_small_window(float* values,
 }
 
 __global__ void stem_apply_dynamic_half_column_mask_float_kernel(
-    float* input,
-    const float* batch_mean,
-    uint32_t frames,
-    uint32_t height,
-    uint32_t width,
-    uint32_t median_window_pixels,
-    float threshold_ratio,
+    float* input, const float* batch_mean, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t median_window_pixels, float threshold_ratio,
     float threshold_offset) {
   constexpr uint32_t kMaxMedianWindowPixels = 129;
   float window_values[kMaxMedianWindowPixels];
@@ -424,8 +431,7 @@ __global__ void stem_apply_dynamic_half_column_mask_float_kernel(
   const uint32_t half_height = height / 2;
 
   for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
-       pixel_idx < frame_pixels;
-       pixel_idx += pixel_stride) {
+       pixel_idx < frame_pixels; pixel_idx += pixel_stride) {
     const uint32_t row = pixel_idx / width;
     const uint32_t col = pixel_idx - row * width;
     const uint32_t half_start = row < half_height ? 0 : half_height;
@@ -439,8 +445,7 @@ __global__ void stem_apply_dynamic_half_column_mask_float_kernel(
 
     uint32_t count = 0;
     for (uint32_t sample_row = row_start;
-         sample_row < row_end && count < kMaxMedianWindowPixels;
-         ++sample_row) {
+         sample_row < row_end && count < kMaxMedianWindowPixels; ++sample_row) {
       window_values[count++] =
           batch_mean[static_cast<uint64_t>(sample_row) * width + col];
     }
@@ -460,15 +465,10 @@ __global__ void stem_apply_dynamic_half_column_mask_float_kernel(
   }
 }
 
-void stem_apply_dynamic_half_column_mask_float(float* input,
-                                               const float* batch_mean,
-                                               uint32_t frames,
-                                               uint32_t height,
-                                               uint32_t width,
-                                               uint32_t median_window_pixels,
-                                               float threshold_ratio,
-                                               float threshold_offset,
-                                               cudaStream_t stream) {
+void stem_apply_dynamic_half_column_mask_float(
+    float* input, const float* batch_mean, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t median_window_pixels, float threshold_ratio,
+    float threshold_offset, cudaStream_t stream) {
   const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
   const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
   if (total_values == 0) { return; }
@@ -478,15 +478,11 @@ void stem_apply_dynamic_half_column_mask_float(float* input,
   const uint32_t blocks = static_cast<uint32_t>(
       required_blocks > 65535ULL ? 65535ULL : required_blocks);
 
-  stem_apply_dynamic_half_column_mask_float_kernel<<<blocks, threads, 0, stream>>>(
-      input,
-      batch_mean,
-      frames,
-      height,
-      width,
-      median_window_pixels,
-      threshold_ratio,
-      threshold_offset);
+  stem_apply_dynamic_half_column_mask_float_kernel<<<blocks, threads, 0,
+                                                     stream>>>(
+      input, batch_mean, frames, height, width, median_window_pixels,
+      threshold_ratio, threshold_offset);
+  check_cuda_launch("stem_apply_dynamic_half_column_mask_float_kernel");
 }
 
 __global__ void stem_sum_frames_float_to_frame_kernel(const float* input,
@@ -496,8 +492,7 @@ __global__ void stem_sum_frames_float_to_frame_kernel(const float* input,
   const uint32_t pixel_stride = blockDim.x * gridDim.x;
 
   for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
-       pixel_idx < frame_pixels;
-       pixel_idx += pixel_stride) {
+       pixel_idx < frame_pixels; pixel_idx += pixel_stride) {
     float sum = 0.0f;
     for (uint32_t frame = 0; frame < frames; ++frame) {
       const uint64_t idx =
@@ -508,12 +503,9 @@ __global__ void stem_sum_frames_float_to_frame_kernel(const float* input,
   }
 }
 
-void stem_sum_frames_float_to_frame(const float* input,
-                                    float* output,
-                                    uint32_t frames,
-                                    uint32_t height,
-                                    uint32_t width,
-                                    cudaStream_t stream) {
+void stem_sum_frames_float_to_frame(const float* input, float* output,
+                                    uint32_t frames, uint32_t height,
+                                    uint32_t width, cudaStream_t stream) {
   const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
   const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
   if (total_values == 0) { return; }
@@ -525,6 +517,7 @@ void stem_sum_frames_float_to_frame(const float* input,
 
   stem_sum_frames_float_to_frame_kernel<<<blocks, threads, 0, stream>>>(
       input, output, frames, static_cast<uint32_t>(frame_pixels));
+  check_cuda_launch("stem_sum_frames_float_to_frame_kernel");
 }
 
 }  // namespace stem

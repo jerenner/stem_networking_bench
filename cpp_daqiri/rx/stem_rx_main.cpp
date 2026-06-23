@@ -99,16 +99,17 @@ struct ReplayerConfig {
 // touch GPUDirect; silent failures here would surface as "0 frames assembled"
 // at the end of the run with no breadcrumb.
 // ===========================================================================
-#define STEM_CUDA_TRY(stmt)                                                    \
-  do {                                                                         \
-    cudaError_t _err = (stmt);                                                 \
-    if (_err != cudaSuccess) {                                                 \
-      std::fprintf(stderr,                                                     \
-                   "STEM_CUDA_TRY failed at %s:%d: %s -> %s (%d)\n",           \
-                   __FILE__, __LINE__, #stmt,                                  \
-                   cudaGetErrorString(_err), static_cast<int>(_err));          \
-    }                                                                          \
-  } while (0)
+inline void stem_cuda_check(cudaError_t err, const char* stmt, const char* file,
+                            int line) {
+  if (err == cudaSuccess) { return; }
+  throw std::runtime_error(std::string("STEM_CUDA_TRY failed at ") + file +
+                           ":" + std::to_string(line) + ": " + stmt + " -> " +
+                           cudaGetErrorString(err) + " (" +
+                           std::to_string(static_cast<int>(err)) + ")");
+}
+
+#define STEM_CUDA_TRY(stmt) \
+  do { stem_cuda_check((stmt), #stmt, __FILE__, __LINE__); } while (0)
 
 // ---------------------------------------------------------------------------
 // stem_rx YAML block.
@@ -194,8 +195,8 @@ ProcessorConfig parse_processor_cfg(const YAML::Node& root,
         legacy_rx["subtract_dark"].as<bool>(cfg.subtract_dark_frame);
     cfg.subtract_dark_frame =
         legacy_rx["subtract_dark_frame"].as<bool>(cfg.subtract_dark_frame);
-    cfg.apply_valid_pixel_mask =
-        legacy_rx["apply_valid_pixel_mask"].as<bool>(cfg.apply_valid_pixel_mask);
+    cfg.apply_valid_pixel_mask = legacy_rx["apply_valid_pixel_mask"].as<bool>(
+        cfg.apply_valid_pixel_mask);
   }
 
   if (root["processor"]) {
@@ -231,32 +232,39 @@ ProcessorConfig parse_processor_cfg(const YAML::Node& root,
 
 void apply_stem_rx_node(StemRxConfig& cfg, const YAML::Node& rx) {
   if (!rx) { return; }
-  cfg.interface_name      = rx["interface_name"].as<std::string>(cfg.interface_name);
-  cfg.frames_per_tensor   = rx["frames_per_tensor"].as<uint32_t>(cfg.frames_per_tensor);
-  cfg.header_size         = rx["header_size"].as<uint16_t>(cfg.header_size);
-  cfg.payload_size        = rx["payload_size"].as<uint16_t>(cfg.payload_size);
+  cfg.interface_name = rx["interface_name"].as<std::string>(cfg.interface_name);
+  cfg.frames_per_tensor =
+      rx["frames_per_tensor"].as<uint32_t>(cfg.frames_per_tensor);
+  cfg.header_size = rx["header_size"].as<uint16_t>(cfg.header_size);
+  cfg.payload_size = rx["payload_size"].as<uint16_t>(cfg.payload_size);
   cfg.expected_source_mask =
       rx["expected_source_mask"].as<uint32_t>(cfg.expected_source_mask);
-  cfg.batch_close_slack_packets =
-      rx["batch_close_slack_packets"].as<uint32_t>(cfg.batch_close_slack_packets);
+  cfg.batch_close_slack_packets = rx["batch_close_slack_packets"].as<uint32_t>(
+      cfg.batch_close_slack_packets);
   cfg.total_time_to_recv_s =
       rx["total_time_to_recv"].as<double>(cfg.total_time_to_recv_s);
-  cfg.capture_latency =
-      rx["capture_latency"].as<bool>(cfg.capture_latency);
+  cfg.capture_latency = rx["capture_latency"].as<bool>(cfg.capture_latency);
   cfg.gpu_header_extract =
       rx["gpu_header_extract"].as<bool>(cfg.gpu_header_extract);
-  cfg.hds =
-      rx["hds"].as<bool>(cfg.hds);
+  cfg.hds = rx["hds"].as<bool>(cfg.hds);
   cfg.tile_duplicate_prefix_to_simulate_payload =
       rx["tile_duplicate_prefix_to_simulate_payload"].as<bool>(
           cfg.tile_duplicate_prefix_to_simulate_payload);
 }
 
 void validate_stem_rx_cfg(const StemRxConfig& cfg, int num_receivers) {
+  if (cfg.frames_per_tensor == 0) {
+    throw std::runtime_error("stem_rx.frames_per_tensor must be > 0");
+  }
+  if ((cfg.expected_source_mask & 0xffu) == 0) {
+    throw std::runtime_error(
+        "stem_rx.expected_source_mask must enable at least one source");
+  }
   if (num_receivers > 1 && !cfg.writer.noop) {
     throw std::runtime_error(
         "num_receivers > 1 with writer.noop=false is not supported: "
-        "shared HDF5 output would interleave receiver streams by arrival order");
+        "shared HDF5 output would interleave receiver streams by arrival "
+        "order");
   }
   if (cfg.hds && cfg.gpu_header_extract) {
     throw std::runtime_error(
@@ -270,6 +278,21 @@ void validate_stem_rx_cfg(const StemRxConfig& cfg, int num_receivers) {
         "STEM_DAQIRI_REQUIRE_HDF5=ON or set writer.noop=true");
   }
 #endif
+}
+
+YAML::Node receiver_override_node(const YAML::Node& root,
+                                  const YAML::Node& stem_rx,
+                                  const std::string& key) {
+  const bool has_nested = stem_rx && static_cast<bool>(stem_rx[key]);
+  const bool has_top_level = static_cast<bool>(root[key]);
+  if (has_nested && has_top_level) {
+    throw std::runtime_error("receiver override '" + key +
+                             "' is ambiguous: use either top-level " + key +
+                             " or stem_rx." + key + ", not both");
+  }
+  if (has_top_level) { return root[key]; }
+  if (has_nested) { return stem_rx[key]; }
+  return YAML::Node{};
 }
 
 std::vector<StemRxConfig> parse_stem_rx_cfgs(const YAML::Node& root) {
@@ -291,7 +314,15 @@ std::vector<StemRxConfig> parse_stem_rx_cfgs(const YAML::Node& root) {
 
   std::vector<StemRxConfig> cfgs;
   cfgs.reserve(static_cast<size_t>(num_receivers));
-  if (num_receivers == 1 && !stem_rx["receiver0"]) {
+  YAML::Node single_receiver0 =
+      receiver_override_node(root, stem_rx, "receiver0");
+  if (num_receivers == 1 && !single_receiver0) {
+    validate_stem_rx_cfg(base, num_receivers);
+    cfgs.push_back(std::move(base));
+    return cfgs;
+  }
+  if (num_receivers == 1) {
+    apply_stem_rx_node(base, single_receiver0);
     validate_stem_rx_cfg(base, num_receivers);
     cfgs.push_back(std::move(base));
     return cfgs;
@@ -299,11 +330,13 @@ std::vector<StemRxConfig> parse_stem_rx_cfgs(const YAML::Node& root) {
 
   for (int i = 0; i < num_receivers; ++i) {
     const std::string key = "receiver" + std::to_string(i);
-    if (!stem_rx[key]) {
-      throw std::runtime_error("num_receivers requires stem_rx." + key);
+    YAML::Node receiver_node = receiver_override_node(root, stem_rx, key);
+    if (!receiver_node) {
+      throw std::runtime_error("num_receivers requires top-level " + key +
+                               " or stem_rx." + key);
     }
     StemRxConfig cfg = base;
-    apply_stem_rx_node(cfg, stem_rx[key]);
+    apply_stem_rx_node(cfg, receiver_node);
     validate_stem_rx_cfg(cfg, num_receivers);
     cfgs.push_back(std::move(cfg));
   }
@@ -312,7 +345,8 @@ std::vector<StemRxConfig> parse_stem_rx_cfgs(const YAML::Node& root) {
 
 ReplayerConfig parse_replayer_cfg(const YAML::Node& root) {
   if (!root["replayer"]) {
-    throw std::runtime_error("source: hdf5 requires a top-level 'replayer' block");
+    throw std::runtime_error(
+        "source: hdf5 requires a top-level 'replayer' block");
   }
   ReplayerConfig cfg;
   const auto rp = root["replayer"];
@@ -331,7 +365,8 @@ ReplayerConfig parse_replayer_cfg(const YAML::Node& root) {
   }
   if (cfg.repeat) {
     throw std::runtime_error(
-        "DAQIRI HDF5 replay is finite; set replayer.repeat=false for parity runs");
+        "DAQIRI HDF5 replay is finite; set "
+        "replayer.repeat=false for parity runs");
   }
   return cfg;
 }
@@ -355,19 +390,17 @@ struct BurstHolder {
   BurstHolder(const BurstHolder&) = delete;
   BurstHolder& operator=(const BurstHolder&) = delete;
   ~BurstHolder() {
-    if (burst != nullptr) {
-      daqiri::free_all_packets_and_burst_rx(burst);
-    }
+    if (burst != nullptr) { daqiri::free_all_packets_and_burst_rx(burst); }
   }
 };
 
 struct PacketEntry {
-  uint8_t* packet_ptr     = nullptr;
-  uint64_t abs_frame      = 0;
-  int16_t  global_row     = -1;
-  uint16_t tile_index     = 0;
-  uint16_t row_number     = 0;
-  uint16_t source_id      = 0xFFFF;
+  uint8_t* packet_ptr = nullptr;
+  uint64_t abs_frame = 0;
+  int16_t global_row = -1;
+  uint16_t tile_index = 0;
+  uint16_t row_number = 0;
+  uint16_t source_id = 0xFFFF;
   std::shared_ptr<BurstHolder> holder;
 };
 
@@ -500,8 +533,13 @@ class AsyncFrameSink {
         queue_.pop();
       }
 
-      STEM_CUDA_TRY(cudaEventSynchronize(slot->ready));
-      write_slot(slot);
+      try {
+        STEM_CUDA_TRY(cudaEventSynchronize(slot->ready));
+        write_slot(slot);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "AsyncFrameSink worker failed: %s\n", e.what());
+        errors_++;
+      }
       slot->leased.store(false, std::memory_order_release);
     }
   }
@@ -512,8 +550,7 @@ class AsyncFrameSink {
     const size_t elem_size =
         slot->output_float ? sizeof(float) : sizeof(uint16_t);
     const size_t elems = static_cast<size_t>(batch_frames) *
-                         slot->output_height *
-                         slot->output_width;
+                         slot->output_height * slot->output_width;
     const size_t bytes = elems * elem_size;
     if (host_buffer_.size() < bytes) { host_buffer_.resize(bytes); }
 
@@ -526,12 +563,14 @@ class AsyncFrameSink {
       return;
     }
     try {
-      const H5::DataType h5_type =
-          slot->output_float ? H5::PredType::NATIVE_FLOAT
-                             : H5::PredType::NATIVE_UINT16;
+      const H5::DataType h5_type = slot->output_float
+                                       ? H5::PredType::NATIVE_FLOAT
+                                       : H5::PredType::NATIVE_UINT16;
       if (!dataset_) {
-        hsize_t dims[3] = {batch_frames, slot->output_height, slot->output_width};
-        hsize_t max_dims[3] = {H5S_UNLIMITED, slot->output_height, slot->output_width};
+        hsize_t dims[3] = {batch_frames, slot->output_height,
+                           slot->output_width};
+        hsize_t max_dims[3] = {H5S_UNLIMITED, slot->output_height,
+                               slot->output_width};
         H5::DataSpace filespace(3, dims, max_dims);
         H5::DSetCreatPropList prop;
         hsize_t chunk_dims[3] = {1, slot->output_height, slot->output_width};
@@ -546,8 +585,8 @@ class AsyncFrameSink {
         if (dataset_float_ != slot->output_float ||
             dataset_height_ != slot->output_height ||
             dataset_width_ != slot->output_width) {
-          std::fprintf(stderr,
-                       "HDF5 write shape/type changed after dataset creation\n");
+          std::fprintf(
+              stderr, "HDF5 write shape/type changed after dataset creation\n");
           errors_++;
           return;
         }
@@ -558,7 +597,8 @@ class AsyncFrameSink {
 
       H5::DataSpace filespace(dataset_->getSpace());
       hsize_t offset[3] = {current_frames_ - batch_frames, 0, 0};
-      hsize_t count[3] = {batch_frames, slot->output_height, slot->output_width};
+      hsize_t count[3] = {batch_frames, slot->output_height,
+                          slot->output_width};
       filespace.selectHyperslab(H5S_SELECT_SET, count, offset);
       H5::DataSpace memspace(3, count);
       dataset_->write(host_buffer_.data(), h5_type, memspace, filespace);
@@ -598,16 +638,12 @@ class AsyncFrameSink {
 
 class FramePipeline {
  public:
-  FramePipeline(const ProcessorConfig& processor,
-                const WriterConfig& writer,
-                uint32_t height,
-                uint32_t width)
-      : processor_(processor),
-        height_(height),
-        width_(width),
-        sink_(writer) {
+  FramePipeline(const ProcessorConfig& processor, const WriterConfig& writer,
+                uint32_t height, uint32_t width)
+      : processor_(processor), height_(height), width_(width), sink_(writer) {
     if (height_ == 0 || width_ == 0) {
-      throw std::runtime_error("FramePipeline requires non-zero frame dimensions");
+      throw std::runtime_error(
+          "FramePipeline requires non-zero frame dimensions");
     }
     if (processor_.dynamic_mask_median_window_pixels == 0 ||
         processor_.dynamic_mask_median_window_pixels > 129) {
@@ -626,73 +662,98 @@ class FramePipeline {
   FramePipeline& operator=(const FramePipeline&) = delete;
 
   bool produces_float() const {
-    return !processor_.noop ||
-           processor_.subtract_dark_frame ||
+    return !processor_.noop || processor_.subtract_dark_frame ||
            processor_.apply_valid_pixel_mask ||
            processor_.apply_dynamic_half_column_mask;
   }
 
-  void allocate_slot_buffers(OutputSlot* slot, uint32_t max_frames) const {
+  void allocate_slot_buffers(OutputSlot* slot, uint32_t max_frames,
+                             bool input_float = false) const {
     const uint64_t frame_pixels = static_cast<uint64_t>(height_) * width_;
-    const uint64_t full_values = static_cast<uint64_t>(max_frames) * frame_pixels;
-    if (produces_float()) {
-      STEM_CUDA_TRY(cudaMalloc(&slot->gpu_float,
-                               full_values * sizeof(float)));
+    const uint64_t full_values =
+        static_cast<uint64_t>(max_frames) * frame_pixels;
+    if (input_float || produces_float()) {
+      STEM_CUDA_TRY(cudaMalloc(&slot->gpu_float, full_values * sizeof(float)));
     }
     if (!processor_.noop) {
-      STEM_CUDA_TRY(cudaMalloc(&slot->gpu_reduced,
-                               frame_pixels * sizeof(float)));
+      STEM_CUDA_TRY(
+          cudaMalloc(&slot->gpu_reduced, frame_pixels * sizeof(float)));
     }
     if (processor_.apply_dynamic_half_column_mask) {
-      STEM_CUDA_TRY(cudaMalloc(&slot->gpu_batch_mean,
-                               frame_pixels * sizeof(float)));
+      STEM_CUDA_TRY(
+          cudaMalloc(&slot->gpu_batch_mean, frame_pixels * sizeof(float)));
     }
   }
 
-  void process_slot(OutputSlot* slot, uint32_t frames, cudaStream_t stream) const {
+  void process_slot(OutputSlot* slot, uint32_t frames, cudaStream_t stream,
+                    bool input_float = false) const {
     if (frames == 0) { return; }
 
-    if (produces_float()) {
+    if (input_float) {
+      if (produces_float()) {
+        if (processor_.subtract_dark_frame ||
+            processor_.apply_valid_pixel_mask) {
+          stem::stem_dark_correct_float_to_float(
+              slot->gpu_float,
+              processor_.subtract_dark_frame ? gpu_dark_frame_ : nullptr,
+              processor_.apply_valid_pixel_mask ? gpu_valid_mask_ : nullptr,
+              slot->gpu_float, frames, height_, width_,
+              processor_.subtract_dark_frame, processor_.apply_valid_pixel_mask,
+              stream);
+        }
+
+        if (processor_.apply_dynamic_half_column_mask) {
+          stem::stem_compute_frame_mean_float(slot->gpu_float,
+                                              slot->gpu_batch_mean, frames,
+                                              height_, width_, stream);
+          stem::stem_apply_dynamic_half_column_mask_float(
+              slot->gpu_float, slot->gpu_batch_mean, frames, height_, width_,
+              processor_.dynamic_mask_median_window_pixels,
+              processor_.dynamic_mask_threshold_ratio,
+              processor_.dynamic_mask_threshold_offset, stream);
+        }
+
+        if (!processor_.noop) {
+          stem::stem_sum_frames_float_to_frame(slot->gpu_float,
+                                               slot->gpu_reduced, frames,
+                                               height_, width_, stream);
+          slot->output_ptr = slot->gpu_reduced;
+          slot->output_rank = 2;
+          slot->output_frames = 1;
+        } else {
+          slot->output_ptr = slot->gpu_float;
+          slot->output_rank = 3;
+          slot->output_frames = frames;
+        }
+      } else {
+        slot->output_ptr = slot->gpu_float;
+        slot->output_rank = 3;
+        slot->output_frames = frames;
+      }
+      slot->output_float = true;
+    } else if (produces_float()) {
       stem::stem_dark_correct_uint16_to_float(
           reinterpret_cast<const uint16_t*>(slot->gpu_u16),
           processor_.subtract_dark_frame ? gpu_dark_frame_ : nullptr,
           processor_.apply_valid_pixel_mask ? gpu_valid_mask_ : nullptr,
-          slot->gpu_float,
-          frames,
-          height_,
-          width_,
-          processor_.subtract_dark_frame,
-          processor_.apply_valid_pixel_mask,
+          slot->gpu_float, frames, height_, width_,
+          processor_.subtract_dark_frame, processor_.apply_valid_pixel_mask,
           stream);
 
       if (processor_.apply_dynamic_half_column_mask) {
-        stem::stem_compute_frame_mean_float(
-            slot->gpu_float,
-            slot->gpu_batch_mean,
-            frames,
-            height_,
-            width_,
-            stream);
+        stem::stem_compute_frame_mean_float(slot->gpu_float,
+                                            slot->gpu_batch_mean, frames,
+                                            height_, width_, stream);
         stem::stem_apply_dynamic_half_column_mask_float(
-            slot->gpu_float,
-            slot->gpu_batch_mean,
-            frames,
-            height_,
-            width_,
+            slot->gpu_float, slot->gpu_batch_mean, frames, height_, width_,
             processor_.dynamic_mask_median_window_pixels,
             processor_.dynamic_mask_threshold_ratio,
-            processor_.dynamic_mask_threshold_offset,
-            stream);
+            processor_.dynamic_mask_threshold_offset, stream);
       }
 
       if (!processor_.noop) {
-        stem::stem_sum_frames_float_to_frame(
-            slot->gpu_float,
-            slot->gpu_reduced,
-            frames,
-            height_,
-            width_,
-            stream);
+        stem::stem_sum_frames_float_to_frame(slot->gpu_float, slot->gpu_reduced,
+                                             frames, height_, width_, stream);
         slot->output_ptr = slot->gpu_reduced;
         slot->output_rank = 2;
         slot->output_frames = 1;
@@ -724,8 +785,8 @@ class FramePipeline {
   void validate_correction_shape(const Hdf5FrameData& frame,
                                  const std::string& label) const {
     if (frame.height != height_ || frame.width != width_) {
-      throw std::runtime_error(
-          label + " shape does not match incoming frame shape");
+      throw std::runtime_error(label +
+                               " shape does not match incoming frame shape");
     }
   }
 
@@ -748,33 +809,29 @@ class FramePipeline {
     try {
       if (processor_.subtract_dark_frame) {
         Hdf5FrameData dark = read_single_frame_float_dataset(
-            processor_.dark_frame_path,
-            processor_.dark_frame_dataset);
+            processor_.dark_frame_path, processor_.dark_frame_dataset);
         validate_correction_shape(dark, "dark frame");
-        STEM_CUDA_TRY(cudaMalloc(&gpu_dark_frame_,
-                                 frame_pixels * sizeof(float)));
-        STEM_CUDA_TRY(cudaMemcpy(gpu_dark_frame_,
-                                 dark.pixels.data(),
+        STEM_CUDA_TRY(
+            cudaMalloc(&gpu_dark_frame_, frame_pixels * sizeof(float)));
+        STEM_CUDA_TRY(cudaMemcpy(gpu_dark_frame_, dark.pixels.data(),
                                  dark.pixels.size() * sizeof(float),
                                  cudaMemcpyHostToDevice));
-        std::cout << "loaded dark frame " << processor_.dark_frame_path
-                  << ":" << dark.dataset_path << " shape "
-                  << dark.height << "x" << dark.width << "\n";
+        std::cout << "loaded dark frame " << processor_.dark_frame_path << ":"
+                  << dark.dataset_path << " shape " << dark.height << "x"
+                  << dark.width << "\n";
       }
       if (processor_.apply_valid_pixel_mask) {
         Hdf5FrameData mask = read_single_frame_float_dataset(
-            processor_.dark_frame_path,
-            processor_.valid_pixel_mask_dataset);
+            processor_.dark_frame_path, processor_.valid_pixel_mask_dataset);
         validate_correction_shape(mask, "valid pixel mask");
-        STEM_CUDA_TRY(cudaMalloc(&gpu_valid_mask_,
-                                 frame_pixels * sizeof(float)));
-        STEM_CUDA_TRY(cudaMemcpy(gpu_valid_mask_,
-                                 mask.pixels.data(),
+        STEM_CUDA_TRY(
+            cudaMalloc(&gpu_valid_mask_, frame_pixels * sizeof(float)));
+        STEM_CUDA_TRY(cudaMemcpy(gpu_valid_mask_, mask.pixels.data(),
                                  mask.pixels.size() * sizeof(float),
                                  cudaMemcpyHostToDevice));
         std::cout << "loaded valid pixel mask " << processor_.dark_frame_path
-                  << ":" << mask.dataset_path << " shape "
-                  << mask.height << "x" << mask.width << "\n";
+                  << ":" << mask.dataset_path << " shape " << mask.height << "x"
+                  << mask.width << "\n";
       }
     } catch (const H5::Exception& e) {
       throw std::runtime_error(
@@ -805,22 +862,23 @@ class FrameAssembler {
         expected_source_count_(
             __builtin_popcount(cfg.expected_source_mask & 0xff)),
         rows_per_tensor_(cfg.frames_per_tensor * stem::FRAME_HEIGHT),
-        packet_cells_per_frame_(
-            expected_source_count_ * stem::TILE_PACKETS_PER_SOURCE),
-        placement_capacity_(
-            cfg.frames_per_tensor * stem::FULL_FRAME_TILE_PACKETS),
-        expected_packets_per_batch_(
-            cfg.frames_per_tensor *
-            expected_source_count_ *
-            stem::TILE_PACKETS_PER_SOURCE) {
+        packet_cells_per_frame_(expected_source_count_ *
+                                stem::TILE_PACKETS_PER_SOURCE),
+        placement_capacity_(cfg.frames_per_tensor *
+                            stem::FULL_FRAME_TILE_PACKETS),
+        expected_packets_per_batch_(cfg.frames_per_tensor *
+                                    expected_source_count_ *
+                                    stem::TILE_PACKETS_PER_SOURCE) {
     STEM_CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&h_pkt_ptrs_),
                                  sizeof(uint8_t*) * placement_capacity_));
     STEM_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_pkt_ptrs_),
                              sizeof(uint8_t*) * placement_capacity_));
-    STEM_CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&h_placements_),
-                                 sizeof(stem::PacketPlacement) * placement_capacity_));
-    STEM_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_placements_),
-                             sizeof(stem::PacketPlacement) * placement_capacity_));
+    STEM_CUDA_TRY(
+        cudaMallocHost(reinterpret_cast<void**>(&h_placements_),
+                       sizeof(stem::PacketPlacement) * placement_capacity_));
+    STEM_CUDA_TRY(
+        cudaMalloc(reinterpret_cast<void**>(&d_placements_),
+                   sizeof(stem::PacketPlacement) * placement_capacity_));
     STEM_CUDA_TRY(cudaStreamCreate(&stream_));
 
     const uint32_t slot_count =
@@ -830,17 +888,15 @@ class FrameAssembler {
       auto slot = std::make_unique<OutputSlot>();
       STEM_CUDA_TRY(cudaMalloc(&slot->gpu_u16,
                                static_cast<uint64_t>(cfg.frames_per_tensor) *
-                               stem::FRAME_SIZE_BYTES));
+                                   stem::FRAME_SIZE_BYTES));
       pipeline_->allocate_slot_buffers(slot.get(), cfg.frames_per_tensor);
-      STEM_CUDA_TRY(cudaEventCreateWithFlags(&slot->ready,
-                                             cudaEventDisableTiming));
+      STEM_CUDA_TRY(
+          cudaEventCreateWithFlags(&slot->ready, cudaEventDisableTiming));
       output_slots_.push_back(std::move(slot));
     }
 
     // Reserve once up front so push_back doesn't realloc 19 times.
-    if (cfg_.capture_latency) {
-      latencies_us_.reserve(kMaxLatencySamples);
-    }
+    if (cfg_.capture_latency) { latencies_us_.reserve(kMaxLatencySamples); }
     const uint32_t total_cells =
         cfg.frames_per_tensor * packet_cells_per_frame_;
     pending_packets_.reserve(placement_capacity_ +
@@ -885,7 +941,9 @@ class FrameAssembler {
   std::vector<int64_t>& latencies_us() { return latencies_us_; }
   uint64_t tile_packets_ignored() const { return tile_packets_ignored_; }
   uint64_t incomplete_batches() const { return incomplete_batches_; }
-  uint64_t incomplete_missing_total() const { return incomplete_missing_total_; }
+  uint64_t incomplete_missing_total() const {
+    return incomplete_missing_total_;
+  }
   uint64_t incomplete_missing_max() const { return incomplete_missing_max_; }
   uint64_t output_pool_drops() const { return output_pool_drops_; }
   uint64_t sink_queued() const { return pipeline_ ? pipeline_->queued() : 0; }
@@ -896,10 +954,8 @@ class FrameAssembler {
   // The burst's lifetime is now governed by the shared_ptr inside each
   // PacketEntry; once no entries reference it, BurstHolder destructor
   // calls free_all_packets_and_burst_rx().
-  void process_burst(daqiri::BurstParams* burst,
-                     uint64_t* total_pkts,
-                     uint64_t* total_bytes,
-                     uint64_t* drops_unexpected_source,
+  void process_burst(daqiri::BurstParams* burst, uint64_t* total_pkts,
+                     uint64_t* total_bytes, uint64_t* drops_unexpected_source,
                      uint64_t* frames_assembled) {
     auto holder = std::make_shared<BurstHolder>(burst);
     const auto n = daqiri::get_num_packets(burst);
@@ -916,16 +972,17 @@ class FrameAssembler {
       }
 
       for (int i = 0; i < n; ++i) {
-        auto* header_ptr = static_cast<uint8_t*>(
-            daqiri::get_segment_packet_ptr(burst, 0, i));
-        auto* payload_ptr = static_cast<uint8_t*>(
-            daqiri::get_segment_packet_ptr(burst, 1, i));
+        auto* header_ptr =
+            static_cast<uint8_t*>(daqiri::get_segment_packet_ptr(burst, 0, i));
+        auto* payload_ptr =
+            static_cast<uint8_t*>(daqiri::get_segment_packet_ptr(burst, 1, i));
         if (header_ptr == nullptr || payload_ptr == nullptr) {
-          fail_packet_layout("HDS packet " + std::to_string(i) +
-                             " has null segment pointer(s): seg0=" +
-                             std::to_string(reinterpret_cast<uintptr_t>(header_ptr)) +
-                             " seg1=" +
-                             std::to_string(reinterpret_cast<uintptr_t>(payload_ptr)));
+          fail_packet_layout(
+              "HDS packet " + std::to_string(i) +
+              " has null segment pointer(s): seg0=" +
+              std::to_string(reinterpret_cast<uintptr_t>(header_ptr)) +
+              " seg1=" +
+              std::to_string(reinterpret_cast<uintptr_t>(payload_ptr)));
         }
 
         const stem::PacketHeaderInfo header =
@@ -936,8 +993,8 @@ class FrameAssembler {
       ensure_header_scratch(static_cast<uint32_t>(n));
       burst_packet_ptrs_.resize(static_cast<size_t>(n));
       for (int i = 0; i < n; ++i) {
-        auto* ptr = static_cast<uint8_t*>(
-            daqiri::get_segment_packet_ptr(burst, 0, i));
+        auto* ptr =
+            static_cast<uint8_t*>(daqiri::get_segment_packet_ptr(burst, 0, i));
         burst_packet_ptrs_[static_cast<size_t>(i)] = ptr;
         h_burst_ptrs_[i] = (ptr == nullptr) ? nullptr : ptr + cfg_.header_size;
       }
@@ -945,8 +1002,8 @@ class FrameAssembler {
       STEM_CUDA_TRY(cudaMemcpyAsync(d_burst_ptrs_, h_burst_ptrs_,
                                     sizeof(uint8_t*) * n,
                                     cudaMemcpyHostToDevice, stream_));
-      stem::stem_extract_packet_headers(
-          d_burst_ptrs_, d_burst_headers_, static_cast<uint32_t>(n), stream_);
+      stem::stem_extract_packet_headers(d_burst_ptrs_, d_burst_headers_,
+                                        static_cast<uint32_t>(n), stream_);
       STEM_CUDA_TRY(cudaMemcpyAsync(h_burst_headers_, d_burst_headers_,
                                     sizeof(stem::PacketHeaderInfo) * n,
                                     cudaMemcpyDeviceToHost, stream_));
@@ -955,13 +1012,12 @@ class FrameAssembler {
       for (int i = 0; i < n; ++i) {
         auto* ptr = burst_packet_ptrs_[static_cast<size_t>(i)];
         if (ptr == nullptr) { continue; }
-        admit_packet(ptr, h_burst_headers_[i], holder,
-                     drops_unexpected_source);
+        admit_packet(ptr, h_burst_headers_[i], holder, drops_unexpected_source);
       }
     } else {
       for (int i = 0; i < n; ++i) {
-        auto* ptr = static_cast<uint8_t*>(
-            daqiri::get_segment_packet_ptr(burst, 0, i));
+        auto* ptr =
+            static_cast<uint8_t*>(daqiri::get_segment_packet_ptr(burst, 0, i));
         if (ptr == nullptr) { continue; }
 
         // host_pinned daqiri buffers are host-readable; read the 64B
@@ -997,8 +1053,8 @@ class FrameAssembler {
 
   uint16_t available_payload_len() const {
     return cfg_.tile_duplicate_prefix_to_simulate_payload
-        ? static_cast<uint16_t>(stem::STEM_PAYLOAD_SIZE)
-        : static_cast<uint16_t>(stem::TILE_PAYLOAD_BYTES);
+               ? static_cast<uint16_t>(stem::STEM_PAYLOAD_SIZE)
+               : static_cast<uint16_t>(stem::TILE_PAYLOAD_BYTES);
   }
 
   uint16_t packet_header_segment_len() const {
@@ -1012,7 +1068,8 @@ class FrameAssembler {
   stem::PacketHeaderInfo parse_packet_header(const uint8_t* stem_hdr) const {
     const uint16_t row_number =
         static_cast<uint16_t>(stem_hdr[stem::STEM_HDR_OFF_ROW_NUMBER_LO]) |
-        (static_cast<uint16_t>(stem_hdr[stem::STEM_HDR_OFF_ROW_NUMBER_HI]) << 8);
+        (static_cast<uint16_t>(stem_hdr[stem::STEM_HDR_OFF_ROW_NUMBER_HI])
+         << 8);
     const uint16_t source_id =
         static_cast<uint16_t>(stem_hdr[stem::STEM_HDR_OFF_SOURCE_ID_LO]) |
         (static_cast<uint16_t>(stem_hdr[stem::STEM_HDR_OFF_SOURCE_ID_HI]) << 8);
@@ -1021,8 +1078,7 @@ class FrameAssembler {
     const int32_t global_row = source_id_to_global_row(source_id, row_offset);
     uint64_t tx_epoch_us = 0;
     if (cfg_.capture_latency) {
-      std::memcpy(&tx_epoch_us,
-                  stem_hdr + stem::STEM_HDR_OFF_EPOCH_US,
+      std::memcpy(&tx_epoch_us, stem_hdr + stem::STEM_HDR_OFF_EPOCH_US,
                   sizeof(tx_epoch_us));
     }
 
@@ -1037,8 +1093,7 @@ class FrameAssembler {
   }
 
   [[noreturn]] void fail_packet_layout(const std::string& detail) const {
-    std::cerr << "stem_daqiri_rx packet layout error: " << detail << "\n";
-    std::exit(1);
+    throw std::runtime_error("stem_daqiri_rx packet layout error: " + detail);
   }
 
   void validate_packet_layout_once(daqiri::BurstParams* burst) {
@@ -1055,37 +1110,36 @@ class FrameAssembler {
                            std::to_string(burst->hdr.hdr.num_segs) +
                            " segment(s); expected at least 2");
       }
-      const uint32_t actual_header_len = static_cast<uint32_t>(
-          daqiri::get_segment_packet_length(burst, 0, 0));
-      const uint32_t actual_payload_len = static_cast<uint32_t>(
-          daqiri::get_segment_packet_length(burst, 1, 0));
-      if (actual_header_len != header_len || actual_payload_len != payload_len) {
-        fail_packet_layout(
-            "HDS split mismatch on first packet: seg0=" +
-            std::to_string(actual_header_len) + "B expected " +
-            std::to_string(header_len) + "B, seg1=" +
-            std::to_string(actual_payload_len) + "B expected " +
-            std::to_string(payload_len) + "B");
+      const uint32_t actual_header_len =
+          static_cast<uint32_t>(daqiri::get_segment_packet_length(burst, 0, 0));
+      const uint32_t actual_payload_len =
+          static_cast<uint32_t>(daqiri::get_segment_packet_length(burst, 1, 0));
+      if (actual_header_len != header_len ||
+          actual_payload_len != payload_len) {
+        fail_packet_layout("HDS split mismatch on first packet: seg0=" +
+                           std::to_string(actual_header_len) + "B expected " +
+                           std::to_string(header_len) +
+                           "B, seg1=" + std::to_string(actual_payload_len) +
+                           "B expected " + std::to_string(payload_len) + "B");
       }
       std::cout << "stem_daqiri_rx HDS layout verified: seg0="
                 << actual_header_len << "B seg1=" << actual_payload_len
                 << "B; epoch_us remains in seg0 at byte "
-                << (cfg_.header_size + stem::STEM_HDR_OFF_EPOCH_US)
-                << "\n";
+                << (cfg_.header_size + stem::STEM_HDR_OFF_EPOCH_US) << "\n";
     } else {
       if (burst->hdr.hdr.num_segs < 1) {
         fail_packet_layout("non-HDS burst has no packet segment");
       }
-      const uint32_t actual_packet_len = static_cast<uint32_t>(
-          daqiri::get_segment_packet_length(burst, 0, 0));
+      const uint32_t actual_packet_len =
+          static_cast<uint32_t>(daqiri::get_segment_packet_length(burst, 0, 0));
       const uint32_t expected_packet_len = header_len + payload_len;
       if (actual_packet_len != expected_packet_len) {
         fail_packet_layout(
             "single-segment packet length mismatch on first packet: seg0=" +
             std::to_string(actual_packet_len) + "B expected " +
-            std::to_string(expected_packet_len) +
-            "B (header+STEM header " + std::to_string(header_len) +
-            "B, payload " + std::to_string(payload_len) + "B)");
+            std::to_string(expected_packet_len) + "B (header+STEM header " +
+            std::to_string(header_len) + "B, payload " +
+            std::to_string(payload_len) + "B)");
       }
     }
 
@@ -1129,8 +1183,7 @@ class FrameAssembler {
   // dedup map: one cell per (frame, compact tile_index).
   uint64_t packet_cell_index(const PacketEntry& entry,
                              uint64_t relative_frame) const {
-    return relative_frame *
-               static_cast<uint64_t>(packet_cells_per_frame_) +
+    return relative_frame * static_cast<uint64_t>(packet_cells_per_frame_) +
            static_cast<uint64_t>(entry.tile_index);
   }
 
@@ -1163,7 +1216,8 @@ class FrameAssembler {
 
   void ensure_header_scratch(uint32_t n) {
     if (n <= burst_header_capacity_) { return; }
-    uint32_t new_capacity = burst_header_capacity_ == 0 ? 1024 : burst_header_capacity_;
+    uint32_t new_capacity =
+        burst_header_capacity_ == 0 ? 1024 : burst_header_capacity_;
     while (new_capacity < n) { new_capacity *= 2; }
 
     if (h_burst_ptrs_) { STEM_CUDA_TRY(cudaFreeHost(h_burst_ptrs_)); }
@@ -1175,31 +1229,30 @@ class FrameAssembler {
                                  sizeof(uint8_t*) * new_capacity));
     STEM_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_burst_ptrs_),
                              sizeof(uint8_t*) * new_capacity));
-    STEM_CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&h_burst_headers_),
-                                 sizeof(stem::PacketHeaderInfo) * new_capacity));
+    STEM_CUDA_TRY(
+        cudaMallocHost(reinterpret_cast<void**>(&h_burst_headers_),
+                       sizeof(stem::PacketHeaderInfo) * new_capacity));
     STEM_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_burst_headers_),
                              sizeof(stem::PacketHeaderInfo) * new_capacity));
     burst_header_capacity_ = new_capacity;
   }
 
   void sample_latency_if_needed(const stem::PacketHeaderInfo& header) {
-    if (!cfg_.capture_latency ||
-        header.source_id != 0 ||
-        header.row_offset != 0 ||
-        latencies_us_.size() >= kMaxLatencySamples ||
+    if (!cfg_.capture_latency || header.source_id != 0 ||
+        header.row_offset != 0 || latencies_us_.size() >= kMaxLatencySamples ||
         header.epoch_us == 0) {
       return;
     }
     const uint64_t now_us =
         std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
     if (now_us >= header.epoch_us) {
       latencies_us_.push_back(static_cast<int64_t>(now_us - header.epoch_us));
     }
   }
 
-  void admit_packet(uint8_t* packet_ptr,
-                    const stem::PacketHeaderInfo& header,
+  void admit_packet(uint8_t* packet_ptr, const stem::PacketHeaderInfo& header,
                     const std::shared_ptr<BurstHolder>& holder,
                     uint64_t* drops_unexpected_source) {
     if ((header.source_id >= 8) ||
@@ -1233,12 +1286,12 @@ class FrameAssembler {
 
     PacketEntry entry;
     entry.packet_ptr = packet_ptr;
-    entry.abs_frame  = abs_frame;
+    entry.abs_frame = abs_frame;
     entry.global_row = header.global_row;
     entry.tile_index = tile_index;
     entry.row_number = header.row_number;
-    entry.source_id  = header.source_id;
-    entry.holder     = holder;
+    entry.source_id = header.source_id;
+    entry.holder = holder;
     pending_packets_.push_back(std::move(entry));
 
     const uint64_t batch_end =
@@ -1250,9 +1303,11 @@ class FrameAssembler {
     if (abs_frame < current_batch_start_abs_frame_) { return; }
 
     const uint64_t relative_frame = abs_frame - current_batch_start_abs_frame_;
-    const uint64_t cell = packet_cell_index(pending_packets_.back(), relative_frame);
-    // relative_frame < frames_per_tensor and (global_row|tile_index) < cells/frame
-    // are both enforced upstream, so cell < total_cells by construction.
+    const uint64_t cell =
+        packet_cell_index(pending_packets_.back(), relative_frame);
+    // relative_frame < frames_per_tensor and (global_row|tile_index) <
+    // cells/frame are both enforced upstream, so cell < total_cells by
+    // construction.
     assert(cell < current_batch_occupied_.size());
     if (!current_batch_occupied_[cell]) {
       current_batch_occupied_[cell] = 1;
@@ -1271,8 +1326,8 @@ class FrameAssembler {
   OutputSlot* acquire_output_slot() {
     for (auto& slot : output_slots_) {
       bool expected = false;
-      if (slot->leased.compare_exchange_strong(
-              expected, true, std::memory_order_acq_rel)) {
+      if (slot->leased.compare_exchange_strong(expected, true,
+                                               std::memory_order_acq_rel)) {
         return slot.get();
       }
     }
@@ -1339,10 +1394,10 @@ class FrameAssembler {
         emit_cell_generation_[cell] = emit_generation_;
         h_pkt_ptrs_[pkts_to_gather] = read_it->packet_ptr;
         stem::PacketPlacement pl;
-        pl.global_row     = read_it->global_row;
-        pl.tile_index     = read_it->tile_index;
+        pl.global_row = read_it->global_row;
+        pl.tile_index = read_it->tile_index;
         pl.relative_frame = static_cast<uint8_t>(rel_frame);
-        pl.valid          = 1;
+        pl.valid = 1;
         h_placements_[pkts_to_gather] = pl;
         pkts_to_gather++;
       }
@@ -1355,16 +1410,18 @@ class FrameAssembler {
     OutputSlot* output_slot =
         pkts_to_gather > 0 ? acquire_output_slot() : nullptr;
     if (output_slot != nullptr) {
-      STEM_CUDA_TRY(cudaMemsetAsync(output_slot->gpu_u16, 0,
-                                    static_cast<uint64_t>(cfg_.frames_per_tensor) *
-                                    stem::FRAME_SIZE_BYTES,
-                                    stream_));
+      STEM_CUDA_TRY(
+          cudaMemsetAsync(output_slot->gpu_u16, 0,
+                          static_cast<uint64_t>(cfg_.frames_per_tensor) *
+                              stem::FRAME_SIZE_BYTES,
+                          stream_));
       STEM_CUDA_TRY(cudaMemcpyAsync(d_pkt_ptrs_, h_pkt_ptrs_,
                                     sizeof(uint8_t*) * pkts_to_gather,
                                     cudaMemcpyHostToDevice, stream_));
-      STEM_CUDA_TRY(cudaMemcpyAsync(d_placements_, h_placements_,
-                                    sizeof(stem::PacketPlacement) * pkts_to_gather,
-                                    cudaMemcpyHostToDevice, stream_));
+      STEM_CUDA_TRY(
+          cudaMemcpyAsync(d_placements_, h_placements_,
+                          sizeof(stem::PacketPlacement) * pkts_to_gather,
+                          cudaMemcpyHostToDevice, stream_));
 
       // Match Holoscan's contract: tile_duplicate_prefix_to_simulate_payload
       // fully determines whether each packet exposes a 7680 B test payload or
@@ -1372,14 +1429,9 @@ class FrameAssembler {
       // payload byte 0; non-HDS packet_ptrs point at the wire packet base.
       stem::stem_gather_tile_packets_by_placement(
           d_pkt_ptrs_, d_placements_, output_slot->gpu_u16,
-          available_payload_len(),
-          gather_header_len(),
-          pkts_to_gather,
-          cfg_.frames_per_tensor,
-          stem::FRAME_HEIGHT,
-          stem::FRAME_WIDTH,
-          cfg_.tile_duplicate_prefix_to_simulate_payload,
-          stream_);
+          available_payload_len(), gather_header_len(), pkts_to_gather,
+          cfg_.frames_per_tensor, stem::FRAME_HEIGHT, stem::FRAME_WIDTH,
+          cfg_.tile_duplicate_prefix_to_simulate_payload, stream_);
 
       pipeline_->process_slot(output_slot, cfg_.frames_per_tensor, stream_);
       output_slot->batch_index = emitted_batches_;
@@ -1409,7 +1461,8 @@ class FrameAssembler {
   }
 
   void rebuild_window_counts() {
-    std::fill(current_batch_occupied_.begin(), current_batch_occupied_.end(), 0);
+    std::fill(current_batch_occupied_.begin(), current_batch_occupied_.end(),
+              0);
     current_batch_unique_packets_ = 0;
     future_packet_count_ = 0;
     const uint64_t batch_end =
@@ -1418,7 +1471,8 @@ class FrameAssembler {
       if (e.abs_frame >= batch_end) {
         future_packet_count_++;
       } else if (e.abs_frame >= current_batch_start_abs_frame_) {
-        const uint64_t relative_frame = e.abs_frame - current_batch_start_abs_frame_;
+        const uint64_t relative_frame =
+            e.abs_frame - current_batch_start_abs_frame_;
         const uint64_t cell = packet_cell_index(e, relative_frame);
         // cell < total_cells by construction (see admit_packet).
         assert(cell < current_batch_occupied_.size());
@@ -1432,30 +1486,30 @@ class FrameAssembler {
 
   const StemRxConfig& cfg_;
   std::shared_ptr<FramePipeline> pipeline_;
-  const uint32_t      expected_source_count_;
-  const uint32_t      rows_per_tensor_;
-  const uint32_t      packet_cells_per_frame_;
-  const uint32_t      placement_capacity_;
-  const uint32_t      expected_packets_per_batch_;
-  uint8_t**           h_pkt_ptrs_ = nullptr;
-  uint8_t**           d_pkt_ptrs_ = nullptr;
+  const uint32_t expected_source_count_;
+  const uint32_t rows_per_tensor_;
+  const uint32_t packet_cells_per_frame_;
+  const uint32_t placement_capacity_;
+  const uint32_t expected_packets_per_batch_;
+  uint8_t** h_pkt_ptrs_ = nullptr;
+  uint8_t** d_pkt_ptrs_ = nullptr;
   stem::PacketPlacement* h_placements_ = nullptr;
   stem::PacketPlacement* d_placements_ = nullptr;
-  cudaStream_t        stream_ = nullptr;
+  cudaStream_t stream_ = nullptr;
 
   std::vector<PacketEntry> pending_packets_;
   std::vector<uint8_t> current_batch_occupied_;
   std::vector<uint32_t> emit_cell_generation_;
   uint32_t emit_generation_ = 1;
-  uint32_t   current_batch_unique_packets_ = 0;
-  uint32_t   future_packet_count_ = 0;
-  uint64_t   current_batch_start_abs_frame_ = 0;
-  uint64_t   frame_unwrap_ref_ = 0;
-  bool       stream_synced_ = false;
-  bool       packet_layout_checked_ = false;
-  uint64_t   incomplete_batches_ = 0;
-  uint64_t   incomplete_missing_total_ = 0;
-  uint64_t   incomplete_missing_max_ = 0;
+  uint32_t current_batch_unique_packets_ = 0;
+  uint32_t future_packet_count_ = 0;
+  uint64_t current_batch_start_abs_frame_ = 0;
+  uint64_t frame_unwrap_ref_ = 0;
+  bool stream_synced_ = false;
+  bool packet_layout_checked_ = false;
+  uint64_t incomplete_batches_ = 0;
+  uint64_t incomplete_missing_total_ = 0;
+  uint64_t incomplete_missing_max_ = 0;
 
   std::vector<std::unique_ptr<OutputSlot>> output_slots_;
   uint64_t output_pool_drops_ = 0;
@@ -1482,120 +1536,141 @@ class FrameAssembler {
 // ---------------------------------------------------------------------------
 // RX worker.
 // ---------------------------------------------------------------------------
-void rx_worker(const StemRxConfig& cfg,
-               std::shared_ptr<FramePipeline> pipeline,
-               std::atomic<bool>& stop) {
-  const int port_id = daqiri::get_port_id(cfg.interface_name);
-  if (port_id < 0) {
-    std::cerr << "Invalid RX interface_name: " << cfg.interface_name << "\n";
-    stop.store(true);
-    return;
-  }
+struct RxRunStats {
+  std::atomic<uint64_t> worker_errors{0};
+  std::atomic<uint64_t> output_pool_drops{0};
+  std::atomic<uint64_t> frames_assembled{0};
+};
 
-  FrameAssembler asm_state(cfg, std::move(pipeline));
-
-  uint64_t total_pkts = 0;
-  uint64_t total_bytes = 0;
-  uint64_t drops_unexpected_source = 0;
-  uint64_t frames_assembled = 0;
-  uint64_t bursts_polled = 0;
-
-  const auto start = std::chrono::steady_clock::now();
-  while (!stop.load() && !g_stop_requested) {
-    if (cfg.total_time_to_recv_s >= 0.0) {
-      const auto elapsed = std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - start).count();
-      if (elapsed >= cfg.total_time_to_recv_s) { break; }
+void rx_worker(const StemRxConfig& cfg, std::shared_ptr<FramePipeline> pipeline,
+               std::atomic<bool>& stop, RxRunStats& run_stats) {
+  try {
+    const int port_id = daqiri::get_port_id(cfg.interface_name);
+    if (port_id < 0) {
+      std::cerr << "Invalid RX interface_name: " << cfg.interface_name << "\n";
+      run_stats.worker_errors.fetch_add(1, std::memory_order_relaxed);
+      stop.store(true);
+      return;
     }
 
-    const auto num_rx_queues =
-        static_cast<int>(daqiri::get_num_rx_queues(port_id));
-    bool got_any = false;
-    for (int q = 0; q < num_rx_queues; ++q) {
-      daqiri::BurstParams* burst = nullptr;
-      if (daqiri::get_rx_burst(&burst, port_id, q) !=
-              daqiri::Status::SUCCESS ||
-          burst == nullptr) {
-        continue;
+    FrameAssembler asm_state(cfg, std::move(pipeline));
+
+    uint64_t total_pkts = 0;
+    uint64_t total_bytes = 0;
+    uint64_t drops_unexpected_source = 0;
+    uint64_t frames_assembled = 0;
+    uint64_t bursts_polled = 0;
+
+    const auto start = std::chrono::steady_clock::now();
+    while (!stop.load() && !g_stop_requested) {
+      if (cfg.total_time_to_recv_s >= 0.0) {
+        const auto elapsed = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+        if (elapsed >= cfg.total_time_to_recv_s) { break; }
       }
-      got_any = true;
-      ++bursts_polled;
-      asm_state.process_burst(burst,
-                              &total_pkts, &total_bytes,
-                              &drops_unexpected_source,
-                              &frames_assembled);
+
+      const auto num_rx_queues =
+          static_cast<int>(daqiri::get_num_rx_queues(port_id));
+      bool got_any = false;
+      for (int q = 0; q < num_rx_queues; ++q) {
+        daqiri::BurstParams* burst = nullptr;
+        if (daqiri::get_rx_burst(&burst, port_id, q) !=
+                daqiri::Status::SUCCESS ||
+            burst == nullptr) {
+          continue;
+        }
+        got_any = true;
+        ++bursts_polled;
+        asm_state.process_burst(burst, &total_pkts, &total_bytes,
+                                &drops_unexpected_source, &frames_assembled);
+      }
+      if (!got_any) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+      }
     }
-    if (!got_any) {
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
+
+    asm_state.flush(&frames_assembled);
+
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    const double gbps =
+        secs > 0 ? static_cast<double>(total_bytes) * 8.0 / (secs * 1e9) : 0.0;
+    const double fps =
+        secs > 0 ? static_cast<double>(frames_assembled) / secs : 0.0;
+
+    std::printf("stem_daqiri_rx complete:\n");
+    std::printf("  duration         : %.3f s\n", secs);
+    std::printf("  bursts polled    : %lu\n",
+                static_cast<unsigned long>(bursts_polled));
+    std::printf("  packets received : %lu\n",
+                static_cast<unsigned long>(total_pkts));
+    std::printf("  bytes received   : %lu\n",
+                static_cast<unsigned long>(total_bytes));
+    std::printf("  achieved Gbps    : %.3f\n", gbps);
+    std::printf("  frames assembled : %lu  (fps %.3f)\n",
+                static_cast<unsigned long>(frames_assembled), fps);
+    std::printf("  unexpected source: %lu\n",
+                static_cast<unsigned long>(drops_unexpected_source));
+    std::printf("  tile dropped pkts: %lu  (row_offset >= 120)\n",
+                static_cast<unsigned long>(asm_state.tile_packets_ignored()));
+    // The previous "out-of-window" counter was a bug -- those packets are
+    // now retained across batch boundaries. Report 0 explicitly so any
+    // existing parser that grepped that line still works.
+    std::printf("  out-of-window    : 0\n");
+    std::printf("  incomplete batches: %lu\n",
+                static_cast<unsigned long>(asm_state.incomplete_batches()));
+    std::printf(
+        "  incomplete missing: %lu\n",
+        static_cast<unsigned long>(asm_state.incomplete_missing_total()));
+    std::printf("  incomplete max    : %lu\n",
+                static_cast<unsigned long>(asm_state.incomplete_missing_max()));
+    std::printf("  sink pool drops  : %lu\n",
+                static_cast<unsigned long>(asm_state.output_pool_drops()));
+    std::printf("  sink queued      : %lu\n",
+                static_cast<unsigned long>(asm_state.sink_queued()));
+    std::printf("  sink written     : %lu\n",
+                static_cast<unsigned long>(asm_state.sink_written()));
+    std::printf("  sink errors      : %lu\n",
+                static_cast<unsigned long>(asm_state.sink_errors()));
+
+    if (cfg.capture_latency) {
+      auto& lat = asm_state.latencies_us();
+      if (lat.empty()) {
+        std::printf("  latency samples  : 0 (no epoch_us stamps received)\n");
+      } else {
+        std::sort(lat.begin(), lat.end());
+        const auto pct = [&](double q) {
+          const size_t idx = std::min(
+              lat.size() - 1, static_cast<size_t>(q * (lat.size() - 1)));
+          return lat[idx];
+        };
+        const int64_t p50 = pct(0.50);
+        const int64_t p90 = pct(0.90);
+        const int64_t p99 = pct(0.99);
+        const int64_t p999 = pct(0.999);
+        std::printf("  latency samples  : %lu\n",
+                    static_cast<unsigned long>(lat.size()));
+        std::printf("  latency p50/p90/p99/p999 us : %ld / %ld / %ld / %ld\n",
+                    static_cast<long>(p50), static_cast<long>(p90),
+                    static_cast<long>(p99), static_cast<long>(p999));
+      }
     }
-  }
-
-  asm_state.flush(&frames_assembled);
-
-  const double secs =
-      std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - start).count();
-  const double gbps = secs > 0
-      ? static_cast<double>(total_bytes) * 8.0 / (secs * 1e9)
-      : 0.0;
-  const double fps = secs > 0
-      ? static_cast<double>(frames_assembled) / secs
-      : 0.0;
-
-  std::printf("stem_daqiri_rx complete:\n");
-  std::printf("  duration         : %.3f s\n", secs);
-  std::printf("  bursts polled    : %lu\n", static_cast<unsigned long>(bursts_polled));
-  std::printf("  packets received : %lu\n", static_cast<unsigned long>(total_pkts));
-  std::printf("  bytes received   : %lu\n", static_cast<unsigned long>(total_bytes));
-  std::printf("  achieved Gbps    : %.3f\n", gbps);
-  std::printf("  frames assembled : %lu  (fps %.3f)\n",
-              static_cast<unsigned long>(frames_assembled), fps);
-  std::printf("  unexpected source: %lu\n",
-              static_cast<unsigned long>(drops_unexpected_source));
-  std::printf("  tile dropped pkts: %lu  (row_offset >= 120)\n",
-              static_cast<unsigned long>(asm_state.tile_packets_ignored()));
-  // The previous "out-of-window" counter was a bug -- those packets are
-  // now retained across batch boundaries. Report 0 explicitly so any
-  // existing parser that grepped that line still works.
-  std::printf("  out-of-window    : 0\n");
-  std::printf("  incomplete batches: %lu\n",
-              static_cast<unsigned long>(asm_state.incomplete_batches()));
-  std::printf("  incomplete missing: %lu\n",
-              static_cast<unsigned long>(asm_state.incomplete_missing_total()));
-  std::printf("  incomplete max    : %lu\n",
-              static_cast<unsigned long>(asm_state.incomplete_missing_max()));
-  std::printf("  sink pool drops  : %lu\n",
-              static_cast<unsigned long>(asm_state.output_pool_drops()));
-  std::printf("  sink queued      : %lu\n",
-              static_cast<unsigned long>(asm_state.sink_queued()));
-  std::printf("  sink written     : %lu\n",
-              static_cast<unsigned long>(asm_state.sink_written()));
-  std::printf("  sink errors      : %lu\n",
-              static_cast<unsigned long>(asm_state.sink_errors()));
-
-  if (cfg.capture_latency) {
-    auto& lat = asm_state.latencies_us();
-    if (lat.empty()) {
-      std::printf("  latency samples  : 0 (no epoch_us stamps received)\n");
-    } else {
-      std::sort(lat.begin(), lat.end());
-      const auto pct = [&](double q) {
-        const size_t idx = std::min(lat.size() - 1,
-            static_cast<size_t>(q * (lat.size() - 1)));
-        return lat[idx];
-      };
-      const int64_t p50 = pct(0.50);
-      const int64_t p90 = pct(0.90);
-      const int64_t p99 = pct(0.99);
-      const int64_t p999 = pct(0.999);
-      std::printf("  latency samples  : %lu\n",
-                  static_cast<unsigned long>(lat.size()));
-      std::printf("  latency p50/p90/p99/p999 us : %ld / %ld / %ld / %ld\n",
-                  static_cast<long>(p50),
-                  static_cast<long>(p90),
-                  static_cast<long>(p99),
-                  static_cast<long>(p999));
-    }
+    run_stats.output_pool_drops.fetch_add(asm_state.output_pool_drops(),
+                                          std::memory_order_relaxed);
+    run_stats.frames_assembled.fetch_add(frames_assembled,
+                                         std::memory_order_relaxed);
+  } catch (const std::exception& e) {
+    std::cerr << "stem_daqiri_rx worker failed on '" << cfg.interface_name
+              << "': " << e.what() << "\n";
+    run_stats.worker_errors.fetch_add(1, std::memory_order_relaxed);
+    stop.store(true);
+  } catch (...) {
+    std::cerr << "stem_daqiri_rx worker failed on '" << cfg.interface_name
+              << "': unknown exception\n";
+    run_stats.worker_errors.fetch_add(1, std::memory_order_relaxed);
+    stop.store(true);
   }
 }
 
@@ -1608,11 +1683,11 @@ void print_rx_start(const StemRxConfig& cfg) {
   std::cout << "stem_daqiri_rx starting on '" << cfg.interface_name
             << "' frames_per_tensor=" << cfg.frames_per_tensor
             << " header_size=" << cfg.header_size
-            << " payload_size=" << cfg.payload_size
-            << " gpu_header_extract=" << (cfg.gpu_header_extract ? "true" : "false")
-            << " hds=" << (cfg.hds ? "true" : "false")
-            << " tile_dup_prefix="
-            << (cfg.tile_duplicate_prefix_to_simulate_payload ? "true" : "false")
+            << " payload_size=" << cfg.payload_size << " gpu_header_extract="
+            << (cfg.gpu_header_extract ? "true" : "false")
+            << " hds=" << (cfg.hds ? "true" : "false") << " tile_dup_prefix="
+            << (cfg.tile_duplicate_prefix_to_simulate_payload ? "true"
+                                                              : "false")
             << " gather_available_payload_len=" << gather_available_payload_len
             << " processor.noop=" << (cfg.processor.noop ? "true" : "false")
             << " subtract_dark_frame="
@@ -1624,8 +1699,7 @@ void print_rx_start(const StemRxConfig& cfg) {
             << " writer.noop=" << (cfg.writer.noop ? "true" : "false")
             << " writer.num_concurrent=" << cfg.writer.num_concurrent
             << " source_mask=0x" << std::hex << cfg.expected_source_mask
-            << std::dec
-            << " duration=" << cfg.total_time_to_recv_s << " s\n";
+            << std::dec << " duration=" << cfg.total_time_to_recv_s << " s\n";
 }
 
 OutputSlot* acquire_replay_slot(
@@ -1633,8 +1707,8 @@ OutputSlot* acquire_replay_slot(
   for (;;) {
     for (const auto& slot : slots) {
       bool expected = false;
-      if (slot->leased.compare_exchange_strong(
-              expected, true, std::memory_order_acq_rel)) {
+      if (slot->leased.compare_exchange_strong(expected, true,
+                                               std::memory_order_acq_rel)) {
         return slot.get();
       }
     }
@@ -1653,9 +1727,7 @@ void wait_for_replay_slots(
         break;
       }
     }
-    if (busy) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    if (busy) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
   }
 }
 
@@ -1685,16 +1757,17 @@ int run_hdf5_replay(const YAML::Node& root) {
     throw std::runtime_error("replayer.start_frame is outside the dataset");
   }
   const H5::DataType dataset_type = dataset.getDataType();
-  if (dataset_type.getClass() != H5T_INTEGER ||
-      dataset_type.getSize() != sizeof(uint16_t)) {
+  const bool dataset_uint16 = dataset_type.getClass() == H5T_INTEGER &&
+                              dataset_type.getSize() == sizeof(uint16_t);
+  const bool dataset_float32 = dataset_type.getClass() == H5T_FLOAT &&
+                               dataset_type.getSize() == sizeof(float);
+  if (!dataset_uint16 && !dataset_float32) {
     throw std::runtime_error(
-        "DAQIRI HDF5 replay currently expects uint16 [frames,H,W] input");
+        "DAQIRI HDF5 replay expects uint16 or float32 [frames,H,W] input");
   }
 
   auto pipeline = std::make_shared<FramePipeline>(
-      processor,
-      writer,
-      static_cast<uint32_t>(dims[1]),
+      processor, writer, static_cast<uint32_t>(dims[1]),
       static_cast<uint32_t>(dims[2]));
 
   cudaStream_t stream = nullptr;
@@ -1706,11 +1779,15 @@ int run_hdf5_replay(const YAML::Node& root) {
   const uint64_t frame_pixels = dims[1] * dims[2];
   for (uint32_t i = 0; i < slot_count; ++i) {
     auto slot = std::make_unique<OutputSlot>();
-    STEM_CUDA_TRY(cudaMalloc(&slot->gpu_u16,
-                             static_cast<uint64_t>(replayer.frames_per_tensor) *
-                             frame_pixels * sizeof(uint16_t)));
-    pipeline->allocate_slot_buffers(slot.get(), replayer.frames_per_tensor);
-    STEM_CUDA_TRY(cudaEventCreateWithFlags(&slot->ready, cudaEventDisableTiming));
+    if (dataset_uint16) {
+      STEM_CUDA_TRY(cudaMalloc(
+          &slot->gpu_u16, static_cast<uint64_t>(replayer.frames_per_tensor) *
+                              frame_pixels * sizeof(uint16_t)));
+    }
+    pipeline->allocate_slot_buffers(slot.get(), replayer.frames_per_tensor,
+                                    dataset_float32);
+    STEM_CUDA_TRY(
+        cudaEventCreateWithFlags(&slot->ready, cudaEventDisableTiming));
     slots.push_back(std::move(slot));
   }
 
@@ -1720,7 +1797,9 @@ int run_hdf5_replay(const YAML::Node& root) {
   uint64_t emitted_frames = 0;
   uint64_t current_frame = replayer.start_frame;
   uint64_t emitted_batches = 0;
-  std::vector<uint16_t> host_buffer;
+  std::vector<uint8_t> host_buffer;
+  const size_t element_bytes =
+      dataset_float32 ? sizeof(float) : sizeof(uint16_t);
 
   const auto start = std::chrono::steady_clock::now();
   while (emitted_frames < target_frames && !g_stop_requested) {
@@ -1734,10 +1813,8 @@ int run_hdf5_replay(const YAML::Node& root) {
 
     const uint64_t frames_left_in_file = dims[0] - current_frame;
     const uint64_t frames_left_target = target_frames - emitted_frames;
-    const uint32_t batch_frames = static_cast<uint32_t>(
-        std::min<uint64_t>({replayer.frames_per_tensor,
-                            frames_left_in_file,
-                            frames_left_target}));
+    const uint32_t batch_frames = static_cast<uint32_t>(std::min<uint64_t>(
+        {replayer.frames_per_tensor, frames_left_in_file, frames_left_target}));
     if (batch_frames == 0) { break; }
 
     hsize_t offset[3] = {current_frame, 0, 0};
@@ -1745,19 +1822,19 @@ int run_hdf5_replay(const YAML::Node& root) {
     filespace.selectHyperslab(H5S_SELECT_SET, count, offset);
     H5::DataSpace memspace(3, count);
     host_buffer.resize(static_cast<size_t>(batch_frames) *
-                       static_cast<size_t>(frame_pixels));
+                       static_cast<size_t>(frame_pixels) * element_bytes);
     dataset.read(host_buffer.data(),
-                 H5::PredType::NATIVE_UINT16,
-                 memspace,
-                 filespace);
+                 dataset_float32 ? H5::PredType::NATIVE_FLOAT
+                                 : H5::PredType::NATIVE_UINT16,
+                 memspace, filespace);
 
     OutputSlot* slot = acquire_replay_slot(slots);
-    STEM_CUDA_TRY(cudaMemcpyAsync(slot->gpu_u16,
-                                  host_buffer.data(),
-                                  host_buffer.size() * sizeof(uint16_t),
-                                  cudaMemcpyHostToDevice,
-                                  stream));
-    pipeline->process_slot(slot, batch_frames, stream);
+    STEM_CUDA_TRY(cudaMemcpyAsync(dataset_float32
+                                      ? static_cast<void*>(slot->gpu_float)
+                                      : static_cast<void*>(slot->gpu_u16),
+                                  host_buffer.data(), host_buffer.size(),
+                                  cudaMemcpyHostToDevice, stream));
+    pipeline->process_slot(slot, batch_frames, stream, dataset_float32);
     slot->batch_index = emitted_batches++;
     STEM_CUDA_TRY(cudaEventRecord(slot->ready, stream));
     pipeline->enqueue(slot);
@@ -1778,11 +1855,10 @@ int run_hdf5_replay(const YAML::Node& root) {
   if (stream) { cudaStreamDestroy(stream); }
 
   const double secs =
-      std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - start).count();
-  const double fps = secs > 0
-      ? static_cast<double>(emitted_frames) / secs
-      : 0.0;
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+          .count();
+  const double fps =
+      secs > 0 ? static_cast<double>(emitted_frames) / secs : 0.0;
   std::printf("stem_daqiri_hdf5_replay complete:\n");
   std::printf("  duration         : %.3f s\n", secs);
   std::printf("  frames replayed  : %lu  (fps %.3f)\n",
@@ -1818,9 +1894,7 @@ int main(int argc, char** argv) {
     const auto root = YAML::LoadFile(argv[1]);
     const std::string source =
         root["source"].as<std::string>(std::string("network"));
-    if (source == "hdf5") {
-      return run_hdf5_replay(root);
-    }
+    if (source == "hdf5") { return run_hdf5_replay(root); }
     if (source != "network") {
       throw std::runtime_error("source must be 'network' or 'hdf5'");
     }
@@ -1832,13 +1906,9 @@ int main(int argc, char** argv) {
     }
 
     auto pipeline = std::make_shared<FramePipeline>(
-        cfgs.front().processor,
-        cfgs.front().writer,
-        stem::FRAME_HEIGHT,
+        cfgs.front().processor, cfgs.front().writer, stem::FRAME_HEIGHT,
         stem::FRAME_WIDTH);
-    if (pipeline->errors() > 0) {
-      return 1;
-    }
+    if (pipeline->errors() > 0) { return 1; }
 
     if (daqiri::daqiri_init(argv[1]) != daqiri::Status::SUCCESS) {
       std::cerr << "daqiri_init failed for " << argv[1] << "\n";
@@ -1846,16 +1916,28 @@ int main(int argc, char** argv) {
     }
 
     std::atomic<bool> stop{false};
+    RxRunStats run_stats;
     std::vector<std::thread> threads;
     threads.reserve(cfgs.size());
     for (const auto& cfg : cfgs) {
-      threads.emplace_back(rx_worker, cfg, pipeline, std::ref(stop));
+      threads.emplace_back(rx_worker, cfg, pipeline, std::ref(stop),
+                           std::ref(run_stats));
     }
     for (auto& t : threads) { t.join(); }
 
     daqiri::print_stats();
     daqiri::shutdown();
-    return pipeline->errors() == 0 ? 0 : 1;
+    if (run_stats.worker_errors.load(std::memory_order_relaxed) > 0 ||
+        run_stats.output_pool_drops.load(std::memory_order_relaxed) > 0 ||
+        pipeline->errors() > 0) {
+      std::cerr << "stem_daqiri_rx failed: worker_errors="
+                << run_stats.worker_errors.load(std::memory_order_relaxed)
+                << " output_pool_drops="
+                << run_stats.output_pool_drops.load(std::memory_order_relaxed)
+                << " sink_errors=" << pipeline->errors() << "\n";
+      return 1;
+    }
+    return 0;
   } catch (const std::exception& e) {
     std::cerr << "stem_daqiri_rx failed: " << e.what() << "\n";
     return 1;
