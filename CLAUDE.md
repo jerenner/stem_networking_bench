@@ -56,7 +56,7 @@ Build the daqiri base image and then the project image on the target machine.
 # 1) One-time base image: daqiri + PyTorch + patched DPDK 25.11 + CUDA, at /opt/daqiri.
 cd third_party/daqiri && \
     IMAGE_TAG=daqiri-torch:local BASE_IMAGE=torch BASE_TARGET=dpdk \
-    DAQIRI_MGR="dpdk" scripts/build-container.sh
+    DAQIRI_ENGINE="dpdk" scripts/build-container.sh
 cd ../..
 
 # 2) stem_daqiri image. Phase flags opt into the TX/RX binaries (both default OFF).

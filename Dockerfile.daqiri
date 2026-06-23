@@ -10,7 +10,7 @@
 #
 #     cd third_party/daqiri && \
 #       IMAGE_TAG=daqiri-torch:local BASE_IMAGE=torch BASE_TARGET=dpdk \
-#       DAQIRI_MGR="dpdk" \
+#       DAQIRI_ENGINE="dpdk" \
 #       scripts/build-container.sh
 #
 # That produces daqiri-torch:local: PyTorch 26.01 + patched DPDK 25.11 +
@@ -35,7 +35,7 @@
 #
 # Build args:
 #   DAQIRI_BASE              Base image (default daqiri-torch:local).
-#   DAQIRI_MGR               daqiri manager backends to compile in (default dpdk).
+#   DAQIRI_ENGINE            daqiri engine backends to compile in (default dpdk).
 #   STEM_BUILD_TYPE          CMake build type (default Release).
 #   STEM_DAQIRI_BUILD_TX     ON to build the TX binary (Phase 1+).
 #   STEM_DAQIRI_BUILD_RX     ON to build the RX binary (Phase 2+).
@@ -46,7 +46,7 @@ ARG DAQIRI_BASE=daqiri-torch:local
 
 FROM ${DAQIRI_BASE} AS stem-daqiri-build
 
-ARG DAQIRI_MGR="dpdk"
+ARG DAQIRI_ENGINE="dpdk"
 ARG STEM_BUILD_TYPE=Release
 ARG STEM_DAQIRI_BUILD_TX=OFF
 ARG STEM_DAQIRI_BUILD_RX=OFF
@@ -69,7 +69,7 @@ RUN rm -rf /workspace/stem/cpp_daqiri/build \
              -B /workspace/stem/cpp_daqiri/build \
              -G Ninja \
              -DCMAKE_BUILD_TYPE=${STEM_BUILD_TYPE} \
-             -DDAQIRI_MGR="${DAQIRI_MGR}" \
+             -DDAQIRI_ENGINE="${DAQIRI_ENGINE}" \
              -DSTEM_DAQIRI_BUILD_TX=${STEM_DAQIRI_BUILD_TX} \
              -DSTEM_DAQIRI_BUILD_RX=${STEM_DAQIRI_BUILD_RX} \
              -DSTEM_DAQIRI_ENABLE_HDF5=${STEM_DAQIRI_ENABLE_HDF5} \

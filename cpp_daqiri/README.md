@@ -29,7 +29,7 @@ Build the daqiri base image once on the target machine:
 ```bash
 cd third_party/daqiri
 IMAGE_TAG=daqiri-torch:local BASE_IMAGE=torch BASE_TARGET=dpdk \
-    DAQIRI_MGR="dpdk" scripts/build-container.sh
+    DAQIRI_ENGINE="dpdk" scripts/build-container.sh
 cd ../..
 ```
 

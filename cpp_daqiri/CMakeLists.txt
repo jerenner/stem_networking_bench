@@ -61,8 +61,12 @@ endif()
 set(DAQIRI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(DAQIRI_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
-if(NOT DEFINED DAQIRI_MGR)
-  set(DAQIRI_MGR "dpdk" CACHE STRING "daqiri manager backends" FORCE)
+if(DEFINED DAQIRI_MGR AND NOT DEFINED DAQIRI_ENGINE)
+  # Older daqiri used DAQIRI_MGR; current daqiri uses DAQIRI_ENGINE.
+  set(DAQIRI_ENGINE "${DAQIRI_MGR}" CACHE STRING "daqiri engine backends" FORCE)
+endif()
+if(NOT DEFINED DAQIRI_ENGINE)
+  set(DAQIRI_ENGINE "dpdk" CACHE STRING "daqiri engine backends" FORCE)
 endif()
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/daqiri
