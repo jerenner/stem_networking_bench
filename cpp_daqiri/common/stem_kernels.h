@@ -22,6 +22,8 @@
  *
  * Phase 3 (processor) uses:
  *   - stem_dark_correct_uint16_to_float (port of dark_correct_uint16_to_float)
+ *   - stem_compute_frame_mean_float / stem_apply_dynamic_half_column_mask_float
+ *   - stem_sum_frames_float_to_frame
  */
 #pragma once
 
@@ -159,5 +161,29 @@ void stem_dark_correct_uint16_to_float(const uint16_t* input,
                                        bool subtract_dark,
                                        bool apply_valid_pixel_mask,
                                        cudaStream_t stream);
+
+void stem_compute_frame_mean_float(const float* input,
+                                   float* mean,
+                                   uint32_t frames,
+                                   uint32_t height,
+                                   uint32_t width,
+                                   cudaStream_t stream);
+
+void stem_apply_dynamic_half_column_mask_float(float* input,
+                                               const float* batch_mean,
+                                               uint32_t frames,
+                                               uint32_t height,
+                                               uint32_t width,
+                                               uint32_t median_window_pixels,
+                                               float threshold_ratio,
+                                               float threshold_offset,
+                                               cudaStream_t stream);
+
+void stem_sum_frames_float_to_frame(const float* input,
+                                    float* output,
+                                    uint32_t frames,
+                                    uint32_t height,
+                                    uint32_t width,
+                                    cudaStream_t stream);
 
 }  // namespace stem

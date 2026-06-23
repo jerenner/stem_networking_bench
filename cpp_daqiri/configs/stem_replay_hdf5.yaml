@@ -1,0 +1,30 @@
+%YAML 1.2
+---
+source: "hdf5"
+
+replayer:
+  filepath: "/tmp/stem_input.h5"
+  dataset_name: "/frames"
+  # DAQIRI replay is finite; repeat:true is rejected.
+  repeat: false
+  start_frame: 0
+  frames_per_tensor: 128
+  count: 128
+
+processor:
+  noop: true
+  subtract_dark_frame: false
+  dark_frame_path: ""
+  dark_frame_dataset: "/processed"
+  apply_valid_pixel_mask: false
+  valid_pixel_mask_dataset: "/valid_pixel_mask"
+  apply_dynamic_half_column_mask: false
+  dynamic_mask_median_window_pixels: 31
+  dynamic_mask_threshold_ratio: 1.0
+  dynamic_mask_threshold_offset: 500.0
+
+writer:
+  filepath: "/tmp/stem_replay_out.h5"
+  dataset_name: "/processed"
+  noop: false
+  num_concurrent: 3

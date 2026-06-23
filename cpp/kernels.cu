@@ -162,6 +162,7 @@ __global__ void extract_packet_headers_kernel(uint8_t** src_ptrs,
   PacketHeaderInfo header{};
   header.source_id = 0xFFFF;
   header.global_row = -1;
+  header.epoch_us = 0;
 
   uint8_t* src = src_ptrs[pkt_idx];
   if (src != nullptr) {
@@ -171,6 +172,9 @@ __global__ void extract_packet_headers_kernel(uint8_t** src_ptrs,
     header.row_offset = header.row_number % 128;
     header.global_row = static_cast<int16_t>(
         source_id_to_global_row(header.source_id, header.row_offset));
+    for (uint32_t i = 0; i < sizeof(uint64_t); ++i) {
+      header.epoch_us |= static_cast<uint64_t>(src[16 + i]) << (i * 8);
+    }
   }
 
   headers[pkt_idx] = header;

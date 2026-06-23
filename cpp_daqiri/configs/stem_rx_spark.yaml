@@ -18,6 +18,8 @@
 #
 %YAML 1.2
 ---
+source: "network"
+
 daqiri:
   cfg:
     version: 1
@@ -32,9 +34,9 @@ daqiri:
       kind: "host_pinned"
       affinity: 0
       # 262144 mbufs * 8064 bytes ~= 2 GiB of host-pinned. With
-      # frames_per_tensor=16 and ~1024 pkts/frame the worst-case in-flight
-      # set is 16*1024 + slack ~= 17K mbufs, so 262144 gives a generous
-      # 15x safety margin and absorbs bursty TX without dropping.
+      # frames_per_tensor=128 and 960 tile pkts/frame the worst-case in-flight
+      # set is ~123K mbufs plus slack, so 262144 gives enough headroom for
+      # parity sweeps.
       num_bufs: 262144
       buf_size: 8064   # >= packet size 7786
 
@@ -62,10 +64,7 @@ daqiri:
 
 stem_rx:
   interface_name: "rx_port"
-  # 16 frames per emit -> ~16384 packets per batch window, well within the
-  # 262144-mbuf pool. The Phase 3 parity sweep can override this back to
-  # 128 once we've separated the GPU processor from the poll loop.
-  frames_per_tensor: 16
+  frames_per_tensor: 128
   # Wire layout matches stem_daqiri_tx:
   #   header_size = Eth(14)+IPv4(20)+UDP(8) = 42
   #   payload_size = STEM 7680B row payload
@@ -81,13 +80,6 @@ stem_rx:
   # p50/p90/p99/p999 at end.
   capture_latency: true
 
-  # Phase 3 processor stage. When subtract_dark is true the kernel runs
-  # with a constant 0 dark frame and 1.0 mask -- enough GPU work to mirror
-  # the Holoscan processor's pipeline depth without needing a real dark
-  # frame file.
-  subtract_dark: true
-  apply_valid_pixel_mask: true
-
   # Tile readout is the only reassembly mode now (mirrors upstream/tiling).
   # The daqiri test TX still emits 128 rows/source @ 7680 B; the RX maps
   # row_offset [0,120) into compact tile slots, drops the 8 extra rows per
@@ -96,3 +88,15 @@ stem_rx:
   # real FPGA source that emits full 4096-sample tile payloads, set
   # tile_duplicate_prefix_to_simulate_payload: false.
   tile_duplicate_prefix_to_simulate_payload: true
+
+processor:
+  noop: true
+  subtract_dark_frame: false
+  dark_frame_path: ""
+  dark_frame_dataset: "/processed"
+  apply_valid_pixel_mask: false
+  valid_pixel_mask_dataset: "/valid_pixel_mask"
+  apply_dynamic_half_column_mask: false
+  dynamic_mask_median_window_pixels: 31
+  dynamic_mask_threshold_ratio: 1.0
+  dynamic_mask_threshold_offset: 500.0

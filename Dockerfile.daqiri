@@ -40,6 +40,7 @@
 #   STEM_DAQIRI_BUILD_TX     ON to build the TX binary (Phase 1+).
 #   STEM_DAQIRI_BUILD_RX     ON to build the RX binary (Phase 2+).
 #   STEM_DAQIRI_ENABLE_HDF5  ON to build the optional RX smoke/debug HDF5 writer.
+#   STEM_DAQIRI_REQUIRE_HDF5 ON to fail the build if HDF5 is unavailable.
 
 ARG DAQIRI_BASE=daqiri-torch:local
 
@@ -50,6 +51,7 @@ ARG STEM_BUILD_TYPE=Release
 ARG STEM_DAQIRI_BUILD_TX=OFF
 ARG STEM_DAQIRI_BUILD_RX=OFF
 ARG STEM_DAQIRI_ENABLE_HDF5=ON
+ARG STEM_DAQIRI_REQUIRE_HDF5=OFF
 
 # build-essential, ninja, pkgconf, and CUDA dev headers are already in the
 # daqiri-torch:local image (DPDK was built from source there). yaml-cpp dev
@@ -71,6 +73,7 @@ RUN rm -rf /workspace/stem/cpp_daqiri/build \
              -DSTEM_DAQIRI_BUILD_TX=${STEM_DAQIRI_BUILD_TX} \
              -DSTEM_DAQIRI_BUILD_RX=${STEM_DAQIRI_BUILD_RX} \
              -DSTEM_DAQIRI_ENABLE_HDF5=${STEM_DAQIRI_ENABLE_HDF5} \
+             -DSTEM_DAQIRI_REQUIRE_HDF5=${STEM_DAQIRI_REQUIRE_HDF5} \
              -DCMAKE_INSTALL_PREFIX=/opt/stem_daqiri \
     && cmake --build /workspace/stem/cpp_daqiri/build -j "$(nproc)" \
     && cmake --install /workspace/stem/cpp_daqiri/build

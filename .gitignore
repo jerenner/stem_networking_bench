@@ -5,3 +5,6 @@ cpp_daqiri/benchmarks/sweep_*/
 cpp_daqiri/benchmarks/logs_tx_*/
 cpp_daqiri/benchmarks/logs_rx_*/
 cpp_daqiri/benchmarks/logs_*.driver.log
+
+__pycache__/
+*.py[cod]

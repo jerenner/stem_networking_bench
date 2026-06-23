@@ -33,10 +33,10 @@ Two log formats are understood:
    from the filename's "_<rate>gbps_run<N>.log" suffix paired with the
    sweep's --seconds value (passed in via --duration; defaults to 10).
 
-   TODO(latency): Holoscan-side latency (p50/p99) is reported as "n/a"
-   until cpp/stem_receiver_op.h is taught to read epoch_us from STEM
-   headers and log a "latency p50/p90/p99 us :" line. The parity gate
-   should be human-judged for that metric until then.
+   Holoscan and daqiri both log
+       "latency p50/p90/p99/p999 us : ..."
+   after reading the STEM header epoch_us field on canonical frame-start
+   packets.
 """
 from __future__ import annotations
 
@@ -163,7 +163,11 @@ def _scan_holoscan_rx(dir_: Optional[Path],
         slot["achieved_gbps"].append(
             bytes_recv * 8.0 / (nominal_duration_s * 1e9)
             if nominal_duration_s > 0 else 0.0)
-        # No latency, no fps yet: see TODO(latency) above.
+        for key in ("lat_p50", "lat_p99"):
+            val = _grep_first(text, _DAQIRI_RX_PATTERNS[key])
+            if val is not None:
+                slot[key].append(val)
+        # No fps yet: Holoscan does not log emitted-frame rate in a stable line.
     return out
 
 
@@ -270,11 +274,8 @@ def main() -> int:
         "Each cell is `daqiri / holoscan` (means across runs). PASS means daqiri",
         "matches-or-beats Holoscan on that metric.",
         "",
-        "TODO(latency): Holoscan-side p50/p99 are populated as `n/a` until the",
-        "Holoscan RX is taught to read epoch_us from STEM headers (~30 lines",
-        "in cpp/stem_receiver_op.h::add_pending_packet to capture epoch_us",
-        "for (source_id==0, row_offset==0) packets and one log line in",
-        "emit_current_assembled_batch).",
+        "Latency p50/p99 are parsed from the common",
+        "`latency p50/p90/p99/p999 us : ...` line emitted by both RX paths.",
         "",
         "| Target Gbps | Achieved Gbps | Drops | Latency p50 us | Latency p99 us | FPS | Verdict |",
         "|------------:|:--------------|:------|---------------:|---------------:|----:|:--------|",

@@ -4,6 +4,8 @@
 #
 %YAML 1.2
 ---
+source: "network"
+
 daqiri:
   cfg:
     version: 1
@@ -45,6 +47,9 @@ daqiri:
 
 stem_rx:
   interface_name: "rx_port"
+  # Intentional for IGX RX-only/noop production: keep latency and in-flight
+  # buffering lower than 128-frame parity sweeps. Do not compare reduced
+  # /processed output from this config against 128-frame Holoscan baselines.
   frames_per_tensor: 16
   header_size: 42
   payload_size: 7680
@@ -53,13 +58,24 @@ stem_rx:
   total_time_to_recv: -1.0
   capture_latency: false
   gpu_header_extract: true
-  subtract_dark: false
+  # Tile readout is the only reassembly mode. Current checked-in packet
+  # sizing documents a 7786-byte wire packet with a 7680-byte payload, so
+  # leave this true until the production FPGA is confirmed to emit native
+  # 8192-byte tile payloads. If that is confirmed, set this false and update
+  # the RX memory-region buf_size, MTU guidance, and ipv4_len together.
+  tile_duplicate_prefix_to_simulate_payload: true
+
+processor:
+  noop: true
+  subtract_dark_frame: false
+  dark_frame_path: ""
+  dark_frame_dataset: "/processed"
   apply_valid_pixel_mask: false
-  # Tile readout is the only reassembly mode. Set
-  # tile_duplicate_prefix_to_simulate_payload: false when the FPGA emits
-  # full 4096-sample tile payloads; leave true for the daqiri test TX or
-  # any source that still emits 7680 B row-sized payloads.
-  tile_duplicate_prefix_to_simulate_payload: false
+  valid_pixel_mask_dataset: "/valid_pixel_mask"
+  apply_dynamic_half_column_mask: false
+  dynamic_mask_median_window_pixels: 31
+  dynamic_mask_threshold_ratio: 1.0
+  dynamic_mask_threshold_offset: 500.0
 
 writer:
   filepath: "/tmp/stem_rx_igx_production.h5"

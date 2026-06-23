@@ -35,9 +35,17 @@ find_package(CUDAToolkit REQUIRED)
 option(STEM_DAQIRI_BUILD_TX "Build the STEM daqiri TX binary (Phase 1+)" OFF)
 option(STEM_DAQIRI_BUILD_RX "Build the STEM daqiri RX binary (Phase 2+)" OFF)
 option(STEM_DAQIRI_ENABLE_HDF5 "Enable the RX debug HDF5 writer when HDF5 is available" ON)
+option(STEM_DAQIRI_REQUIRE_HDF5 "Require HDF5 support for parity-capable RX/replay builds" OFF)
 
+if(STEM_DAQIRI_REQUIRE_HDF5)
+  set(STEM_DAQIRI_ENABLE_HDF5 ON CACHE BOOL "Enable HDF5 support" FORCE)
+endif()
 if(STEM_DAQIRI_ENABLE_HDF5)
-  find_package(HDF5 COMPONENTS CXX QUIET)
+  if(STEM_DAQIRI_REQUIRE_HDF5)
+    find_package(HDF5 COMPONENTS CXX REQUIRED)
+  else()
+    find_package(HDF5 COMPONENTS CXX QUIET)
+  endif()
   if(HDF5_FOUND)
     message(STATUS "HDF5 found; stem_daqiri_rx will include the debug HDF5 writer")
   else()
@@ -156,8 +164,11 @@ endif()
 if(STEM_DAQIRI_BUILD_RX)
   list(APPEND STEM_DAQIRI_CONFIGS
     configs/stem_rx_spark.yaml
+    configs/stem_rx_spark_hds.yaml
     configs/stem_rx_igx_production.yaml
     configs/stem_rx_igx_loopback.yaml
+    configs/stem_rx_igx_loopback_hds.yaml
+    configs/stem_replay_hdf5.yaml
   )
 endif()
 

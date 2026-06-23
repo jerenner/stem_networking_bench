@@ -69,8 +69,12 @@ docker build -f Dockerfile.daqiri \
 The phased CMake flags (`STEM_DAQIRI_BUILD_TX` / `_RX` in `cpp_daqiri/CMakeLists.txt`) gate
 which binaries get built: Phase 0 builds only `stem_daqiri_hello` (link check), Phase 1 adds
 `stem_daqiri_tx`, Phase 2 adds `stem_daqiri_rx`. Phase 3 is the **same binary as Phase 2** —
-its behavior (latency stamping, dark correction, valid-pixel mask) is toggled by YAML flags
-(`stamp_epoch_us`, `capture_latency`, `subtract_dark`, `apply_valid_pixel_mask`), not build flags.
+its behavior (latency stamping, dark correction, valid-pixel mask, dynamic mask, and
+frame reduction) is toggled by YAML (`stamp_epoch_us`, `capture_latency`, and the
+top-level `processor` block), not build flags. Legacy `stem_rx.subtract_dark` and
+`stem_rx.apply_valid_pixel_mask` remain deprecated aliases when `processor` is absent.
+Use `-DSTEM_DAQIRI_REQUIRE_HDF5=ON` for parity builds that must include HDF5
+writer/replay/correction-file support.
 
 `cpp_daqiri/scripts/verify_phase.sh {phase0|phase1|phase2|phase3}` runs the build + smoke-test
 gate for a given phase on a single Spark.
@@ -135,7 +139,7 @@ reads `num_receivers` (defaults to 2 = dual-NIC FPGA topology; single-NIC reads 
 
 ## Critical runtime requirements — `cpp_daqiri/`
 
-`cpp_daqiri/` has two memory/header paths selected by YAML. Do not replace one with the
+`cpp_daqiri/` has three memory/header paths selected by YAML. Do not replace one with the
 other:
 
 - **Spark / GB10 unified memory**: daqiri memory region `kind: host_pinned`; RX keeps
@@ -144,6 +148,17 @@ other:
 - **IGX / discrete RTX 6000 Ada dGPU**: daqiri memory region `kind: device`; RX sets
   `stem_rx.gpu_header_extract: true`. Packet payloads stay in VRAM, and only extracted
   header metadata is copied back to the CPU.
+- **Header/data split (HDS)**: RX queue memory regions must be ordered header first,
+  payload second, and `stem_rx.hds: true` makes the gather pointer point at segment 1
+  payload byte 0. The runtime verifies the first observed split is exactly 106/7680
+  before admitting packets. Use `configs/stem_rx_spark_hds.yaml` for Spark or
+  `configs/stem_rx_igx_loopback_hds.yaml` for IGX loopback. Keep
+  `tile_duplicate_prefix_to_simulate_payload: true` until the production FPGA wire
+  payload is confirmed to be native 8192 B and the memory-region sizes/MTU docs are
+  updated together. Treat HDS as a functional parity path, not a high-throughput
+  parity gate: Holoscan's current configs leave `split_boundary: false`, and its
+  HDS code consumes one RX queue with two segments, not a separate two-queue
+  header/payload pairing.
 
 IGX production RX is RX-only against the FPGA. Use `configs/stem_rx_igx_production.yaml`
 as the starting point:
@@ -155,6 +170,12 @@ as the starting point:
 - `writer.noop: true` is the production default. The HDF5 sink is smoke/debug only and
   must not be placed on the poll loop; RX uses a bounded leased output-buffer pool and
   counts `sink pool drops` instead of blocking when the pool is exhausted.
+- Multi-receiver DAQIRI output is valid only with `writer.noop: true`; a shared HDF5
+  writer would interleave receiver streams by arrival order and is refused.
+- IGX production keeps `frames_per_tensor: 16` intentionally for RX-only/noop latency and
+  buffering. Use a 128-frame parity config for reduced `/processed` comparisons.
+- Latency percentiles are `system_clock(now) - epoch_us`; absolute values require
+  synchronized TX/RX clocks, and negative-skew samples are dropped.
 
 On the Spark bench the following cause silent total packet loss or refusal to start if
 wrong, and are not optional:
@@ -180,6 +201,10 @@ FPGA-network config.
 
 - `make_dark_frame.py` — build a blinker-aware averaged dark frame from an HDF5 frame stack
   (input to the processor's dark-subtraction).
+- `cpp_daqiri/scripts/compare_h5_outputs.py` — exact/toleranced pixel-level HDF5 parity check.
+  Exact output is expected for deterministic replay or `processor.noop:true` uint16 gather
+  output. DAQIRI-vs-Holoscan reduced float output should use `--rtol` because DAQIRI's CUDA
+  frame sum is not bit-identical to `torch::sum(0)`.
 - `verify_output.py` / `plot_h5_frames.py` — compare/plot input vs processed HDF5 frames.
 
 ## Conventions
