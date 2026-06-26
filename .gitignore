@@ -1,0 +1,25 @@
+# Python/cache noise
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local data and generated analysis artifacts
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.png
+*.jpg
+*.jpeg
+*.csv
+*.sqlite
+*.nsys-rep
+
+# Local exploratory output directories
+dark_subtraction_analysis/
+test_data/
+
+# Scratch diagnostics
+frame0_dump.txt
+frame_comparison.png
+

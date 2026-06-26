@@ -46,6 +46,25 @@ graph LR
     *   Transfers data from GPU to Host memory.
     *   Writes the frame to an HDF5 file for offline analysis and verification.
 
+## Python Analysis Layout
+
+The Python side is organized so the reusable analysis math is separate from the
+exploratory study scripts:
+
+- `stem_analysis/`: reusable NumPy implementations of the Holoscan processor
+  chain, detector geometry helpers, DM4 loading, ZLP/CoreLoss spectrum helpers,
+  and stitch calibration/repair utilities.
+- `scripts/offline/run_offline_pipeline.py`: canonical offline runner that
+  reproduces `PyTorchProcessorOp` mathematically on HDF5 frame stacks.
+- `scripts/dark/`: dark-frame creation and dark-frame inspection tools.
+- `scripts/studies/`: manifest-driven NiO spectrum and stitch studies.
+- `scripts/diagnostics/`: focused BLR, dark-recovery, and one-off diagnostic
+  studies.
+
+For details, see [`docs/PYTHON_ANALYSIS.md`](docs/PYTHON_ANALYSIS.md).
+For dark-frame construction and runtime masking details, see
+[`docs/DARK_FRAME_WORKFLOW.md`](docs/DARK_FRAME_WORKFLOW.md).
+
 ## Acknowledgements
 
 This project is built on the NVIDIA holoscan SDK and holohub.
