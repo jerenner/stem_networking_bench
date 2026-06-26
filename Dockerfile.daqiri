@@ -1,0 +1,99 @@
+# syntax=docker/dockerfile:1
+#
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved. SPDX-License-Identifier: Apache-2.0
+#
+# stem_networking_bench daqiri image.
+#
+# This image reuses daqiri's container as its base. The user must first run,
+# on each Spark:
+#
+#     cd third_party/daqiri && \
+#       IMAGE_TAG=daqiri-torch:local BASE_IMAGE=torch BASE_TARGET=dpdk \
+#       DAQIRI_ENGINE="dpdk" \
+#       scripts/build-container.sh
+#
+# That produces daqiri-torch:local: PyTorch 26.01 + patched DPDK 25.11 +
+# daqiri installed at /opt/daqiri. We FROM that image so we inherit all of
+# DPDK and CUDA without re-building from source.
+#
+# Then build this image from the stem_networking_bench repo root:
+#
+# Hello/link-check image:
+#     docker build -f Dockerfile.daqiri \
+#       --build-arg STEM_DAQIRI_BUILD_TX=OFF \
+#       --build-arg STEM_DAQIRI_BUILD_RX=OFF \
+#       -t stem_daqiri:hello .
+#
+# TX-only image:
+#     docker build -f Dockerfile.daqiri \
+#       --build-arg STEM_DAQIRI_BUILD_TX=ON -t stem_daqiri:tx-only .
+#
+# TX+RX image:
+#     docker build -f Dockerfile.daqiri \
+#       --build-arg STEM_DAQIRI_BUILD_TX=ON --build-arg STEM_DAQIRI_BUILD_RX=ON \
+#       -t stem_daqiri:tx-rx .
+#
+# Build args:
+#   DAQIRI_BASE              Base image (default daqiri-torch:local).
+#   DAQIRI_ENGINE            daqiri engine backends to compile in (default dpdk).
+#   STEM_BUILD_TYPE          CMake build type (default Release).
+#   STEM_DAQIRI_BUILD_TX     ON to build the TX binary.
+#   STEM_DAQIRI_BUILD_RX     ON to build the RX binary.
+#   STEM_DAQIRI_ENABLE_HDF5  ON to build the optional RX smoke/debug HDF5 writer.
+#   STEM_DAQIRI_REQUIRE_HDF5 ON to fail the build if HDF5 is unavailable.
+
+ARG DAQIRI_BASE=daqiri-torch:local
+
+FROM ${DAQIRI_BASE} AS stem-daqiri-build
+
+ARG DAQIRI_ENGINE="dpdk"
+ARG STEM_BUILD_TYPE=Release
+ARG STEM_DAQIRI_BUILD_TX=OFF
+ARG STEM_DAQIRI_BUILD_RX=OFF
+ARG STEM_DAQIRI_ENABLE_HDF5=ON
+ARG STEM_DAQIRI_REQUIRE_HDF5=OFF
+
+# build-essential, ninja, pkgconf, and CUDA dev headers are already in the
+# daqiri-torch:local image (DPDK was built from source there). yaml-cpp dev
+# headers come from daqiri's third_party/yaml-cpp via add_subdirectory.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libhdf5-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/stem
+COPY third_party/daqiri /workspace/stem/third_party/daqiri
+COPY cpp_daqiri        /workspace/stem/cpp_daqiri
+
+RUN rm -rf /workspace/stem/cpp_daqiri/build \
+    && cmake -S /workspace/stem/cpp_daqiri \
+             -B /workspace/stem/cpp_daqiri/build \
+             -G Ninja \
+             -DCMAKE_BUILD_TYPE=${STEM_BUILD_TYPE} \
+             -DDAQIRI_ENGINE="${DAQIRI_ENGINE}" \
+             -DSTEM_DAQIRI_BUILD_TX=${STEM_DAQIRI_BUILD_TX} \
+             -DSTEM_DAQIRI_BUILD_RX=${STEM_DAQIRI_BUILD_RX} \
+             -DSTEM_DAQIRI_ENABLE_HDF5=${STEM_DAQIRI_ENABLE_HDF5} \
+             -DSTEM_DAQIRI_REQUIRE_HDF5=${STEM_DAQIRI_REQUIRE_HDF5} \
+             -DCMAKE_INSTALL_PREFIX=/opt/stem_daqiri \
+    && cmake --build /workspace/stem/cpp_daqiri/build -j "$(nproc)" \
+    && cmake --install /workspace/stem/cpp_daqiri/build
+
+# Final runtime image: minimal layer that exposes binaries + configs on PATH.
+# Only /opt/stem_daqiri (the install prefix) is copied -- the CMake build
+# directory at /workspace/stem/cpp_daqiri/build is intentionally NOT shipped,
+# it would add hundreds of MB of object files and ninja manifests with no
+# runtime use.
+FROM ${DAQIRI_BASE} AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libhdf5-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=stem-daqiri-build /opt/stem_daqiri /opt/stem_daqiri
+
+ENV PATH=/opt/stem_daqiri/bin:${PATH}
+ENV LD_LIBRARY_PATH=/opt/stem_daqiri/lib:/opt/daqiri/lib:${LD_LIBRARY_PATH}
+
+WORKDIR /opt/stem_daqiri/bin
+CMD ["./stem_daqiri_hello", "--self-test"]

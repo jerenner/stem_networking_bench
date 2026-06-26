@@ -1,0 +1,102 @@
+# STEM RX config for stem_daqiri_rx. Run on
+#   spark-stacked-02 == spark-201a (169.254.95.47, MAC 4c:bb:47:2e:20:1b)
+# The peer TX is:
+#   spark-stacked-01 == spark-960b (169.254.100.253, MAC 4c:bb:47:2d:96:0c)
+#
+# Topology and tuning constants follow daqiri's documented DGX Spark setup
+# (third_party/daqiri/examples/daqiri_bench_raw_tx_rx_spark.yaml). Memory
+# regions use `kind: host_pinned` per Spark's GPUDirect path on GB10.
+#
+# To run inside the stem_daqiri:tx-rx TX+RX container on spark-201a:
+#
+#   docker run --rm -it --privileged --network host \
+#       --gpus all --ulimit memlock=-1 --ulimit stack=67108864 \
+#       -v /dev/hugepages:/dev/hugepages \
+#       stem_daqiri:tx-rx \
+#       /opt/stem_daqiri/bin/stem_daqiri_rx \
+#           /opt/stem_daqiri/bin/configs/stem_rx_spark.yaml --seconds 30
+#
+%YAML 1.2
+---
+source: "network"
+
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "raw"
+    master_core: 8
+    debug: false
+    log_level: "info"
+    loopback: ""
+
+    memory_regions:
+    - name: "Data_RX_GPU"
+      kind: "host_pinned"
+      affinity: 0
+      # 262144 mbufs * 8064 bytes ~= 2 GiB of host-pinned. With
+      # frames_per_tensor=128 and 960 tile pkts/frame the worst-case in-flight
+      # set is ~123K mbufs plus slack, so 262144 gives enough headroom for
+      # parity sweeps.
+      num_bufs: 262144
+      buf_size: 8064   # >= packet size 7786
+
+    interfaces:
+    - name: "rx_port"
+      address: "0002:01:00.0"   # enP2p1s0f0np0 on spark-201a (high-bw ConnectX, no kernel IP)
+      rx:
+        flow_isolation: true
+        queues:
+        - name: "rx_q_0"
+          id: 0
+          cpu_core: 18
+          batch_size: 4096
+          memory_regions:
+            - "Data_RX_GPU"
+        flows:
+        - name: "flow_0"
+          id: 0
+          action:
+            type: queue
+            id: 0
+          match:
+            udp_src: 4096
+            udp_dst: 4096
+
+stem_rx:
+  interface_name: "rx_port"
+  frames_per_tensor: 128
+  # Wire layout matches stem_daqiri_tx:
+  #   header_size = Eth(14)+IPv4(20)+UDP(8) = 42
+  #   payload_size = STEM 7680B row payload
+  header_size: 42
+  payload_size: 7680
+  # Accept all 8 source IDs the TX rotates through.
+  expected_source_mask: 255
+  batch_close_slack_packets: 512
+  total_time_to_recv: 30.0
+
+  # Live latency capture. Reads epoch_us stamped by the TX into the
+  # first packet of every burst, computes now - epoch_us, and prints
+  # p50/p90/p99/p999 at end.
+  capture_latency: true
+
+  # Tile readout is the only reassembly mode now (mirrors upstream/tiling).
+  # The daqiri test TX still emits 128 rows/source @ 7680 B; the RX maps
+  # row_offset [0,120) into compact tile slots, drops the 8 extra rows per
+  # source as `tile dropped pkts`, and the gather kernel fills the missing
+  # 256 tile samples by wrapping the 3840-sample payload prefix. With a
+  # real FPGA source that emits full 4096-sample tile payloads, set
+  # tile_duplicate_prefix_to_simulate_payload: false.
+  tile_duplicate_prefix_to_simulate_payload: true
+
+processor:
+  noop: true
+  subtract_dark_frame: false
+  dark_frame_path: ""
+  dark_frame_dataset: "/processed"
+  apply_valid_pixel_mask: false
+  valid_pixel_mask_dataset: "/valid_pixel_mask"
+  apply_dynamic_half_column_mask: false
+  dynamic_mask_median_window_pixels: 31
+  dynamic_mask_threshold_ratio: 1.0
+  dynamic_mask_threshold_offset: 500.0

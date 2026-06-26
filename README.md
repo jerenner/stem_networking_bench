@@ -1,6 +1,21 @@
 # STEM Networking Benchmark
 
-This application is a high-performance benchmarking tool designed for EELS Microscopy data acquisition and processing pipelines. It makes use of the [NVIDIA Holoscan SDK](https://github.com/nvidia-holoscan/holoscan-sdk) to implement a modular, GPU-accelerated pipeline that receives high-speed UDP network packets, aggregates them into frames, processes them using PyTorch, and writes the results to disk.
+This repository contains high-performance benchmarking pipelines for EELS
+microscopy data acquisition. The common task is to receive high-speed STEM UDP
+packets, assemble detector frames on the GPU, optionally process those frames,
+and write or discard the output depending on whether the run is a parity,
+debug, or throughput test.
+
+There are two C++ implementations of the same wire-format pipeline:
+
+- `cpp/`: the original NVIDIA Holoscan SDK implementation. It remains the
+  reference for operator semantics and offline HDF5 replay.
+- `cpp_daqiri/`: the daqiri implementation, pinned through
+  `third_party/daqiri`. This is the current production-oriented RX/TX path for
+  IGX loopback, IGX FPGA RX, and two-Spark experiments.
+
+Both implementations use the same STEM packet geometry:
+42 B Ethernet/IPv4/UDP + 64 B STEM header + 7680 B payload in a 7786 B packet.
 
 ## Architecture & Strategy
 
@@ -21,7 +36,73 @@ graph LR
     F -->|"HDF5 File"| G[Disk]
 ```
 
-## Operators
+The daqiri path has equivalent source, frame assembly, processor, and sink
+stages, but it is configured through `cpp_daqiri/configs/*.yaml` and uses
+daqiri DPDK engines for live network I/O. See `cpp_daqiri/README.md` for the
+operational commands.
+
+## Current DAQIRI Status
+
+The daqiri pipeline is parity-capable for the DAQIRI-only gates:
+
+- HDF5 replay accepts `uint16` and `float32` `[frames,H,W]` datasets.
+- Processor controls match the Holoscan-facing config shape: `processor.noop`,
+  dark-frame subtraction, valid-pixel mask loading, dynamic half-column masking,
+  and `noop:false` frame reduction.
+- The HDF5 writer is supported for replay, smoke, and pixel-parity runs.
+- IGX live loopback supports non-HDS and HDS RX paths. HDS is treated as a
+  functional parity path, not the primary 95 Gbps throughput gate.
+- Production IGX RX uses `writer.noop:true` and `frames_per_tensor: 16` for
+  latency and bounded buffering. Use 128-frame configs for reduced-output
+  comparisons against Holoscan.
+
+Validation after the latest daqiri submodule update passed the HDF5 suite,
+config checks, full IGX live validation, and a 30-minute non-HDS unbounded
+soak. The soak sent 22.4 TB at 99.632 Gbps TX, assembled 2,811,664 frames on
+RX, and reported zero DPDK missed, error, or out-of-buffer counters and zero
+sink drops/errors. A long HDS soak and a fresh end-to-end Holoscan comparison
+remain separate follow-up tests.
+
+## DAQIRI Quick Start
+
+Build daqiri's base image once on the target machine, then build the STEM
+DAQIRI image from this repository:
+
+```bash
+git submodule update --init --recursive third_party/daqiri
+
+cd third_party/daqiri
+IMAGE_TAG=daqiri-torch:local BASE_IMAGE=torch BASE_TARGET=dpdk \
+    DAQIRI_ENGINE="dpdk" scripts/build-container.sh
+cd ../..
+
+docker build -f Dockerfile.daqiri \
+    --build-arg STEM_DAQIRI_BUILD_TX=ON \
+    --build-arg STEM_DAQIRI_BUILD_RX=ON \
+    --build-arg STEM_DAQIRI_REQUIRE_HDF5=ON \
+    -t stem_daqiri:parity-hdf5 .
+```
+
+The `stem_daqiri:parity-hdf5` image enables TX, RX, and mandatory HDF5
+replay/writer/correction-file support.
+
+Run repeatable offline gates:
+
+```bash
+cpp_daqiri/scripts/run_daqiri_validation.sh hdf5
+cpp_daqiri/scripts/run_daqiri_validation.sh config
+```
+
+DAQIRI HDF5 replay is finite-only and intentionally rejects
+`replayer.repeat:true`. Holoscan can repeat/wrap HDF5 replay input, but
+parity replay runs should use `repeat:false` on both sides.
+
+Live loopback gates require a privileged host-network container with GPU access,
+hugepages, and `/tmp` mounted. The DAQIRI README contains the full launch
+command and the `live-smoke`, `live-wire`, `hds-smoke`, `hds-wire`,
+`live-writer`, and `live-pixel` validation commands.
+
+## Holoscan Operators
 
 ### 1. `StemReceiverOp`
     *   Interfaces with the Holoscan Advanced Network operator (using DPDK).

@@ -31,6 +31,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
@@ -89,6 +90,8 @@ class StemReceiverOp : public Operator {
   static constexpr uint32_t TILE_PAYLOAD_BYTES = TILE_SAMPLES * sizeof(uint16_t);
   static constexpr uint32_t FULL_FRAME_TILE_PACKETS = 960;
   static constexpr uint32_t TILE_PACKETS_PER_SOURCE = FULL_FRAME_TILE_PACKETS / 8;
+  static constexpr uint32_t STEM_HDR_OFF_EPOCH_US = 16;
+  static constexpr size_t MAX_LATENCY_SAMPLES = 1'000'000;
 
   HOLOSCAN_OPERATOR_FORWARD_ARGS(StemReceiverOp)
 
@@ -166,6 +169,24 @@ class StemReceiverOp : public Operator {
         header_batches_launched_,
         header_batches_completed_,
         header_slot_full_waits_);
+    if (latencies_us_.empty()) {
+      HOLOSCAN_LOG_INFO("latency samples  : 0 (no epoch_us stamps received)");
+    } else {
+      std::sort(latencies_us_.begin(), latencies_us_.end());
+      const auto pct = [&](double q) {
+        const size_t idx = std::min(
+            latencies_us_.size() - 1,
+            static_cast<size_t>(q * (latencies_us_.size() - 1)));
+        return latencies_us_[idx];
+      };
+      HOLOSCAN_LOG_INFO("latency samples  : {}", latencies_us_.size());
+      HOLOSCAN_LOG_INFO(
+          "latency p50/p90/p99/p999 us : {} / {} / {} / {}",
+          pct(0.50),
+          pct(0.90),
+          pct(0.99),
+          pct(0.999));
+    }
     flush_packet_debug_outputs();
     HOLOSCAN_LOG_INFO("StemReceiverOp shutting down");
     freeResources();
@@ -986,6 +1007,7 @@ class StemReceiverOp : public Operator {
     PacketHeaderInfo header{};
     header.source_id = 0xFFFF;
     header.global_row = -1;
+    header.epoch_us = 0;
 
     if (src != nullptr) {
       header.row_number = (static_cast<uint16_t>(src[5]) << 8) | static_cast<uint16_t>(src[4]);
@@ -994,6 +1016,7 @@ class StemReceiverOp : public Operator {
       header.row_offset = header.row_number % ROWS_PER_SOURCE;
       header.global_row = static_cast<int16_t>(
           source_id_to_global_row_host(header.source_id, header.row_offset));
+      std::memcpy(&header.epoch_us, src + STEM_HDR_OFF_EPOCH_US, sizeof(header.epoch_us));
     }
 
     return header;
@@ -1019,6 +1042,21 @@ class StemReceiverOp : public Operator {
     }
 
     return best_frame;
+  }
+
+  void sample_latency_if_needed(const PacketHeaderInfo& header) {
+    if (header.source_id != 0 ||
+        header.row_offset != 0 ||
+        header.epoch_us == 0 ||
+        latencies_us_.size() >= MAX_LATENCY_SAMPLES) {
+      return;
+    }
+    const uint64_t now_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    if (now_us >= header.epoch_us) {
+      latencies_us_.push_back(static_cast<int64_t>(now_us - header.epoch_us));
+    }
   }
 
   void rebuild_current_batch_state() {
@@ -1061,6 +1099,8 @@ class StemReceiverOp : public Operator {
       ttl_packets_ignored_tile_readout_++;
       return;
     }
+
+    sample_latency_if_needed(header);
 
     if (!stream_synced_) {
       if (header.row_number != 0) {
@@ -1658,6 +1698,7 @@ class StemReceiverOp : public Operator {
   int64_t ttl_packets_dropped_ = 0;
   int64_t ttl_packets_ignored_unexpected_source_ = 0;
   int64_t ttl_packets_ignored_tile_readout_ = 0;
+  std::vector<int64_t> latencies_us_;
 
   int64_t aggr_pkts_recv_ = 0;
   uint64_t total_frames_emitted_ = 0;

@@ -1,0 +1,51 @@
+# RX-only DAQIRI PCAP capture config for STEM packets on the verified IGX RX PF.
+# This is for /opt/daqiri/bin/daqiri_example_pcap_writer, not stem_daqiri_rx.
+#
+# It records raw Ethernet packets before STEM frame assembly. Adjust the PCIe PF,
+# CPU cores, and flow match for a production FPGA source.
+#
+%YAML 1.2
+---
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "raw"
+    master_core: 8
+    debug: false
+    log_level: "info"
+    loopback: ""
+
+    memory_regions:
+    - name: "Data_RX_GPU"
+      kind: "device"
+      affinity: 0
+      num_bufs: 65536
+      buf_size: 8064   # >= current 7786-byte STEM wire packet
+
+    interfaces:
+    - name: "rx_port"
+      address: "0005:03:00.1"
+      rx:
+        flow_isolation: true
+        queues:
+        - name: "rx_q_0"
+          id: 0
+          cpu_core: 9
+          timeout_us: 1000
+          batch_size: 4096
+          memory_regions:
+            - "Data_RX_GPU"
+        flows:
+        - name: "flow_0"
+          id: 0
+          action:
+            type: queue
+            id: 0
+          match:
+            udp_src: 4096
+            udp_dst: 4096
+            ipv4_len: 7772   # 7786-byte wire packet minus 14-byte Ethernet header
+
+bench_rx:
+  interface_name: "rx_port"
+  cpu_core: 11

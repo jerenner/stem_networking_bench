@@ -1,0 +1,90 @@
+# STEM RX HDS config for DGX Spark / GB10. This uses daqiri
+# header/data split so the first 106 bytes land in a CPU-readable header
+# segment and the 7680-byte test payload lands in a separate payload segment.
+#
+# Both regions are host_pinned on Spark. On IGX, only the payload memory kind
+# changes to device; see stem_rx_igx_loopback_hds.yaml.
+#
+%YAML 1.2
+---
+source: "network"
+
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "raw"
+    master_core: 8
+    debug: false
+    log_level: "info"
+    loopback: ""
+
+    memory_regions:
+    - name: "Data_RX_HDR"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 262144
+      buf_size: 106    # Eth+IPv4+UDP(42) + STEM header(64)
+    - name: "Data_RX_PAYLOAD"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 262144
+      buf_size: 7680   # payload-only; daqiri adds mbuf headroom
+
+    interfaces:
+    - name: "rx_port"
+      address: "0002:01:00.0"
+      rx:
+        flow_isolation: true
+        queues:
+        - name: "rx_q_0"
+          id: 0
+          cpu_core: 18
+          batch_size: 4096
+          memory_regions:
+            - "Data_RX_HDR"
+            - "Data_RX_PAYLOAD"
+        flows:
+        - name: "flow_0"
+          id: 0
+          action:
+            type: queue
+            id: 0
+          match:
+            udp_src: 4096
+            udp_dst: 4096
+            # Flow match only; the RX queue's chained memory regions drive HDS.
+            ipv4_len: 7772
+
+stem_rx:
+  interface_name: "rx_port"
+  frames_per_tensor: 128
+  header_size: 42
+  payload_size: 7680
+  expected_source_mask: 255
+  batch_close_slack_packets: 512
+  total_time_to_recv: 30.0
+  capture_latency: true
+  gpu_header_extract: false
+  hds: true
+  # HDS does not change the wire format. The daqiri test TX still emits
+  # 7680-byte row-sized payloads, so the gather kernel wraps the prefix to
+  # fill the 4096-sample tile tail.
+  tile_duplicate_prefix_to_simulate_payload: true
+
+processor:
+  noop: true
+  subtract_dark_frame: false
+  dark_frame_path: ""
+  dark_frame_dataset: "/processed"
+  apply_valid_pixel_mask: false
+  valid_pixel_mask_dataset: "/valid_pixel_mask"
+  apply_dynamic_half_column_mask: false
+  dynamic_mask_median_window_pixels: 31
+  dynamic_mask_threshold_ratio: 1.0
+  dynamic_mask_threshold_offset: 500.0
+
+writer:
+  filepath: "/tmp/stem_rx_spark_hds.h5"
+  dataset_name: "/processed"
+  noop: true
+  num_concurrent: 3

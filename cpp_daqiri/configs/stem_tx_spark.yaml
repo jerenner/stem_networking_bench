@@ -1,0 +1,108 @@
+# STEM TX config for stem_daqiri_tx. Run on
+#   spark-stacked-01 == spark-960b (169.254.100.253, MAC 4c:bb:47:2d:96:0c)
+# The peer ConnectX-7 NIC is:
+#   spark-stacked-02 == spark-201a (169.254.95.47,  MAC 4c:bb:47:2e:20:1b)
+#
+# Topology and tuning constants follow daqiri's documented DGX Spark setup
+# (see third_party/daqiri/examples/daqiri_bench_raw_tx_rx_spark.yaml and
+# third_party/daqiri/docs/tutorials/system_configuration.md "DGX Spark"
+# tab). Memory regions use `kind: host_pinned` because GB10 (unified memory)
+# does not load nvidia_peermem and CUDA reports DMA_BUF_SUPPORTED=0 -- the
+# canonical Spark GPUDirect path is host_pinned.
+#
+# To run inside the stem_daqiri:tx-only container on spark-960b:
+#
+#   docker run --rm -it --privileged --network host \
+#       --gpus all --ulimit memlock=-1 --ulimit stack=67108864 \
+#       -v /dev/hugepages:/dev/hugepages \
+#       stem_daqiri:tx-only \
+#       /opt/stem_daqiri/bin/stem_daqiri_tx \
+#           /opt/stem_daqiri/bin/configs/stem_tx_spark.yaml --seconds 10
+#
+%YAML 1.2
+---
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "raw"
+    master_core: 8
+    debug: false
+    log_level: "info"
+    loopback: ""
+
+    memory_regions:
+    - name: "Data_TX_GPU"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 51200
+      buf_size: 8064   # >= header_size(42) + payload_size(7744) = 7786
+
+    interfaces:
+    - name: "tx_port"
+      address: "0002:01:00.0"   # enP2p1s0f0np0 on spark-960b (high-bw ConnectX, no kernel IP)
+      tx:
+        queues:
+        - name: "tx_q_0"
+          id: 0
+          batch_size: 4096
+          cpu_core: 17
+          memory_regions:
+            - "Data_TX_GPU"
+          offloads:
+            - "tx_eth_src"
+
+stem_tx:
+  interface_name: "tx_port"
+  # Per-burst packet count. The TX worker uses this as both the daqiri burst
+  # size and the template variety (so each packet position in a burst gets a
+  # unique (source_id, row_offset) pair).
+  batch_size: 1024
+
+  # Wire layout per packet:
+  #   header_size  = Eth(14) + IPv4(20) + UDP(8)              = 42 bytes
+  #   payload_size = STEM custom header(64) + row payload(7680) = 7744 bytes
+  #   total                                                    = 7786 bytes
+  header_size: 42
+  payload_size: 7744
+
+  # IPs are filled into the IPv4 header for completeness (RX flow filter
+  # currently matches on UDP ports only, IP is wildcard). MACs MUST be the
+  # 0002:01:00.0 NIC's MACs since flow isolation is on and promiscuous is
+  # disabled, so the RX NIC only accepts frames addressed to its own MAC.
+  ip_src_addr:  "10.99.99.1"
+  ip_dst_addr:  "10.99.99.2"
+  eth_src_addr: "4c:bb:47:2d:96:10"   # spark-960b enP2p1s0f0np0 (TX NIC)
+  eth_dst_addr: "4c:bb:47:2e:20:1f"   # spark-201a enP2p1s0f0np0 (RX NIC)
+  udp_src_port: 4096
+  udp_dst_port: 4096
+
+  # STEM frame structure. With (8, 128) we cycle through the full 8x128 =
+  # 1024-row frame layout in batch_size = 1024 packets per burst.
+  num_sources_active: 8
+  rows_per_source:    128
+
+  # Update STEM headers (row_number, source_id) on the GPU every burst so
+  # consecutive bursts carry advancing frame indices instead of cycling
+  # the same 0..127 over and over. Without this, the Holoscan RX (and the
+  # daqiri RX) only ever see frame_index = 0 -- they cannot frame-assemble
+  # normally; every batch closes via the slack-fallback path and shows up
+  # as an "incomplete batch" warning.
+  update_headers_per_burst: true
+
+  # Live latency stamping: every burst writes wall-clock epoch_us into
+  # packet 0's STEM header. With update_headers_per_burst: true the GPU
+  # header-update kernel writes the stamp directly; with the per-host
+  # fallback (no kernel) the TX host-stores it. Either path also zeroes
+  # epoch_us in pkts 1..N-1 to prevent stale-stamp leaks across DPDK pool
+  # rotations. The RX pairs this with its capture_latency flag and only
+  # samples at (source_id == 0, row_offset == 0) packets, which on the
+  # daqiri TX side is exactly the first packet of every frame.
+  stamp_epoch_us: true
+
+  # Pacing (token-bucket). target_rate_gbps <= 0 disables pacing.
+  # Override on the command line with --seconds N --rate GBPS.
+  # 20 Gbps is the Spark smoke-test setpoint -- well within the receive
+  # path's capacity and easy to debug. Throughput sweeps push this to 50/100.
+  target_rate_gbps: 20.0
+  total_time_to_send: 10.0
+  total_bytes_cap: 0

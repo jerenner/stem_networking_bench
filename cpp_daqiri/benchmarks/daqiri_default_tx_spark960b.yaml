@@ -1,0 +1,69 @@
+# Stock daqiri default benchmark, TX side (run on spark-960b = spark-stacked-01).
+#
+# This config drives daqiri's stock daqiri_bench_raw_gpudirect binary -- it
+# is NOT a stem_daqiri config. It is used purely to validate that the two
+# Sparks can move bytes between each other before we write any STEM-specific
+# TX/RX code in the STEM DAQIRI wrappers.
+#
+# Topology:
+#   spark-960b (TX, 169.254.100.253, MAC 4c:bb:47:2d:96:0c)
+#       enp1s0f0np0 / PCI 0000:01:00.0
+#         ----> ConnectX direct link ---->
+#   spark-201a (RX, 169.254.95.47,  MAC 4c:bb:47:2e:20:1b)
+#       enp1s0f0np0 / PCI 0000:01:00.0
+#
+# Run from the stem_networking_bench repo root on spark-960b:
+#
+#   docker run --rm -it --privileged --network host \
+#       --gpus all --ulimit memlock=-1 --ulimit stack=67108864 \
+#       -v /dev/hugepages:/dev/hugepages \
+#       -v "$PWD/cpp_daqiri/benchmarks:/configs" \
+#       daqiri-torch:local \
+#       /opt/daqiri/bin/daqiri_bench_raw_gpudirect \
+#           /configs/daqiri_default_tx_spark960b.yaml --seconds 10
+#
+# At the same time on spark-201a, run the matching RX config:
+#   /configs/daqiri_default_rx_spark201a.yaml
+#
+%YAML 1.2
+---
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "raw"
+    master_core: 8
+    debug: false
+    log_level: "info"
+    loopback: ""
+
+    memory_regions:
+    - name: "Data_TX_GPU"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 51200
+      buf_size: 8064
+
+    interfaces:
+    - name: "tx_port"
+      address: 0000:01:00.0
+      tx:
+        queues:
+        - name: "tx_q_0"
+          id: 0
+          batch_size: 10240
+          cpu_core: 17
+          memory_regions:
+            - "Data_TX_GPU"
+          offloads:
+            - "tx_eth_src"
+
+bench_tx:
+  interface_name: "tx_port"
+  batch_size: 10240
+  payload_size: 8000
+  header_size: 64
+  eth_dst_addr: 4c:bb:47:2e:20:1b
+  ip_src_addr: 169.254.100.253
+  ip_dst_addr: 169.254.95.47
+  udp_src_port: 4096
+  udp_dst_port: 4096
