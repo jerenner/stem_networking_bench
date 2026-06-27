@@ -21,14 +21,15 @@ daqiri:
       kind: "device"
       affinity: 0
       num_bufs: 262144
-      # Covers the current 7786-byte row-compatible packet and a future
-      # 4096-sample native tile packet including all headers.
-      buf_size: 9228
+      # Covers the current 7786-byte row-compatible packet and stays below
+      # DAQIRI's 9100-byte wire-frame ceiling. Native 4096-sample tile packets
+      # will require a coordinated packet-size update.
+      buf_size: 8064
     - name: "Data_RX_GPU_1"
       kind: "device"
       affinity: 0
       num_bufs: 262144
-      buf_size: 9228
+      buf_size: 8064
 
     interfaces:
     - name: "rx_port_0"
