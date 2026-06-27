@@ -65,6 +65,12 @@ Holoscan-compatible top-level `processor` block, and the `writer` block.
 Legacy `stem_rx.subtract_dark` and `stem_rx.apply_valid_pixel_mask` are still
 accepted as deprecated aliases when `processor` is absent.
 
+The processor uses the same fused correction order as the Holoscan `tiling`
+path for both network `uint16` and HDF5 replay `float32` input: optional
+dark-aware grouped BLR estimation, fused conversion/dark/BLR correction and
+batch mean, combined valid-pixel and two-sided dynamic masking with excluded
+edge rows, then optional frame reduction.
+
 ## RX-Only Production
 
 Config: `configs/stem_rx_igx_production.yaml`
@@ -120,6 +126,32 @@ pool of assembled GPU buffers; a writer thread receives a lease for a completed
 slot. If no slot is free, RX advances the window and increments `sink pool drops`
 instead of blocking the DPDK poll loop. `writer.noop: true` is the production
 default; the HDF5 writer is only a smoke/debug sink.
+
+### Dual FPGA RX
+
+Config: `configs/stem_rx_igx_fpga_dual.yaml`
+
+This configuration receives independent frame streams on PCI functions
+`0005:03:00.0` and `0005:03:00.1`. Each interface owns its own frame assembler;
+completed batches join only at the shared GPU processor and output sink. The
+four-source test mask (`0x0f`) fills 480 of 960 tiles per frame. Change it to
+`0xff` when all eight source IDs are active.
+
+The throughput default is `writer.noop:true`. With `writer.noop:false`, the
+single sink thread serializes batches from both receivers into one HDF5 dataset
+in arrival order. Receiver identity is not encoded in that dataset, matching
+the previous Holoscan shared-writer behavior.
+
+```bash
+docker run --rm -it \
+    --privileged --network host --ipc=host --gpus all \
+    --ulimit memlock=-1 --ulimit stack=67108864 \
+    -v /dev/hugepages:/dev/hugepages \
+    -v /tmp:/tmp \
+    stem_daqiri:parity-hdf5 \
+    /opt/stem_daqiri/bin/stem_daqiri_rx \
+    /opt/stem_daqiri/bin/configs/stem_rx_igx_fpga_dual.yaml
+```
 
 ## IGX HW Loopback
 
@@ -414,9 +446,9 @@ unless Holoscan grows an equivalent path to compare against.
 requires HDS layout verification, frames assembled, and zero sink drops/errors,
 but DPDK missed/out-of-buffer counters are reported rather than treated as a
 zero-drop throughput gate.
-Multi-receiver DAQIRI output is currently allowed only with `writer.noop:true`;
-HDF5 output is refused because receiver streams would otherwise interleave by
-arrival order in one dataset.
+Multi-receiver HDF5 output intentionally interleaves complete receiver batches
+by arrival order through one writer thread. Use separate runs or files if
+receiver provenance must be preserved.
 
 DAQIRI HDF5 replay is finite-only and intentionally rejects
 `replayer.repeat:true`. Holoscan can repeat/wrap HDF5 replay input, but parity
@@ -498,6 +530,7 @@ cpp_daqiri/scripts/parse_spark_parity_results.py \
 | `rx/stem_rx_main.cpp` | daqiri RX, frame assembly, output sink |
 | `scripts/compare_h5_outputs.py` | pixel-level HDF5 parity comparator |
 | `configs/stem_rx_igx_production.yaml` | IGX RX-only production config |
+| `configs/stem_rx_igx_fpga_dual.yaml` | Dual-interface IGX FPGA production config |
 | `configs/stem_rx_igx_loopback.yaml` | IGX hardware-loopback RX config |
 | `configs/stem_rx_igx_loopback_hds.yaml` | IGX hardware-loopback RX config with HDS |
 | `configs/stem_replay_hdf5.yaml` | finite uint16/float32 HDF5 replay config for processor parity |

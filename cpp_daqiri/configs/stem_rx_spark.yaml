@@ -96,7 +96,14 @@ processor:
   dark_frame_dataset: "/processed"
   apply_valid_pixel_mask: false
   valid_pixel_mask_dataset: "/valid_pixel_mask"
+  apply_blr_correction: false
+  blr_rows: 30
+  blr_zlp_width: 768
+  blr_zlp_group_columns: 4
+  blr_core_group_columns: 16
   apply_dynamic_half_column_mask: false
   dynamic_mask_median_window_pixels: 31
   dynamic_mask_threshold_ratio: 1.0
   dynamic_mask_threshold_offset: 500.0
+  dynamic_mask_excluded_edge_rows: 32
+  dynamic_mask_two_sided: true

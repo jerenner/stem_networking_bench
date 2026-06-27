@@ -283,122 +283,190 @@ void stem_gather_tile_packets_by_placement(
 }
 
 // ===========================================================================
-// Processor -- dark-frame subtract + valid-pixel mask, uint16 -> fp32
+// Processor -- fused dark subtraction, BLR correction, and batch mean
 // ===========================================================================
-__global__ void stem_dark_correct_uint16_to_float_kernel(
-    const uint16_t* input, const float* dark_frame,
-    const float* valid_pixel_mask, float* output, uint32_t frames,
-    uint32_t frame_pixels, bool subtract_dark, bool apply_valid_pixel_mask) {
-  const uint32_t pixel_stride = blockDim.x * gridDim.x;
+template <typename InputT>
+__global__ void stem_compute_blr_baseline_kernel(
+    const InputT* input, const float* dark_frame, float* baseline,
+    uint32_t frames, uint32_t height, uint32_t width, uint32_t blr_rows,
+    uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, uint32_t zlp_bins,
+    uint32_t bins_per_half, bool subtract_dark) {
+  const uint64_t baseline_values =
+      static_cast<uint64_t>(frames) * 2 * bins_per_half;
+  const uint64_t stride = static_cast<uint64_t>(blockDim.x) * gridDim.x;
+  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
 
-  for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
-       pixel_idx < frame_pixels; pixel_idx += pixel_stride) {
-    const float dark_value = subtract_dark ? dark_frame[pixel_idx] : 0.0f;
-    const float mask_value =
-        apply_valid_pixel_mask ? valid_pixel_mask[pixel_idx] : 1.0f;
+  for (uint64_t baseline_idx =
+           static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       baseline_idx < baseline_values; baseline_idx += stride) {
+    const uint32_t bin = baseline_idx % bins_per_half;
+    const uint64_t frame_half = baseline_idx / bins_per_half;
+    const uint32_t half = frame_half % 2;
+    const uint32_t frame = frame_half / 2;
+    const bool is_zlp = bin < zlp_bins;
+    const uint32_t group_columns =
+        is_zlp ? zlp_group_columns : core_group_columns;
+    const uint32_t group_start =
+        is_zlp ? bin * zlp_group_columns
+               : zlp_width + (bin - zlp_bins) * core_group_columns;
+    const uint32_t row_start = half == 0 ? 0 : height - blr_rows;
 
-    for (uint32_t frame = 0; frame < frames; ++frame) {
-      const uint64_t idx =
-          static_cast<uint64_t>(frame) * frame_pixels + pixel_idx;
-      output[idx] = (static_cast<float>(input[idx]) - dark_value) * mask_value;
+    float sum = 0.0f;
+    for (uint32_t row_offset = 0; row_offset < blr_rows; ++row_offset) {
+      const uint64_t pixel_base =
+          static_cast<uint64_t>(row_start + row_offset) * width + group_start;
+      const uint64_t input_base =
+          static_cast<uint64_t>(frame) * frame_pixels + pixel_base;
+      for (uint32_t col_offset = 0; col_offset < group_columns; ++col_offset) {
+        const uint64_t pixel_idx = pixel_base + col_offset;
+        const float dark_value = subtract_dark ? dark_frame[pixel_idx] : 0.0f;
+        sum += static_cast<float>(input[input_base + col_offset]) - dark_value;
+      }
     }
+    baseline[baseline_idx] =
+        sum / static_cast<float>(blr_rows * group_columns);
   }
 }
 
-void stem_dark_correct_uint16_to_float(
-    const uint16_t* input, const float* dark_frame,
-    const float* valid_pixel_mask, float* output, uint32_t frames,
-    uint32_t height, uint32_t width, bool subtract_dark,
-    bool apply_valid_pixel_mask, cudaStream_t stream) {
-  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
-  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
-  if (total_values == 0) { return; }
+template <typename InputT>
+void launch_stem_compute_blr_baseline(
+    const InputT* input, const float* dark_frame, float* baseline,
+    uint32_t frames, uint32_t height, uint32_t width, uint32_t blr_rows,
+    uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, cudaStream_t stream) {
+  if (frames == 0 || height == 0 || width == 0 || blr_rows == 0) { return; }
 
+  const uint32_t zlp_bins = zlp_width / zlp_group_columns;
+  const uint32_t core_bins = (width - zlp_width) / core_group_columns;
+  const uint32_t bins_per_half = zlp_bins + core_bins;
+  const uint64_t baseline_values =
+      static_cast<uint64_t>(frames) * 2 * bins_per_half;
   const uint32_t threads = 256;
-  const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
+  const uint64_t required_blocks = (baseline_values + threads - 1) / threads;
   const uint32_t blocks = static_cast<uint32_t>(
       required_blocks > 65535ULL ? 65535ULL : required_blocks);
 
-  stem_dark_correct_uint16_to_float_kernel<<<blocks, threads, 0, stream>>>(
-      input, dark_frame, valid_pixel_mask, output, frames,
-      static_cast<uint32_t>(frame_pixels), subtract_dark,
-      apply_valid_pixel_mask);
-  check_cuda_launch("stem_dark_correct_uint16_to_float_kernel");
+  stem_compute_blr_baseline_kernel<InputT><<<blocks, threads, 0, stream>>>(
+      input, dark_frame, baseline, frames, height, width, blr_rows, zlp_width,
+      zlp_group_columns, core_group_columns, zlp_bins, bins_per_half,
+      subtract_dark);
+  check_cuda_launch("stem_compute_blr_baseline_kernel");
 }
 
-__global__ void stem_dark_correct_float_to_float_kernel(
-    const float* input, const float* dark_frame, const float* valid_pixel_mask,
-    float* output, uint32_t frames, uint32_t frame_pixels, bool subtract_dark,
-    bool apply_valid_pixel_mask) {
+void stem_compute_blr_baseline(
+    const uint16_t* input, const float* dark_frame, float* baseline,
+    uint32_t frames, uint32_t height, uint32_t width, uint32_t blr_rows,
+    uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, cudaStream_t stream) {
+  launch_stem_compute_blr_baseline(
+      input, dark_frame, baseline, frames, height, width, blr_rows, zlp_width,
+      zlp_group_columns, core_group_columns, subtract_dark, stream);
+}
+
+void stem_compute_blr_baseline(
+    const float* input, const float* dark_frame, float* baseline,
+    uint32_t frames, uint32_t height, uint32_t width, uint32_t blr_rows,
+    uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, cudaStream_t stream) {
+  launch_stem_compute_blr_baseline(
+      input, dark_frame, baseline, frames, height, width, blr_rows, zlp_width,
+      zlp_group_columns, core_group_columns, subtract_dark, stream);
+}
+
+template <typename InputT>
+__global__ void stem_correct_with_blr_and_mean_kernel(
+    const InputT* input, const float* dark_frame, const float* blr_baseline,
+    float* output, float* batch_mean, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, uint32_t zlp_bins,
+    uint32_t bins_per_half, bool subtract_dark, bool apply_blr,
+    bool compute_batch_mean) {
+  const uint32_t frame_pixels = height * width;
   const uint32_t pixel_stride = blockDim.x * gridDim.x;
+  const uint32_t half_height = height / 2;
 
   for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
        pixel_idx < frame_pixels; pixel_idx += pixel_stride) {
-    const float dark_value = subtract_dark ? dark_frame[pixel_idx] : 0.0f;
-    const float mask_value =
-        apply_valid_pixel_mask ? valid_pixel_mask[pixel_idx] : 1.0f;
-
-    for (uint32_t frame = 0; frame < frames; ++frame) {
-      const uint64_t idx =
-          static_cast<uint64_t>(frame) * frame_pixels + pixel_idx;
-      output[idx] = (input[idx] - dark_value) * mask_value;
+    const uint32_t row = pixel_idx / width;
+    const uint32_t col = pixel_idx - row * width;
+    const uint32_t half = row < half_height ? 0 : 1;
+    uint32_t bin = 0;
+    if (apply_blr) {
+      bin = col < zlp_width
+                ? col / zlp_group_columns
+                : zlp_bins + (col - zlp_width) / core_group_columns;
     }
-  }
-}
+    const float dark_value = subtract_dark ? dark_frame[pixel_idx] : 0.0f;
 
-void stem_dark_correct_float_to_float(
-    const float* input, const float* dark_frame, const float* valid_pixel_mask,
-    float* output, uint32_t frames, uint32_t height, uint32_t width,
-    bool subtract_dark, bool apply_valid_pixel_mask, cudaStream_t stream) {
-  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
-  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
-  if (total_values == 0) { return; }
-
-  const uint32_t threads = 256;
-  const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
-  const uint32_t blocks = static_cast<uint32_t>(
-      required_blocks > 65535ULL ? 65535ULL : required_blocks);
-
-  stem_dark_correct_float_to_float_kernel<<<blocks, threads, 0, stream>>>(
-      input, dark_frame, valid_pixel_mask, output, frames,
-      static_cast<uint32_t>(frame_pixels), subtract_dark,
-      apply_valid_pixel_mask);
-  check_cuda_launch("stem_dark_correct_float_to_float_kernel");
-}
-
-__global__ void stem_compute_frame_mean_float_kernel(const float* input,
-                                                     float* mean,
-                                                     uint32_t frames,
-                                                     uint32_t frame_pixels) {
-  const uint32_t pixel_stride = blockDim.x * gridDim.x;
-
-  for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
-       pixel_idx < frame_pixels; pixel_idx += pixel_stride) {
     float sum = 0.0f;
     for (uint32_t frame = 0; frame < frames; ++frame) {
       const uint64_t idx =
           static_cast<uint64_t>(frame) * frame_pixels + pixel_idx;
-      sum += input[idx];
+      float value = static_cast<float>(input[idx]) - dark_value;
+      if (apply_blr) {
+        const uint64_t baseline_idx =
+            (static_cast<uint64_t>(frame) * 2 + half) * bins_per_half + bin;
+        value -= blr_baseline[baseline_idx];
+      }
+      output[idx] = value;
+      if (compute_batch_mean) { sum += value; }
     }
-    mean[pixel_idx] = sum / static_cast<float>(frames);
+    if (compute_batch_mean) {
+      batch_mean[pixel_idx] = sum / static_cast<float>(frames);
+    }
   }
 }
 
-void stem_compute_frame_mean_float(const float* input, float* mean,
-                                   uint32_t frames, uint32_t height,
-                                   uint32_t width, cudaStream_t stream) {
+template <typename InputT>
+void launch_stem_correct_with_blr_and_mean(
+    const InputT* input, const float* dark_frame, const float* blr_baseline,
+    float* output, float* batch_mean, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, bool apply_blr,
+    bool compute_batch_mean, cudaStream_t stream) {
   const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
   const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
   if (total_values == 0) { return; }
 
+  const uint32_t zlp_bins = apply_blr ? zlp_width / zlp_group_columns : 0;
+  const uint32_t core_bins =
+      apply_blr ? (width - zlp_width) / core_group_columns : 0;
+  const uint32_t bins_per_half = zlp_bins + core_bins;
   const uint32_t threads = 256;
   const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
   const uint32_t blocks = static_cast<uint32_t>(
       required_blocks > 65535ULL ? 65535ULL : required_blocks);
 
-  stem_compute_frame_mean_float_kernel<<<blocks, threads, 0, stream>>>(
-      input, mean, frames, static_cast<uint32_t>(frame_pixels));
-  check_cuda_launch("stem_compute_frame_mean_float_kernel");
+  stem_correct_with_blr_and_mean_kernel<InputT><<<blocks, threads, 0, stream>>>(
+      input, dark_frame, blr_baseline, output, batch_mean, frames, height,
+      width, zlp_width, zlp_group_columns, core_group_columns, zlp_bins,
+      bins_per_half, subtract_dark, apply_blr, compute_batch_mean);
+  check_cuda_launch("stem_correct_with_blr_and_mean_kernel");
+}
+
+void stem_correct_with_blr_and_mean(
+    const uint16_t* input, const float* dark_frame, const float* blr_baseline,
+    float* output, float* batch_mean, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, bool apply_blr,
+    bool compute_batch_mean, cudaStream_t stream) {
+  launch_stem_correct_with_blr_and_mean(
+      input, dark_frame, blr_baseline, output, batch_mean, frames, height,
+      width, zlp_width, zlp_group_columns, core_group_columns, subtract_dark,
+      apply_blr, compute_batch_mean, stream);
+}
+
+void stem_correct_with_blr_and_mean(
+    const float* input, const float* dark_frame, const float* blr_baseline,
+    float* output, float* batch_mean, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, bool apply_blr,
+    bool compute_batch_mean, cudaStream_t stream) {
+  launch_stem_correct_with_blr_and_mean(
+      input, dark_frame, blr_baseline, output, batch_mean, frames, height,
+      width, zlp_width, zlp_group_columns, core_group_columns, subtract_dark,
+      apply_blr, compute_batch_mean, stream);
 }
 
 __device__ __forceinline__ float stem_median_from_small_window(float* values,
@@ -419,10 +487,12 @@ __device__ __forceinline__ float stem_median_from_small_window(float* values,
   return values[median_idx];
 }
 
-__global__ void stem_apply_dynamic_half_column_mask_float_kernel(
-    float* input, const float* batch_mean, uint32_t frames, uint32_t height,
-    uint32_t width, uint32_t median_window_pixels, float threshold_ratio,
-    float threshold_offset) {
+__global__ void stem_apply_dynamic_and_valid_pixel_mask_float_kernel(
+    float* input, const float* batch_mean, const float* valid_pixel_mask,
+    uint32_t frames, uint32_t height, uint32_t width,
+    uint32_t median_window_pixels, float threshold_ratio,
+    float threshold_offset, uint32_t excluded_edge_rows,
+    bool apply_dynamic_mask, bool two_sided, bool apply_valid_pixel_mask) {
   constexpr uint32_t kMaxMedianWindowPixels = 129;
   float window_values[kMaxMedianWindowPixels];
 
@@ -434,28 +504,40 @@ __global__ void stem_apply_dynamic_half_column_mask_float_kernel(
        pixel_idx < frame_pixels; pixel_idx += pixel_stride) {
     const uint32_t row = pixel_idx / width;
     const uint32_t col = pixel_idx - row * width;
-    const uint32_t half_start = row < half_height ? 0 : half_height;
-    const uint32_t half_end = row < half_height ? half_height : height;
+    bool should_zero =
+        apply_valid_pixel_mask && valid_pixel_mask[pixel_idx] == 0.0f;
 
-    const uint32_t radius = median_window_pixels / 2;
-    uint32_t row_start = row > radius ? row - radius : half_start;
-    row_start = row_start < half_start ? half_start : row_start;
-    uint32_t row_end = row + radius + 1;
-    row_end = row_end > half_end ? half_end : row_end;
+    if (apply_dynamic_mask && !should_zero) {
+      const bool top_half = row < half_height;
+      const uint32_t half_start = top_half ? excluded_edge_rows : half_height;
+      const uint32_t half_end =
+          top_half ? half_height : height - excluded_edge_rows;
+      if (row >= half_start && row < half_end) {
+        const uint32_t radius = median_window_pixels / 2;
+        uint32_t row_start = row > radius ? row - radius : half_start;
+        row_start = row_start < half_start ? half_start : row_start;
+        uint32_t row_end = row + radius + 1;
+        row_end = row_end > half_end ? half_end : row_end;
 
-    uint32_t count = 0;
-    for (uint32_t sample_row = row_start;
-         sample_row < row_end && count < kMaxMedianWindowPixels; ++sample_row) {
-      window_values[count++] =
-          batch_mean[static_cast<uint64_t>(sample_row) * width + col];
+        uint32_t count = 0;
+        for (uint32_t sample_row = row_start;
+             sample_row < row_end && count < kMaxMedianWindowPixels;
+             ++sample_row) {
+          window_values[count++] =
+              batch_mean[static_cast<uint64_t>(sample_row) * width + col];
+        }
+        if (count > 0) {
+          const float local_median =
+              stem_median_from_small_window(window_values, count);
+          const float current_value = batch_mean[pixel_idx];
+          const float reference = local_median * threshold_ratio;
+          const float deviation = current_value - reference;
+          should_zero = two_sided ? fabsf(deviation) > threshold_offset
+                                  : deviation > threshold_offset;
+        }
+      }
     }
-    if (count == 0) { continue; }
-
-    const float local_median =
-        stem_median_from_small_window(window_values, count);
-    const float current_value = batch_mean[pixel_idx];
-    const float threshold = local_median * threshold_ratio + threshold_offset;
-    if (current_value <= threshold) { continue; }
+    if (!should_zero) { continue; }
 
     for (uint32_t frame = 0; frame < frames; ++frame) {
       const uint64_t idx =
@@ -465,24 +547,61 @@ __global__ void stem_apply_dynamic_half_column_mask_float_kernel(
   }
 }
 
-void stem_apply_dynamic_half_column_mask_float(
-    float* input, const float* batch_mean, uint32_t frames, uint32_t height,
-    uint32_t width, uint32_t median_window_pixels, float threshold_ratio,
-    float threshold_offset, cudaStream_t stream) {
+void stem_apply_dynamic_and_valid_pixel_mask_float(
+    float* input, const float* batch_mean, const float* valid_pixel_mask,
+    uint32_t frames, uint32_t height, uint32_t width,
+    uint32_t median_window_pixels, float threshold_ratio,
+    float threshold_offset, uint32_t excluded_edge_rows,
+    bool apply_dynamic_mask, bool two_sided, bool apply_valid_pixel_mask,
+    cudaStream_t stream) {
   const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
   const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
-  if (total_values == 0) { return; }
+  if (total_values == 0 || (!apply_dynamic_mask && !apply_valid_pixel_mask)) {
+    return;
+  }
 
   const uint32_t threads = 256;
   const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
   const uint32_t blocks = static_cast<uint32_t>(
       required_blocks > 65535ULL ? 65535ULL : required_blocks);
 
-  stem_apply_dynamic_half_column_mask_float_kernel<<<blocks, threads, 0,
-                                                     stream>>>(
-      input, batch_mean, frames, height, width, median_window_pixels,
-      threshold_ratio, threshold_offset);
-  check_cuda_launch("stem_apply_dynamic_half_column_mask_float_kernel");
+  stem_apply_dynamic_and_valid_pixel_mask_float_kernel<<<blocks, threads, 0,
+                                                         stream>>>(
+      input, batch_mean, valid_pixel_mask, frames, height, width,
+      median_window_pixels, threshold_ratio, threshold_offset,
+      excluded_edge_rows, apply_dynamic_mask, two_sided,
+      apply_valid_pixel_mask);
+  check_cuda_launch("stem_apply_dynamic_and_valid_pixel_mask_float_kernel");
+}
+
+__global__ void stem_apply_valid_pixel_mask_float_kernel(
+    float* input, const float* valid_pixel_mask, uint32_t frames,
+    uint32_t frame_pixels) {
+  const uint32_t pixel_stride = blockDim.x * gridDim.x;
+  for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       pixel_idx < frame_pixels; pixel_idx += pixel_stride) {
+    if (valid_pixel_mask[pixel_idx] != 0.0f) { continue; }
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+      const uint64_t idx =
+          static_cast<uint64_t>(frame) * frame_pixels + pixel_idx;
+      input[idx] = 0.0f;
+    }
+  }
+}
+
+void stem_apply_valid_pixel_mask_float(
+    float* input, const float* valid_pixel_mask, uint32_t frames,
+    uint32_t height, uint32_t width, cudaStream_t stream) {
+  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
+  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
+  if (total_values == 0) { return; }
+  const uint32_t threads = 256;
+  const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
+  const uint32_t blocks = static_cast<uint32_t>(
+      required_blocks > 65535ULL ? 65535ULL : required_blocks);
+  stem_apply_valid_pixel_mask_float_kernel<<<blocks, threads, 0, stream>>>(
+      input, valid_pixel_mask, frames, static_cast<uint32_t>(frame_pixels));
+  check_cuda_launch("stem_apply_valid_pixel_mask_float_kernel");
 }
 
 __global__ void stem_sum_frames_float_to_frame_kernel(const float* input,

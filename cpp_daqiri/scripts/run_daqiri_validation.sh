@@ -142,6 +142,12 @@ with h5py.File(tmp / "stem_pipeline_input.h5", "w") as f:
     dyn[:, 1, 1] = 100
     dyn[:, 4, 2] = 80
     f.create_dataset("/dyn_frames", data=dyn)
+    dyn_two_sided = np.full((2, 8, 3), 10, dtype=np.float32)
+    dyn_two_sided[:, 0, 0] = 1000
+    dyn_two_sided[:, 2, 1] = 100
+    dyn_two_sided[:, 5, 2] = -80
+    dyn_two_sided[:, 7, 0] = -1000
+    f.create_dataset("/dyn_two_sided_frames", data=dyn_two_sided)
 
 with h5py.File(tmp / "stem_pipeline_corr.h5", "w") as f:
     dark = np.arange(16, dtype=np.float32).reshape(4, 4) / 2.0
@@ -362,8 +368,64 @@ processor:
   dynamic_mask_median_window_pixels: 3
   dynamic_mask_threshold_ratio: 1.0
   dynamic_mask_threshold_offset: 5.0
+  dynamic_mask_excluded_edge_rows: 0
+  dynamic_mask_two_sided: false
 writer:
   filepath: "{tmp / 'stem_case_dynamic_out.h5'}"
+  dataset_name: "/processed"
+  noop: false
+  num_concurrent: 1
+""")
+
+write("stem_case_dynamic_two_sided.yaml", f"""%YAML 1.2
+---
+source: "hdf5"
+replayer:
+  filepath: "{common_input}"
+  dataset_name: "/dyn_two_sided_frames"
+  repeat: false
+  start_frame: 0
+  frames_per_tensor: 2
+  count: 2
+processor:
+  noop: true
+  subtract_dark_frame: false
+  apply_valid_pixel_mask: false
+  apply_dynamic_half_column_mask: true
+  dynamic_mask_median_window_pixels: 3
+  dynamic_mask_threshold_ratio: 1.0
+  dynamic_mask_threshold_offset: 5.0
+  dynamic_mask_excluded_edge_rows: 1
+  dynamic_mask_two_sided: true
+writer:
+  filepath: "{tmp / 'stem_case_dynamic_two_sided_out.h5'}"
+  dataset_name: "/processed"
+  noop: false
+  num_concurrent: 1
+""")
+
+write("stem_case_blr.yaml", f"""%YAML 1.2
+---
+source: "hdf5"
+replayer:
+  filepath: "{common_input}"
+  dataset_name: "/frames"
+  repeat: false
+  start_frame: 0
+  frames_per_tensor: 2
+  count: 2
+processor:
+  noop: true
+  subtract_dark_frame: false
+  apply_valid_pixel_mask: false
+  apply_blr_correction: true
+  blr_rows: 1
+  blr_zlp_width: 2
+  blr_zlp_group_columns: 2
+  blr_core_group_columns: 2
+  apply_dynamic_half_column_mask: false
+writer:
+  filepath: "{tmp / 'stem_case_blr_out.h5'}"
   dataset_name: "/processed"
   noop: false
   num_concurrent: 1
@@ -455,6 +517,8 @@ run_ok stem_case_reduce.yaml
 run_ok stem_case_float_reduce.yaml
 run_ok stem_case_reduce_correction.yaml
 run_ok stem_case_dynamic.yaml
+run_ok stem_case_dynamic_two_sided.yaml
+run_ok stem_case_blr.yaml
 
 run_fail stem_case_bad_repeat.yaml
 run_fail stem_case_bad_writer.yaml
@@ -485,6 +549,7 @@ with h5py.File(tmp / "stem_pipeline_input.h5", "r") as f_in, \
     frames = f_in["/frames"][...]
     float_frames = f_in["/float_frames"][...]
     dyn = f_in["/dyn_frames"][...]
+    dyn_two_sided = f_in["/dyn_two_sided_frames"][...]
     dark = f_corr["/dark"][...]
     mask = f_corr["/valid_pixel_mask"][...]
 
@@ -493,12 +558,12 @@ expected = {
     "float_raw": (float_frames, np.float32, tmp / "stem_case_float_raw_out.h5"),
     "window": (frames[1:4], np.uint16, tmp / "stem_case_window_out.h5"),
     "correction": (
-        ((frames[:2].astype(np.float32) - dark) * mask).astype(np.float32),
+        np.where(mask == 0.0, 0.0, frames[:2].astype(np.float32) - dark).astype(np.float32),
         np.float32,
         tmp / "stem_case_correction_out.h5",
     ),
     "float_correction": (
-        ((float_frames[:2] - dark) * mask).astype(np.float32),
+        np.where(mask == 0.0, 0.0, float_frames[:2] - dark).astype(np.float32),
         np.float32,
         tmp / "stem_case_float_correction_out.h5",
     ),
@@ -514,7 +579,7 @@ expected = {
     ),
     "reduce_correction": (
         np.sum(
-            ((frames[:3].astype(np.float32) - dark) * mask).astype(np.float32),
+            np.where(mask == 0.0, 0.0, frames[:3].astype(np.float32) - dark).astype(np.float32),
             axis=0,
             keepdims=True,
         ),
@@ -527,6 +592,24 @@ dyn_expected = dyn.astype(np.float32)
 dyn_expected[:, 1, 1] = 0.0
 dyn_expected[:, 4, 2] = 0.0
 expected["dynamic"] = (dyn_expected, np.float32, tmp / "stem_case_dynamic_out.h5")
+
+dyn_two_sided_expected = dyn_two_sided.copy()
+dyn_two_sided_expected[:, 2, 1] = 0.0
+dyn_two_sided_expected[:, 5, 2] = 0.0
+expected["dynamic_two_sided"] = (
+    dyn_two_sided_expected,
+    np.float32,
+    tmp / "stem_case_dynamic_two_sided_out.h5",
+)
+
+blr_expected = frames[:2].astype(np.float32)
+blr_input = blr_expected.copy()
+for col_start in (0, 2):
+    top = np.mean(blr_input[:, 0, col_start:col_start + 2], axis=1)
+    bottom = np.mean(blr_input[:, 3, col_start:col_start + 2], axis=1)
+    blr_expected[:, :2, col_start:col_start + 2] -= top[:, None, None]
+    blr_expected[:, 2:, col_start:col_start + 2] -= bottom[:, None, None]
+expected["blr"] = (blr_expected, np.float32, tmp / "stem_case_blr_out.h5")
 
 for name, (want, dtype, path) in expected.items():
     with h5py.File(path, "r") as f:
@@ -614,25 +697,6 @@ writer:
   noop: true
 EOF
 
-    cat > "${tmpdir}/top_level_multi_writer.yaml" <<'EOF'
-%YAML 1.2
----
-source: "network"
-num_receivers: 2
-stem_rx:
-  interface_name: "rx_port"
-  frames_per_tensor: 16
-  expected_source_mask: 255
-receiver0:
-  interface_name: "rx_port0"
-receiver1:
-  interface_name: "rx_port1"
-writer:
-  filepath: "/tmp/stem_multi_writer.h5"
-  dataset_name: "/processed"
-  noop: false
-EOF
-
     cat > "${tmpdir}/ambiguous_receiver.yaml" <<'EOF'
 %YAML 1.2
 ---
@@ -655,8 +719,6 @@ EOF
         'expected_source_mask must enable at least one source'
     run_config_fail "${tmpdir}/top_level_receiver_zero_frames.yaml" \
         'frames_per_tensor must be > 0'
-    run_config_fail "${tmpdir}/top_level_multi_writer.yaml" \
-        'num_receivers > 1 with writer\.noop=false'
     run_config_fail "${tmpdir}/ambiguous_receiver.yaml" \
         'receiver override.*ambiguous'
 
@@ -692,6 +754,15 @@ for path in rx_configs:
             raise AssertionError(f"{path.name}: IGX production is expected to keep frames_per_tensor=16")
         if not processor.get("noop", True) or not writer.get("noop", True):
             raise AssertionError(f"{path.name}: 16-frame IGX production config must remain noop/RX-only")
+    if path.name == "stem_rx_igx_fpga_dual.yaml":
+        if int(data.get("num_receivers", 0)) != 2:
+            raise AssertionError(f"{path.name}: expected num_receivers=2")
+        for receiver in ("receiver0", "receiver1"):
+            if not data.get(receiver, {}).get("interface_name"):
+                raise AssertionError(f"{path.name}: missing {receiver}.interface_name")
+        interfaces = data.get("daqiri", {}).get("cfg", {}).get("interfaces", [])
+        if len(interfaces) != 2:
+            raise AssertionError(f"{path.name}: expected two DAQIRI interfaces")
     print(f"PASS {path.name}: frames_per_tensor={frames_per_tensor} source_mask=0x{source_mask:x}")
 PY
 

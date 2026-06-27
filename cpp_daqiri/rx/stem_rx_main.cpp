@@ -78,10 +78,17 @@ struct ProcessorConfig {
   std::string dark_frame_dataset = "/processed";
   bool apply_valid_pixel_mask = false;
   std::string valid_pixel_mask_dataset = "/valid_pixel_mask";
+  bool apply_blr_correction = false;
+  uint32_t blr_rows = 30;
+  uint32_t blr_zlp_width = 768;
+  uint32_t blr_zlp_group_columns = 4;
+  uint32_t blr_core_group_columns = 16;
   bool apply_dynamic_half_column_mask = false;
   uint32_t dynamic_mask_median_window_pixels = 31;
   float dynamic_mask_threshold_ratio = 1.0f;
   float dynamic_mask_threshold_offset = 500.0f;
+  uint32_t dynamic_mask_excluded_edge_rows = 32;
+  bool dynamic_mask_two_sided = true;
 };
 
 struct ReplayerConfig {
@@ -211,6 +218,15 @@ ProcessorConfig parse_processor_cfg(const YAML::Node& root,
     cfg.valid_pixel_mask_dataset =
         p["valid_pixel_mask_dataset"].as<std::string>(
             cfg.valid_pixel_mask_dataset);
+    cfg.apply_blr_correction =
+        p["apply_blr_correction"].as<bool>(cfg.apply_blr_correction);
+    cfg.blr_rows = p["blr_rows"].as<uint32_t>(cfg.blr_rows);
+    cfg.blr_zlp_width =
+        p["blr_zlp_width"].as<uint32_t>(cfg.blr_zlp_width);
+    cfg.blr_zlp_group_columns = p["blr_zlp_group_columns"].as<uint32_t>(
+        cfg.blr_zlp_group_columns);
+    cfg.blr_core_group_columns = p["blr_core_group_columns"].as<uint32_t>(
+        cfg.blr_core_group_columns);
     cfg.apply_dynamic_half_column_mask =
         p["apply_dynamic_half_column_mask"].as<bool>(
             cfg.apply_dynamic_half_column_mask);
@@ -223,6 +239,11 @@ ProcessorConfig parse_processor_cfg(const YAML::Node& root,
     cfg.dynamic_mask_threshold_offset =
         p["dynamic_mask_threshold_offset"].as<float>(
             cfg.dynamic_mask_threshold_offset);
+    cfg.dynamic_mask_excluded_edge_rows =
+        p["dynamic_mask_excluded_edge_rows"].as<uint32_t>(
+            cfg.dynamic_mask_excluded_edge_rows);
+    cfg.dynamic_mask_two_sided = p["dynamic_mask_two_sided"].as<bool>(
+        cfg.dynamic_mask_two_sided);
   }
 
   return cfg;
@@ -250,19 +271,13 @@ void apply_stem_rx_node(StemRxConfig& cfg, const YAML::Node& rx) {
           cfg.tile_duplicate_prefix_to_simulate_payload);
 }
 
-void validate_stem_rx_cfg(const StemRxConfig& cfg, int num_receivers) {
+void validate_stem_rx_cfg(const StemRxConfig& cfg) {
   if (cfg.frames_per_tensor == 0) {
     throw std::runtime_error("stem_rx.frames_per_tensor must be > 0");
   }
   if ((cfg.expected_source_mask & 0xffu) == 0) {
     throw std::runtime_error(
         "stem_rx.expected_source_mask must enable at least one source");
-  }
-  if (num_receivers > 1 && !cfg.writer.noop) {
-    throw std::runtime_error(
-        "num_receivers > 1 with writer.noop=false is not supported: "
-        "shared HDF5 output would interleave receiver streams by arrival "
-        "order");
   }
   if (cfg.hds && cfg.gpu_header_extract) {
     throw std::runtime_error(
@@ -315,13 +330,13 @@ std::vector<StemRxConfig> parse_stem_rx_cfgs(const YAML::Node& root) {
   YAML::Node single_receiver0 =
       receiver_override_node(root, stem_rx, "receiver0");
   if (num_receivers == 1 && !single_receiver0) {
-    validate_stem_rx_cfg(base, num_receivers);
+    validate_stem_rx_cfg(base);
     cfgs.push_back(std::move(base));
     return cfgs;
   }
   if (num_receivers == 1) {
     apply_stem_rx_node(base, single_receiver0);
-    validate_stem_rx_cfg(base, num_receivers);
+    validate_stem_rx_cfg(base);
     cfgs.push_back(std::move(base));
     return cfgs;
   }
@@ -335,7 +350,7 @@ std::vector<StemRxConfig> parse_stem_rx_cfgs(const YAML::Node& root) {
     }
     StemRxConfig cfg = base;
     apply_stem_rx_node(cfg, receiver_node);
-    validate_stem_rx_cfg(cfg, num_receivers);
+    validate_stem_rx_cfg(cfg);
     cfgs.push_back(std::move(cfg));
   }
   return cfgs;
@@ -407,6 +422,7 @@ struct OutputSlot {
   float* gpu_float = nullptr;
   float* gpu_reduced = nullptr;
   float* gpu_batch_mean = nullptr;
+  float* gpu_blr_baseline = nullptr;
   cudaEvent_t ready = nullptr;
   std::atomic<bool> leased{false};
   uint64_t batch_index = 0;
@@ -643,10 +659,45 @@ class FramePipeline {
       throw std::runtime_error(
           "FramePipeline requires non-zero frame dimensions");
     }
-    if (processor_.dynamic_mask_median_window_pixels == 0 ||
-        processor_.dynamic_mask_median_window_pixels > 129) {
+    if (processor_.apply_dynamic_half_column_mask &&
+        (processor_.dynamic_mask_median_window_pixels == 0 ||
+         processor_.dynamic_mask_median_window_pixels > 129 ||
+         processor_.dynamic_mask_median_window_pixels % 2 == 0)) {
       throw std::runtime_error(
-          "processor.dynamic_mask_median_window_pixels must be in [1, 129]");
+          "processor.dynamic_mask_median_window_pixels must be odd and in "
+          "[1, 129]");
+    }
+    if (processor_.apply_dynamic_half_column_mask &&
+        processor_.dynamic_mask_threshold_offset < 0.0f) {
+      throw std::runtime_error(
+          "processor.dynamic_mask_threshold_offset must be non-negative");
+    }
+    if ((processor_.apply_blr_correction ||
+         processor_.apply_dynamic_half_column_mask) &&
+        height_ % 2 != 0) {
+      throw std::runtime_error(
+          "BLR correction and half-column masking require even frame height");
+    }
+    if (processor_.apply_blr_correction) {
+      if (processor_.blr_rows == 0 || height_ < 2 * processor_.blr_rows) {
+        throw std::runtime_error(
+            "processor.blr_rows must be positive and fit in both frame halves");
+      }
+      if (processor_.blr_zlp_group_columns == 0 ||
+          processor_.blr_core_group_columns == 0 ||
+          processor_.blr_zlp_width > width_ ||
+          processor_.blr_zlp_width % processor_.blr_zlp_group_columns != 0 ||
+          (width_ - processor_.blr_zlp_width) %
+                  processor_.blr_core_group_columns !=
+              0) {
+        throw std::runtime_error(
+            "frame width is incompatible with configured BLR regions");
+      }
+    }
+    if (processor_.apply_dynamic_half_column_mask &&
+        2 * processor_.dynamic_mask_excluded_edge_rows >= height_) {
+      throw std::runtime_error(
+          "processor.dynamic_mask_excluded_edge_rows leaves no imaging pixels");
     }
     load_correction_inputs();
   }
@@ -662,6 +713,7 @@ class FramePipeline {
   bool produces_float() const {
     return !processor_.noop || processor_.subtract_dark_frame ||
            processor_.apply_valid_pixel_mask ||
+           processor_.apply_blr_correction ||
            processor_.apply_dynamic_half_column_mask;
   }
 
@@ -681,72 +733,84 @@ class FramePipeline {
       STEM_CUDA_TRY(
           cudaMalloc(&slot->gpu_batch_mean, frame_pixels * sizeof(float)));
     }
+    if (processor_.apply_blr_correction) {
+      const uint32_t blr_bins =
+          processor_.blr_zlp_width / processor_.blr_zlp_group_columns +
+          (width_ - processor_.blr_zlp_width) /
+              processor_.blr_core_group_columns;
+      const uint64_t baseline_values =
+          static_cast<uint64_t>(max_frames) * 2 * blr_bins;
+      STEM_CUDA_TRY(cudaMalloc(&slot->gpu_blr_baseline,
+                               baseline_values * sizeof(float)));
+    }
   }
 
   void process_slot(OutputSlot* slot, uint32_t frames, cudaStream_t stream,
                     bool input_float = false) const {
     if (frames == 0) { return; }
 
-    if (input_float) {
-      if (produces_float()) {
-        if (processor_.subtract_dark_frame ||
-            processor_.apply_valid_pixel_mask) {
-          stem::stem_dark_correct_float_to_float(
-              slot->gpu_float,
-              processor_.subtract_dark_frame ? gpu_dark_frame_ : nullptr,
-              processor_.apply_valid_pixel_mask ? gpu_valid_mask_ : nullptr,
-              slot->gpu_float, frames, height_, width_,
-              processor_.subtract_dark_frame, processor_.apply_valid_pixel_mask,
-              stream);
-        }
-
-        if (processor_.apply_dynamic_half_column_mask) {
-          stem::stem_compute_frame_mean_float(slot->gpu_float,
-                                              slot->gpu_batch_mean, frames,
-                                              height_, width_, stream);
-          stem::stem_apply_dynamic_half_column_mask_float(
-              slot->gpu_float, slot->gpu_batch_mean, frames, height_, width_,
-              processor_.dynamic_mask_median_window_pixels,
-              processor_.dynamic_mask_threshold_ratio,
-              processor_.dynamic_mask_threshold_offset, stream);
-        }
-
-        if (!processor_.noop) {
-          stem::stem_sum_frames_float_to_frame(slot->gpu_float,
-                                               slot->gpu_reduced, frames,
-                                               height_, width_, stream);
-          slot->output_ptr = slot->gpu_reduced;
-          slot->output_rank = 2;
-          slot->output_frames = 1;
+    if (produces_float()) {
+      const float* dark =
+          processor_.subtract_dark_frame ? gpu_dark_frame_ : nullptr;
+      if (processor_.apply_blr_correction) {
+        if (input_float) {
+          stem::stem_compute_blr_baseline(
+              slot->gpu_float, dark, slot->gpu_blr_baseline, frames, height_,
+              width_, processor_.blr_rows, processor_.blr_zlp_width,
+              processor_.blr_zlp_group_columns,
+              processor_.blr_core_group_columns,
+              processor_.subtract_dark_frame, stream);
         } else {
-          slot->output_ptr = slot->gpu_float;
-          slot->output_rank = 3;
-          slot->output_frames = frames;
+          stem::stem_compute_blr_baseline(
+              reinterpret_cast<const uint16_t*>(slot->gpu_u16), dark,
+              slot->gpu_blr_baseline, frames, height_, width_,
+              processor_.blr_rows, processor_.blr_zlp_width,
+              processor_.blr_zlp_group_columns,
+              processor_.blr_core_group_columns,
+              processor_.subtract_dark_frame, stream);
         }
-      } else {
-        slot->output_ptr = slot->gpu_float;
-        slot->output_rank = 3;
-        slot->output_frames = frames;
       }
-      slot->output_float = true;
-    } else if (produces_float()) {
-      stem::stem_dark_correct_uint16_to_float(
-          reinterpret_cast<const uint16_t*>(slot->gpu_u16),
-          processor_.subtract_dark_frame ? gpu_dark_frame_ : nullptr,
-          processor_.apply_valid_pixel_mask ? gpu_valid_mask_ : nullptr,
-          slot->gpu_float, frames, height_, width_,
-          processor_.subtract_dark_frame, processor_.apply_valid_pixel_mask,
-          stream);
+
+      if (input_float) {
+        stem::stem_correct_with_blr_and_mean(
+            slot->gpu_float, dark,
+            processor_.apply_blr_correction ? slot->gpu_blr_baseline : nullptr,
+            slot->gpu_float,
+            processor_.apply_dynamic_half_column_mask ? slot->gpu_batch_mean
+                                                      : nullptr,
+            frames, height_, width_, processor_.blr_zlp_width,
+            processor_.blr_zlp_group_columns,
+            processor_.blr_core_group_columns,
+            processor_.subtract_dark_frame, processor_.apply_blr_correction,
+            processor_.apply_dynamic_half_column_mask, stream);
+      } else {
+        stem::stem_correct_with_blr_and_mean(
+            reinterpret_cast<const uint16_t*>(slot->gpu_u16), dark,
+            processor_.apply_blr_correction ? slot->gpu_blr_baseline : nullptr,
+            slot->gpu_float,
+            processor_.apply_dynamic_half_column_mask ? slot->gpu_batch_mean
+                                                      : nullptr,
+            frames, height_, width_, processor_.blr_zlp_width,
+            processor_.blr_zlp_group_columns,
+            processor_.blr_core_group_columns,
+            processor_.subtract_dark_frame, processor_.apply_blr_correction,
+            processor_.apply_dynamic_half_column_mask, stream);
+      }
 
       if (processor_.apply_dynamic_half_column_mask) {
-        stem::stem_compute_frame_mean_float(slot->gpu_float,
-                                            slot->gpu_batch_mean, frames,
-                                            height_, width_, stream);
-        stem::stem_apply_dynamic_half_column_mask_float(
-            slot->gpu_float, slot->gpu_batch_mean, frames, height_, width_,
+        stem::stem_apply_dynamic_and_valid_pixel_mask_float(
+            slot->gpu_float, slot->gpu_batch_mean,
+            processor_.apply_valid_pixel_mask ? gpu_valid_mask_ : nullptr,
+            frames, height_, width_,
             processor_.dynamic_mask_median_window_pixels,
             processor_.dynamic_mask_threshold_ratio,
-            processor_.dynamic_mask_threshold_offset, stream);
+            processor_.dynamic_mask_threshold_offset,
+            processor_.dynamic_mask_excluded_edge_rows, true,
+            processor_.dynamic_mask_two_sided,
+            processor_.apply_valid_pixel_mask, stream);
+      } else if (processor_.apply_valid_pixel_mask) {
+        stem::stem_apply_valid_pixel_mask_float(
+            slot->gpu_float, gpu_valid_mask_, frames, height_, width_, stream);
       }
 
       if (!processor_.noop) {
@@ -761,6 +825,11 @@ class FramePipeline {
         slot->output_frames = frames;
       }
       slot->output_float = true;
+    } else if (input_float) {
+      slot->output_ptr = slot->gpu_float;
+      slot->output_float = true;
+      slot->output_rank = 3;
+      slot->output_frames = frames;
     } else {
       slot->output_ptr = slot->gpu_u16;
       slot->output_float = false;
@@ -923,6 +992,7 @@ class FrameAssembler {
       if (slot->gpu_float) { cudaFree(slot->gpu_float); }
       if (slot->gpu_reduced) { cudaFree(slot->gpu_reduced); }
       if (slot->gpu_batch_mean) { cudaFree(slot->gpu_batch_mean); }
+      if (slot->gpu_blr_baseline) { cudaFree(slot->gpu_blr_baseline); }
       if (slot->ready) { cudaEventDestroy(slot->ready); }
     }
     if (h_pkt_ptrs_) { cudaFreeHost(h_pkt_ptrs_); }
@@ -1692,8 +1762,12 @@ void print_rx_start(const StemRxConfig& cfg) {
             << (cfg.processor.subtract_dark_frame ? "true" : "false")
             << " apply_valid_pixel_mask="
             << (cfg.processor.apply_valid_pixel_mask ? "true" : "false")
+            << " apply_blr_correction="
+            << (cfg.processor.apply_blr_correction ? "true" : "false")
             << " apply_dynamic_half_column_mask="
             << (cfg.processor.apply_dynamic_half_column_mask ? "true" : "false")
+            << " dynamic_mask_two_sided="
+            << (cfg.processor.dynamic_mask_two_sided ? "true" : "false")
             << " writer.noop=" << (cfg.writer.noop ? "true" : "false")
             << " writer.num_concurrent=" << cfg.writer.num_concurrent
             << " source_mask=0x" << std::hex << cfg.expected_source_mask
@@ -1848,6 +1922,7 @@ int run_hdf5_replay(const YAML::Node& root) {
     if (slot->gpu_float) { cudaFree(slot->gpu_float); }
     if (slot->gpu_reduced) { cudaFree(slot->gpu_reduced); }
     if (slot->gpu_batch_mean) { cudaFree(slot->gpu_batch_mean); }
+    if (slot->gpu_blr_baseline) { cudaFree(slot->gpu_blr_baseline); }
     if (slot->ready) { cudaEventDestroy(slot->ready); }
   }
   if (stream) { cudaStreamDestroy(stream); }

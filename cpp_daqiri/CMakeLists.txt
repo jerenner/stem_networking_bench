@@ -170,6 +170,7 @@ if(STEM_DAQIRI_BUILD_RX)
     configs/stem_rx_spark.yaml
     configs/stem_rx_spark_hds.yaml
     configs/stem_rx_igx_production.yaml
+    configs/stem_rx_igx_fpga_dual.yaml
     configs/stem_rx_igx_loopback.yaml
     configs/stem_rx_igx_loopback_hds.yaml
     configs/stem_replay_hdf5.yaml

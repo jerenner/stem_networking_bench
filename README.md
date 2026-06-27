@@ -47,14 +47,20 @@ The daqiri pipeline is parity-capable for the DAQIRI-only gates:
 
 - HDF5 replay accepts `uint16` and `float32` `[frames,H,W]` datasets.
 - Processor controls match the Holoscan-facing config shape: `processor.noop`,
-  dark-frame subtraction, valid-pixel mask loading, dynamic half-column masking,
-  and `noop:false` frame reduction.
+  dark-frame subtraction, grouped BLR correction, valid-pixel masking,
+  two-sided dynamic half-column masking with excluded edge rows, and
+  `noop:false` frame reduction. Network `uint16` and replay `float32` inputs use
+  the same fused CUDA correction sequence.
 - The HDF5 writer is supported for replay, smoke, and pixel-parity runs.
+- Multiple RX interfaces assemble frames independently and share one processor
+  and serialized HDF5 sink; shared output is ordered by batch arrival.
 - IGX live loopback supports non-HDS and HDS RX paths. HDS is treated as a
   functional parity path, not the primary 95 Gbps throughput gate.
 - Production IGX RX uses `writer.noop:true` and `frames_per_tensor: 16` for
   latency and bounded buffering. Use 128-frame configs for reduced-output
   comparisons against Holoscan.
+- `stem_rx_igx_fpga_dual.yaml` mirrors the two-interface FPGA topology and
+  defaults to the four-source, half-tile test stream on each interface.
 
 Validation after the latest daqiri submodule update passed the HDF5 suite,
 config checks, full IGX live validation, and a 30-minute non-HDS unbounded

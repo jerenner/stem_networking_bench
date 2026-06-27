@@ -20,8 +20,9 @@
  *     LBNL's FPGA emits tile-shaped payloads only)
  *
  * The processor uses:
- *   - stem_dark_correct_uint16_to_float (port of dark_correct_uint16_to_float)
- *   - stem_compute_frame_mean_float / stem_apply_dynamic_half_column_mask_float
+ *   - stem_compute_blr_baseline
+ *   - stem_correct_with_blr_and_mean
+ *   - stem_apply_dynamic_and_valid_pixel_mask_float
  *   - stem_sum_frames_float_to_frame
  */
 #pragma once
@@ -132,30 +133,47 @@ void stem_gather_tile_packets_by_placement(
     uint32_t frames, uint32_t frame_height, uint32_t frame_width,
     bool duplicate_prefix_to_simulate_tile_payload, cudaStream_t stream);
 
-// ---------------------------------------------------------------------------
-// Processor: dark-frame subtraction + valid-pixel mask in one fused
-// kernel. Operates on a [frames, height, width] uint16 input and writes a
-// [frames, height, width] float32 output. Both arrays live on the GPU.
-// ---------------------------------------------------------------------------
-void stem_dark_correct_uint16_to_float(
-    const uint16_t* input, const float* dark_frame,
-    const float* valid_pixel_mask, float* output, uint32_t frames,
-    uint32_t height, uint32_t width, bool subtract_dark,
-    bool apply_valid_pixel_mask, cudaStream_t stream);
+// Processor kernels mirror the fused Holoscan correction path. BLR is
+// estimated from the unmodified input (optionally dark-subtracted), then the
+// conversion, dark subtraction, BLR subtraction, and batch mean are performed
+// in one pass for either uint16 or float32 input.
+void stem_compute_blr_baseline(
+    const uint16_t* input, const float* dark_frame, float* baseline,
+    uint32_t frames, uint32_t height, uint32_t width, uint32_t blr_rows,
+    uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, cudaStream_t stream);
 
-void stem_dark_correct_float_to_float(
-    const float* input, const float* dark_frame, const float* valid_pixel_mask,
-    float* output, uint32_t frames, uint32_t height, uint32_t width,
-    bool subtract_dark, bool apply_valid_pixel_mask, cudaStream_t stream);
+void stem_compute_blr_baseline(
+    const float* input, const float* dark_frame, float* baseline,
+    uint32_t frames, uint32_t height, uint32_t width, uint32_t blr_rows,
+    uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, cudaStream_t stream);
 
-void stem_compute_frame_mean_float(const float* input, float* mean,
-                                   uint32_t frames, uint32_t height,
-                                   uint32_t width, cudaStream_t stream);
+void stem_correct_with_blr_and_mean(
+    const uint16_t* input, const float* dark_frame, const float* blr_baseline,
+    float* output, float* batch_mean, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, bool apply_blr,
+    bool compute_batch_mean, cudaStream_t stream);
 
-void stem_apply_dynamic_half_column_mask_float(
-    float* input, const float* batch_mean, uint32_t frames, uint32_t height,
-    uint32_t width, uint32_t median_window_pixels, float threshold_ratio,
-    float threshold_offset, cudaStream_t stream);
+void stem_correct_with_blr_and_mean(
+    const float* input, const float* dark_frame, const float* blr_baseline,
+    float* output, float* batch_mean, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, bool apply_blr,
+    bool compute_batch_mean, cudaStream_t stream);
+
+void stem_apply_dynamic_and_valid_pixel_mask_float(
+    float* input, const float* batch_mean, const float* valid_pixel_mask,
+    uint32_t frames, uint32_t height, uint32_t width,
+    uint32_t median_window_pixels, float threshold_ratio,
+    float threshold_offset, uint32_t excluded_edge_rows,
+    bool apply_dynamic_mask, bool two_sided, bool apply_valid_pixel_mask,
+    cudaStream_t stream);
+
+void stem_apply_valid_pixel_mask_float(
+    float* input, const float* valid_pixel_mask, uint32_t frames,
+    uint32_t height, uint32_t width, cudaStream_t stream);
 
 void stem_sum_frames_float_to_frame(const float* input, float* output,
                                     uint32_t frames, uint32_t height,

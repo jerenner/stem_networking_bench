@@ -1,0 +1,123 @@
+# IGX Orin + RTX 6000 Ada dual-FPGA production RX configuration.
+# Each NIC carries an independent detector-frame stream. Receiver batches are
+# assembled independently, processed by the shared GPU pipeline, and (when
+# enabled) serialized into one HDF5 dataset in arrival order.
+%YAML 1.2
+---
+source: "network"
+num_receivers: 2
+
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "raw"
+    master_core: 8
+    debug: false
+    log_level: "info"
+    loopback: ""
+
+    memory_regions:
+    - name: "Data_RX_GPU_0"
+      kind: "device"
+      affinity: 0
+      num_bufs: 262144
+      # Covers the current 7786-byte row-compatible packet and a future
+      # 4096-sample native tile packet including all headers.
+      buf_size: 9228
+    - name: "Data_RX_GPU_1"
+      kind: "device"
+      affinity: 0
+      num_bufs: 262144
+      buf_size: 9228
+
+    interfaces:
+    - name: "rx_port_0"
+      address: "0005:03:00.0"
+      rx:
+        flow_isolation: true
+        queues:
+        - name: "rx_q_0"
+          id: 0
+          cpu_core: 9
+          batch_size: 4096
+          timeout_us: 1000
+          memory_regions:
+            - "Data_RX_GPU_0"
+        flows:
+        - name: "flow_0"
+          id: 0
+          action:
+            type: queue
+            id: 0
+          match:
+            udp_dst: 23130
+    - name: "rx_port_1"
+      address: "0005:03:00.1"
+      rx:
+        flow_isolation: true
+        queues:
+        - name: "rx_q_1"
+          id: 0
+          cpu_core: 10
+          batch_size: 4096
+          timeout_us: 1000
+          memory_regions:
+            - "Data_RX_GPU_1"
+        flows:
+        - name: "flow_1"
+          id: 0
+          action:
+            type: queue
+            id: 0
+          match:
+            udp_dst: 23130
+
+stem_rx:
+  frames_per_tensor: 128
+  header_size: 42
+  payload_size: 7680
+  # Current FPGA tests emit IDs 0-3, filling 480 of 960 tiles. Use 255 when
+  # all eight IDs are active and each interface supplies complete frames.
+  expected_source_mask: 15
+  batch_close_slack_packets: 512
+  total_time_to_recv: -1.0
+  capture_latency: false
+  gpu_header_extract: true
+  # Current packets contain 3840 samples. This repeats their first 256 samples
+  # to exercise a full 4096-sample tile copy. Set false for native tile payloads
+  # and update payload_size and flow-length matching at the same time.
+  tile_duplicate_prefix_to_simulate_payload: true
+
+receiver0:
+  interface_name: "rx_port_0"
+
+receiver1:
+  interface_name: "rx_port_1"
+
+processor:
+  # Noop skips only reduction; every correction enabled below still executes.
+  noop: true
+  subtract_dark_frame: false
+  dark_frame_path: ""
+  dark_frame_dataset: "/processed"
+  apply_valid_pixel_mask: false
+  valid_pixel_mask_dataset: "/valid_pixel_mask"
+  apply_blr_correction: false
+  blr_rows: 30
+  blr_zlp_width: 768
+  blr_zlp_group_columns: 4
+  blr_core_group_columns: 16
+  apply_dynamic_half_column_mask: true
+  dynamic_mask_median_window_pixels: 31
+  dynamic_mask_threshold_ratio: 1.0
+  dynamic_mask_threshold_offset: 500.0
+  dynamic_mask_excluded_edge_rows: 32
+  dynamic_mask_two_sided: true
+
+writer:
+  filepath: "/tmp/stem_rx_igx_fpga_dual.h5"
+  dataset_name: "/processed"
+  # Keep true for the 2x100-Gbps keep-up test. If false, batches from both
+  # receivers are serialized into the same dataset in arrival order.
+  noop: true
+  num_concurrent: 3
