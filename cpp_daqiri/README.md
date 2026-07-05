@@ -519,6 +519,29 @@ cpp_daqiri/scripts/parse_spark_parity_results.py \
     --duration 8
 ```
 
+## HDF5 replay
+
+The DAQIRI receiver binary can replay finite `uint16` or `float32` HDF5
+datasets with shape `[frames,H,W]` through the same `FramePipeline` and fused
+CUDA processing kernels used by live network input. The host-side wrapper
+generates the container config and bind-mounts all files, so no interactive
+container or manual file copies are needed:
+
+```bash
+cpp_daqiri/scripts/run_daqiri_hdf5_replay.sh \
+    --input /path/to/nio_15pa_spectrum_frames_float32_uncompressed.h5 \
+    --dark /path/to/nio_15pa_dark_frame_float32.h5 \
+    --output /path/to/nio_15pa_spectrum_processed.h5 \
+    --count 256
+```
+
+Supplying `--dark` enables dark subtraction, valid-pixel masking, grouped BLR,
+and two-sided dynamic masking by default. The input and dark frame must have
+the same `H,W` geometry. `processor.noop` remains true unless `--reduce` is
+passed, so the default output contains every fully processed input frame.
+HDF5 replay validates processing and numerical output, but it is not paced like
+a live 100 Gb/s stream and therefore is not a receiver keep-up test.
+
 ## Files
 
 | Path | Purpose |
@@ -534,6 +557,7 @@ cpp_daqiri/scripts/parse_spark_parity_results.py \
 | `configs/stem_rx_igx_loopback.yaml` | IGX hardware-loopback RX config |
 | `configs/stem_rx_igx_loopback_hds.yaml` | IGX hardware-loopback RX config with HDS |
 | `configs/stem_replay_hdf5.yaml` | finite uint16/float32 HDF5 replay config for processor parity |
+| `scripts/run_daqiri_hdf5_replay.sh` | one-shot Docker wrapper for finite HDF5 processing |
 | `scripts/run_daqiri_validation.sh` | repeatable HDF5, config, live, writer, and HDS validation gates |
 | `configs/stem_tx_igx_loopback.yaml` | IGX hardware-loopback TX config |
 | `configs/stem_{tx,rx}_spark.yaml` | two-Spark configs |
