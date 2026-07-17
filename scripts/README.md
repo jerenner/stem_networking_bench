@@ -22,8 +22,12 @@ canonical CPU/NumPy reproduction of the `PyTorchProcessorOp` correction chain.
 - `offline/`: HDF5 replay-style processing and processed-frame plotting.
 - `studies/`: manifest-driven studies that combine multiple files/currents and
   write publication-style summary products.
+  `run_nio_threshold_study.py` sweeps ImageJ-style positive thresholds before
+  column-spectrum accumulation.
 - `diagnostics/`: narrower scripts used to investigate BLR artifacts,
   dark-frame recovery trends, single-frame samples, or local sanity checks.
+  `plot_raw_frame_qc.py` writes per-frame TIFF figures that combine a raw 2D
+  frame view with ZLP/CoreLoss BLR-row baseline diagnostics.
 
 ## Invocation
 

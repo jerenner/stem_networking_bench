@@ -15,15 +15,15 @@ daqiri:
     debug: false
     log_level: "info"
     loopback: ""
+    rx_meta_buffers: 1024
 
     memory_regions:
     - name: "Data_RX_GPU_0"
       kind: "device"
       affinity: 0
       num_bufs: 262144
-      # Covers the current 7786-byte row-compatible packet and stays below
-      # DAQIRI's 9100-byte wire-frame ceiling. Native 4096-sample tile packets
-      # will require a coordinated packet-size update.
+      # Covers the current 7786-byte row-compatible packet and a future
+      # 4096-sample native tile packet including all headers.
       buf_size: 8064
     - name: "Data_RX_GPU_1"
       kind: "device"
@@ -40,8 +40,8 @@ daqiri:
         - name: "rx_q_0"
           id: 0
           cpu_core: 9
-          batch_size: 4096
-          timeout_us: 1000
+          batch_size: 16384
+          timeout_us: 0
           memory_regions:
             - "Data_RX_GPU_0"
         flows:
@@ -60,8 +60,8 @@ daqiri:
         - name: "rx_q_1"
           id: 0
           cpu_core: 10
-          batch_size: 4096
-          timeout_us: 1000
+          batch_size: 16384
+          timeout_us: 0
           memory_regions:
             - "Data_RX_GPU_1"
         flows:
@@ -79,7 +79,7 @@ stem_rx:
   payload_size: 7680
   # Current FPGA tests emit IDs 0-3, filling 480 of 960 tiles. Use 255 when
   # all eight IDs are active and each interface supplies complete frames.
-  expected_source_mask: 15
+  expected_source_mask: 13
   batch_close_slack_packets: 512
   total_time_to_recv: -1.0
   capture_latency: false
@@ -98,12 +98,12 @@ receiver1:
 processor:
   # Noop skips only reduction; every correction enabled below still executes.
   noop: true
-  subtract_dark_frame: false
-  dark_frame_path: ""
+  subtract_dark_frame: true
+  dark_frame_path: "/calibration/dark.h5"
   dark_frame_dataset: "/processed"
-  apply_valid_pixel_mask: false
+  apply_valid_pixel_mask: true
   valid_pixel_mask_dataset: "/valid_pixel_mask"
-  apply_blr_correction: false
+  apply_blr_correction: true
   blr_rows: 30
   blr_zlp_width: 768
   blr_zlp_group_columns: 4

@@ -17,6 +17,12 @@ There are two C++ implementations of the same wire-format pipeline:
 Both implementations use the same STEM packet geometry:
 42 B Ethernet/IPv4/UDP + 64 B STEM header + 7680 B payload in a 7786 B packet.
 
+See [`docs/CURRENT_PACKET_FORMAT.md`](docs/CURRENT_PACKET_FORMAT.md) for the
+concise sender-facing packet and custom-header specification. See
+[`docs/PACKET_AND_FRAME_FORMAT.md`](docs/PACKET_AND_FRAME_FORMAT.md) for source
+and sequence mapping, the current row-to-tile compatibility transformation,
+dual-receiver topology, frame assembly, and the native tile target.
+
 ## Architecture & Strategy
 
 ```mermaid
