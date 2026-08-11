@@ -18,6 +18,7 @@ __pycache__/
 # Local exploratory output directories
 dark_subtraction_analysis/
 test_data/
+daqiri_profiles/
 
 # Scratch diagnostics
 frame0_dump.txt

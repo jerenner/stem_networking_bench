@@ -402,6 +402,48 @@ docker run --rm \
     --rate 20
 ```
 
+### Live FPGA platform profile
+
+Use `scripts/run_igx_fpga_profile.sh` on the IGX host to run the dual-FPGA
+receiver and `tegrastats` over the same timed interval. The default duration is
+five minutes and the default platform sampling interval is one second:
+
+```bash
+cpp_daqiri/scripts/run_igx_fpga_profile.sh \
+  --config cpp_daqiri/configs/stem_rx_igx_fpga_dual.yaml \
+  --dark /absolute/path/to/walking_dot_dark_frame.h5 \
+  --seconds 300 \
+  --output-root /absolute/path/to/daqiri_profiles
+```
+
+The script creates a unique timestamped directory containing the exact YAML,
+its hash and Git commit, timestamped DAQIRI output, raw `tegrastats` output,
+a tab-separated platform timeline, and synchronized `nvidia-smi` samples when
+the discrete GPU is visible. `tegrastats` captures Orin CPU, memory-controller,
+power, temperature, and integrated-GPU data; `nvidia-smi` captures utilization,
+memory, clocks, temperature, and power for the RTX GPU used by CUDA. The
+script starts both samplers one second before the container to capture a
+baseline and records the start times in `run_metadata.txt`. It stops the
+samplers and container on normal completion, Ctrl-C, or termination.
+
+The script must run on the IGX host, where `tegrastats`, Docker, the NICs, and
+the hugepage mount are available. The dark-frame argument can be omitted only
+when the selected YAML does not refer to `/calibration/dark.h5`.
+
+Analyze a completed timestamped profile on a system with Python, pandas, NumPy,
+and Matplotlib:
+
+```bash
+python cpp_daqiri/scripts/analyze_igx_fpga_profile.py \
+  /absolute/path/to/daqiri_profiles/20260726T170603Z
+```
+
+The analyzer aligns telemetry to the DAQIRI worker interval and writes an
+`analysis` subdirectory containing a keep-up dashboard, synchronized platform
+timeline, CPU-core heatmap, Markdown summary, and machine-readable JSON metrics.
+The dashboard reports startup NIC-drop events separately from steady-state
+pipeline backpressure and labels the compatibility tile discard as intentional.
+
 RX assembly is now tile-only (`gather_tile_packets_by_placement`); the legacy
 row-based gather and its `--validate-ramp` correctness gate were removed
 because LBNL's FPGA cannot emit row-shaped payloads. The test TX still emits
