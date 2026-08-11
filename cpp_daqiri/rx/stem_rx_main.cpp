@@ -57,6 +57,7 @@
 
 #include <daqiri/daqiri.h>
 
+#include "stem_aux_output.h"
 #include "stem_kernels.h"
 #include "stem_packet.h"
 
@@ -122,6 +123,7 @@ inline void stem_cuda_check(cudaError_t err, const char* stmt, const char* file,
 // ---------------------------------------------------------------------------
 struct StemRxConfig {
   std::string interface_name = "rx_port";
+  uint32_t receiver_id = 0;
 
   // Frame batching: how many full 1024x3840 frames are gathered into one
   // emitted output tensor. Matches cpp/stem_receiver_op.h frames_per_tensor.
@@ -249,6 +251,129 @@ ProcessorConfig parse_processor_cfg(const YAML::Node& root,
   return cfg;
 }
 
+stem::ThresholdConfig parse_threshold_cfg(const YAML::Node& node) {
+  stem::ThresholdConfig cfg;
+  if (!node) { return cfg; }
+  cfg.zlp = node["zlp"].as<float>(cfg.zlp);
+  cfg.core_loss = node["core_loss"].as<float>(cfg.core_loss);
+  return cfg;
+}
+
+stem::BurstWriterConfig parse_burst_writer_cfg(const YAML::Node& root) {
+  stem::BurstWriterConfig cfg;
+  if (!root["burst_writer"]) { return cfg; }
+  const auto node = root["burst_writer"];
+  cfg.enabled = node["enabled"].as<bool>(cfg.enabled);
+  cfg.stage = stem::parse_processing_stage(
+      node["processing_stage"].as<std::string>(
+          stem::processing_stage_name(cfg.stage)));
+  cfg.filepath_template = node["filepath_template"].as<std::string>(
+      cfg.filepath_template);
+  cfg.dataset_name =
+      node["dataset_name"].as<std::string>(cfg.dataset_name);
+  cfg.buckets_per_capture = node["buckets_per_capture"].as<uint32_t>(
+      cfg.buckets_per_capture);
+  cfg.capture_count =
+      node["capture_count"].as<uint64_t>(cfg.capture_count);
+  cfg.rearm_after_write =
+      node["rearm_after_write"].as<bool>(cfg.rearm_after_write);
+  cfg.strict_complete =
+      node["strict_complete"].as<bool>(cfg.strict_complete);
+  cfg.threshold = parse_threshold_cfg(node["threshold"]);
+  return cfg;
+}
+
+stem::ThinnedStreamConfig parse_thinned_stream_cfg(const YAML::Node& root) {
+  stem::ThinnedStreamConfig cfg;
+  if (!root["thinned_stream"]) { return cfg; }
+  const auto node = root["thinned_stream"];
+  cfg.enabled = node["enabled"].as<bool>(cfg.enabled);
+  cfg.stage = stem::parse_processing_stage(
+      node["processing_stage"].as<std::string>(
+          stem::processing_stage_name(cfg.stage)));
+  cfg.endpoint = node["endpoint"].as<std::string>(cfg.endpoint);
+  cfg.topic_prefix =
+      node["topic_prefix"].as<std::string>(cfg.topic_prefix);
+  cfg.total_refresh_hz =
+      node["total_refresh_hz"].as<double>(cfg.total_refresh_hz);
+  cfg.representative_frame_index =
+      node["representative_frame_index"].as<uint32_t>(
+          cfg.representative_frame_index);
+  cfg.include_representative_frame =
+      node["include_representative_frame"].as<bool>(
+          cfg.include_representative_frame);
+  cfg.include_bucket_sum = node["include_bucket_sum"].as<bool>(
+      cfg.include_bucket_sum);
+  cfg.queue_depth =
+      node["queue_depth"].as<uint32_t>(cfg.queue_depth);
+  cfg.threshold = parse_threshold_cfg(node["threshold"]);
+  return cfg;
+}
+
+bool processor_produces_float(const ProcessorConfig& processor) {
+  return !processor.noop || processor.subtract_dark_frame ||
+         processor.apply_valid_pixel_mask || processor.apply_blr_correction ||
+         processor.apply_dynamic_half_column_mask;
+}
+
+void validate_processing_stage(stem::ProcessingStage stage,
+                               const ProcessorConfig& processor,
+                               const stem::ThresholdConfig& threshold,
+                               const std::string& label) {
+  if (stage == stem::ProcessingStage::kCounted) {
+    throw std::runtime_error(
+        label + ".processing_stage=counted is reserved but not implemented");
+  }
+  if (stage == stem::ProcessingStage::kDarkSubtracted &&
+      !processor.subtract_dark_frame) {
+    throw std::runtime_error(label +
+                             ".processing_stage=dark_subtracted requires "
+                             "processor.subtract_dark_frame=true");
+  }
+  if (stage == stem::ProcessingStage::kDarkBlr &&
+      (!processor.subtract_dark_frame || !processor.apply_blr_correction)) {
+    throw std::runtime_error(
+        label + ".processing_stage=dark_blr requires dark subtraction and "
+                "BLR correction");
+  }
+  if ((stage == stem::ProcessingStage::kCorrected ||
+       stage == stem::ProcessingStage::kThresholded) &&
+      !processor_produces_float(processor)) {
+    throw std::runtime_error(label +
+                             ".processing_stage requires a float32 processor "
+                             "path");
+  }
+  if (stage == stem::ProcessingStage::kThresholded &&
+      (threshold.zlp < 0.0f || threshold.core_loss < 0.0f)) {
+    throw std::runtime_error(label +
+                             ".threshold values must be non-negative");
+  }
+}
+
+void validate_auxiliary_outputs(
+    const ProcessorConfig& processor, const WriterConfig& writer,
+    const stem::BurstWriterConfig& burst,
+    const stem::ThinnedStreamConfig& thinned) {
+  if (burst.enabled) {
+    if (!writer.noop) {
+      throw std::runtime_error(
+          "continuous writer and burst_writer cannot both be enabled; set "
+          "writer.noop=true for controlled burst acquisition");
+    }
+    validate_processing_stage(burst.stage, processor, burst.threshold,
+                              "burst_writer");
+  }
+  if (thinned.enabled) {
+    if (thinned.total_refresh_hz < 0.0) {
+      throw std::runtime_error(
+          "thinned_stream.total_refresh_hz must be non-negative (0 means "
+          "publish every round-robin opportunity)");
+    }
+    validate_processing_stage(thinned.stage, processor, thinned.threshold,
+                              "thinned_stream");
+  }
+}
+
 void apply_stem_rx_node(StemRxConfig& cfg, const YAML::Node& rx) {
   if (!rx) { return; }
   cfg.interface_name = rx["interface_name"].as<std::string>(cfg.interface_name);
@@ -330,12 +455,14 @@ std::vector<StemRxConfig> parse_stem_rx_cfgs(const YAML::Node& root) {
   YAML::Node single_receiver0 =
       receiver_override_node(root, stem_rx, "receiver0");
   if (num_receivers == 1 && !single_receiver0) {
+    base.receiver_id = 0;
     validate_stem_rx_cfg(base);
     cfgs.push_back(std::move(base));
     return cfgs;
   }
   if (num_receivers == 1) {
     apply_stem_rx_node(base, single_receiver0);
+    base.receiver_id = 0;
     validate_stem_rx_cfg(base);
     cfgs.push_back(std::move(base));
     return cfgs;
@@ -350,6 +477,7 @@ std::vector<StemRxConfig> parse_stem_rx_cfgs(const YAML::Node& root) {
     }
     StemRxConfig cfg = base;
     apply_stem_rx_node(cfg, receiver_node);
+    cfg.receiver_id = static_cast<uint32_t>(i);
     validate_stem_rx_cfg(cfg);
     cfgs.push_back(std::move(cfg));
   }
@@ -653,8 +781,20 @@ class AsyncFrameSink {
 class FramePipeline {
  public:
   FramePipeline(const ProcessorConfig& processor, const WriterConfig& writer,
-                uint32_t height, uint32_t width)
-      : processor_(processor), height_(height), width_(width), sink_(writer) {
+                const stem::BurstWriterConfig& burst_writer,
+                const stem::ThinnedStreamConfig& thinned_stream,
+                uint32_t height, uint32_t width, uint32_t frames_per_bucket,
+                uint32_t receiver_count, bool raw_input_float32 = false)
+      : processor_(processor),
+        burst_writer_cfg_(burst_writer),
+        thinned_stream_cfg_(thinned_stream),
+        height_(height),
+        width_(width),
+        sink_(writer),
+        burst_writer_(burst_writer, height, width, frames_per_bucket,
+                      receiver_count, raw_input_float32),
+        thinned_stream_(thinned_stream, height, width, frames_per_bucket,
+                        receiver_count) {
     if (height_ == 0 || width_ == 0) {
       throw std::runtime_error(
           "FramePipeline requires non-zero frame dimensions");
@@ -711,10 +851,7 @@ class FramePipeline {
   FramePipeline& operator=(const FramePipeline&) = delete;
 
   bool produces_float() const {
-    return !processor_.noop || processor_.subtract_dark_frame ||
-           processor_.apply_valid_pixel_mask ||
-           processor_.apply_blr_correction ||
-           processor_.apply_dynamic_half_column_mask;
+    return processor_produces_float(processor_);
   }
 
   void allocate_slot_buffers(OutputSlot* slot, uint32_t max_frames,
@@ -745,9 +882,78 @@ class FramePipeline {
     }
   }
 
-  void process_slot(OutputSlot* slot, uint32_t frames, cudaStream_t stream,
-                    bool input_float = false) const {
+  void process_slot(OutputSlot* slot, const stem::BatchMetadata& metadata,
+                    cudaStream_t stream, bool input_float = false) {
+    const uint32_t frames = metadata.frames;
     if (frames == 0) { return; }
+
+    auto burst_reservation = burst_writer_.reserve(metadata);
+    auto thinned_reservation = thinned_stream_.reserve(metadata);
+    const void* original_input =
+        input_float ? static_cast<const void*>(slot->gpu_float)
+                    : static_cast<const void*>(slot->gpu_u16);
+
+    const auto emit_thinned = [&](stem::ProcessingStage stage,
+                                  const void* input, bool float32,
+                                  bool subtract_dark,
+                                  bool apply_threshold) {
+      if (!thinned_reservation || thinned_stream_cfg_.stage != stage) { return; }
+      const uint32_t representative_index =
+          thinned_stream_cfg_.representative_frame_index;
+      const auto& threshold = thinned_stream_cfg_.threshold;
+      if (float32) {
+        stem::stem_extract_representative_and_sum(
+            static_cast<const float*>(input),
+            subtract_dark ? gpu_dark_frame_ : nullptr,
+            thinned_reservation->representative_device,
+            thinned_reservation->sum_device, frames, height_, width_,
+            representative_index, subtract_dark, apply_threshold,
+            processor_.blr_zlp_width, threshold.zlp, threshold.core_loss,
+            stream);
+      } else {
+        stem::stem_extract_representative_and_sum(
+            static_cast<const uint16_t*>(input),
+            subtract_dark ? gpu_dark_frame_ : nullptr,
+            thinned_reservation->representative_device,
+            thinned_reservation->sum_device, frames, height_, width_,
+            representative_index, subtract_dark, apply_threshold,
+            processor_.blr_zlp_width, threshold.zlp, threshold.core_loss,
+            stream);
+      }
+      thinned_stream_.submit(*thinned_reservation, stream);
+    };
+
+    const auto emit_burst_copy = [&](stem::ProcessingStage stage,
+                                     const void* input, bool float32) {
+      if (!burst_reservation || burst_writer_cfg_.stage != stage) { return; }
+      burst_writer_.submit_copy(*burst_reservation, input, float32, stream);
+    };
+
+    emit_burst_copy(stem::ProcessingStage::kRaw, original_input, input_float);
+    emit_thinned(stem::ProcessingStage::kRaw, original_input, input_float,
+                 false, false);
+
+    if (burst_reservation &&
+        burst_writer_cfg_.stage == stem::ProcessingStage::kDarkSubtracted) {
+      if (input_float) {
+        stem::stem_correct_with_blr_and_mean(
+            static_cast<const float*>(original_input), gpu_dark_frame_, nullptr,
+            static_cast<float*>(burst_reservation->device_ptr), nullptr, frames,
+            height_, width_, processor_.blr_zlp_width,
+            processor_.blr_zlp_group_columns,
+            processor_.blr_core_group_columns, true, false, false, stream);
+      } else {
+        stem::stem_correct_with_blr_and_mean(
+            static_cast<const uint16_t*>(original_input), gpu_dark_frame_,
+            nullptr, static_cast<float*>(burst_reservation->device_ptr),
+            nullptr, frames, height_, width_, processor_.blr_zlp_width,
+            processor_.blr_zlp_group_columns,
+            processor_.blr_core_group_columns, true, false, false, stream);
+      }
+      burst_writer_.submit_direct(*burst_reservation, stream);
+    }
+    emit_thinned(stem::ProcessingStage::kDarkSubtracted, original_input,
+                 input_float, true, false);
 
     if (produces_float()) {
       const float* dark =
@@ -797,6 +1003,10 @@ class FramePipeline {
             processor_.apply_dynamic_half_column_mask, stream);
       }
 
+      emit_burst_copy(stem::ProcessingStage::kDarkBlr, slot->gpu_float, true);
+      emit_thinned(stem::ProcessingStage::kDarkBlr, slot->gpu_float, true,
+                   false, false);
+
       if (processor_.apply_dynamic_half_column_mask) {
         stem::stem_apply_dynamic_and_valid_pixel_mask_float(
             slot->gpu_float, slot->gpu_batch_mean,
@@ -812,6 +1022,22 @@ class FramePipeline {
         stem::stem_apply_valid_pixel_mask_float(
             slot->gpu_float, gpu_valid_mask_, frames, height_, width_, stream);
       }
+
+      emit_burst_copy(stem::ProcessingStage::kCorrected, slot->gpu_float, true);
+      emit_thinned(stem::ProcessingStage::kCorrected, slot->gpu_float, true,
+                   false, false);
+
+      if (burst_reservation &&
+          burst_writer_cfg_.stage == stem::ProcessingStage::kThresholded) {
+        stem::stem_threshold_frames_float(
+            slot->gpu_float,
+            static_cast<float*>(burst_reservation->device_ptr), frames, height_,
+            width_, processor_.blr_zlp_width, burst_writer_cfg_.threshold.zlp,
+            burst_writer_cfg_.threshold.core_loss, stream);
+        burst_writer_.submit_direct(*burst_reservation, stream);
+      }
+      emit_thinned(stem::ProcessingStage::kThresholded, slot->gpu_float, true,
+                   false, true);
 
       if (!processor_.noop) {
         stem::stem_sum_frames_float_to_frame(slot->gpu_float, slot->gpu_reduced,
@@ -846,7 +1072,20 @@ class FramePipeline {
 
   uint64_t queued() const { return sink_.queued(); }
   uint64_t written() const { return sink_.written(); }
-  uint64_t errors() const { return sink_.errors(); }
+  uint64_t errors() const {
+    // A diagnostic viewer must never be able to fail acquisition. ZeroMQ
+    // send failures remain visible in thinned-stream statistics, while only
+    // durable-output failures affect the process exit status.
+    return sink_.errors() + burst_writer_.stats().errors;
+  }
+  void drain_auxiliary() {
+    burst_writer_.drain();
+    thinned_stream_.drain();
+  }
+  stem::BurstWriterStats burst_stats() const { return burst_writer_.stats(); }
+  stem::ThinnedStreamStats thinned_stats() const {
+    return thinned_stream_.stats();
+  }
 
  private:
   void validate_correction_shape(const Hdf5FrameData& frame,
@@ -909,11 +1148,15 @@ class FramePipeline {
   }
 
   ProcessorConfig processor_;
+  stem::BurstWriterConfig burst_writer_cfg_;
+  stem::ThinnedStreamConfig thinned_stream_cfg_;
   uint32_t height_ = 0;
   uint32_t width_ = 0;
   float* gpu_dark_frame_ = nullptr;
   float* gpu_valid_mask_ = nullptr;
   AsyncFrameSink sink_;
+  stem::BurstWriter burst_writer_;
+  stem::ThinnedStreamPublisher thinned_stream_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1501,7 +1744,16 @@ class FrameAssembler {
           cfg_.frames_per_tensor, stem::FRAME_HEIGHT, stem::FRAME_WIDTH,
           cfg_.tile_duplicate_prefix_to_simulate_payload, stream_);
 
-      pipeline_->process_slot(output_slot, cfg_.frames_per_tensor, stream_);
+      stem::BatchMetadata metadata;
+      metadata.receiver_id = cfg_.receiver_id;
+      metadata.interface_name = cfg_.interface_name;
+      metadata.batch_index = emitted_batches_;
+      metadata.first_frame = current_batch_start_abs_frame_;
+      metadata.frames = cfg_.frames_per_tensor;
+      metadata.received_packets = pkts_to_gather;
+      metadata.expected_packets = expected_packets_per_batch_;
+      metadata.complete = pkts_to_gather >= expected_packets_per_batch_;
+      pipeline_->process_slot(output_slot, metadata, stream_);
       output_slot->batch_index = emitted_batches_;
       STEM_CUDA_TRY(cudaEventRecord(output_slot->ready, stream_));
       pipeline_->enqueue(output_slot);
@@ -1813,6 +2065,10 @@ int run_hdf5_replay(const YAML::Node& root) {
   const ReplayerConfig replayer = parse_replayer_cfg(root);
   const WriterConfig writer = parse_writer_cfg(root);
   const ProcessorConfig processor = parse_processor_cfg(root, YAML::Node{});
+  const stem::BurstWriterConfig burst_writer = parse_burst_writer_cfg(root);
+  const stem::ThinnedStreamConfig thinned_stream =
+      parse_thinned_stream_cfg(root);
+  validate_auxiliary_outputs(processor, writer, burst_writer, thinned_stream);
 
   H5::Exception::dontPrint();
   H5::H5File file(replayer.filepath, H5F_ACC_RDONLY);
@@ -1839,8 +2095,9 @@ int run_hdf5_replay(const YAML::Node& root) {
   }
 
   auto pipeline = std::make_shared<FramePipeline>(
-      processor, writer, static_cast<uint32_t>(dims[1]),
-      static_cast<uint32_t>(dims[2]));
+      processor, writer, burst_writer, thinned_stream,
+      static_cast<uint32_t>(dims[1]), static_cast<uint32_t>(dims[2]),
+      replayer.frames_per_tensor, 1, dataset_float32);
 
   cudaStream_t stream = nullptr;
   STEM_CUDA_TRY(cudaStreamCreate(&stream));
@@ -1906,7 +2163,14 @@ int run_hdf5_replay(const YAML::Node& root) {
                                       : static_cast<void*>(slot->gpu_u16),
                                   host_buffer.data(), host_buffer.size(),
                                   cudaMemcpyHostToDevice, stream));
-    pipeline->process_slot(slot, batch_frames, stream, dataset_float32);
+    stem::BatchMetadata metadata;
+    metadata.receiver_id = 0;
+    metadata.interface_name = "hdf5_replay";
+    metadata.batch_index = emitted_batches;
+    metadata.first_frame = current_frame;
+    metadata.frames = batch_frames;
+    metadata.complete = true;
+    pipeline->process_slot(slot, metadata, stream, dataset_float32);
     slot->batch_index = emitted_batches++;
     STEM_CUDA_TRY(cudaEventRecord(slot->ready, stream));
     pipeline->enqueue(slot);
@@ -1917,6 +2181,7 @@ int run_hdf5_replay(const YAML::Node& root) {
 
   STEM_CUDA_TRY(cudaStreamSynchronize(stream));
   wait_for_replay_slots(slots);
+  pipeline->drain_auxiliary();
   for (auto& slot : slots) {
     if (slot->gpu_u16) { cudaFree(slot->gpu_u16); }
     if (slot->gpu_float) { cudaFree(slot->gpu_float); }
@@ -1942,6 +2207,27 @@ int run_hdf5_replay(const YAML::Node& root) {
               static_cast<unsigned long>(pipeline->written()));
   std::printf("  sink errors      : %lu\n",
               static_cast<unsigned long>(pipeline->errors()));
+  const auto burst_stats = pipeline->burst_stats();
+  std::printf("  burst captures   : %lu written / %lu started\n",
+              static_cast<unsigned long>(burst_stats.captures_written),
+              static_cast<unsigned long>(burst_stats.captures_started));
+  std::printf("  burst buckets    : %lu captured, %lu skipped busy\n",
+              static_cast<unsigned long>(burst_stats.buckets_captured),
+              static_cast<unsigned long>(burst_stats.buckets_skipped_busy));
+  std::printf("  burst rejected   : %lu incomplete, %lu aborted, %lu errors\n",
+              static_cast<unsigned long>(
+                  burst_stats.buckets_rejected_incomplete),
+              static_cast<unsigned long>(burst_stats.aborted_captures),
+              static_cast<unsigned long>(burst_stats.errors));
+  const auto thinned_stats = pipeline->thinned_stats();
+  std::printf("  thinned stream   : %lu published / %lu queued\n",
+              static_cast<unsigned long>(thinned_stats.products_published),
+              static_cast<unsigned long>(thinned_stats.products_queued));
+  std::printf("  thinned drops    : %lu no-buffer, %lu coalesced, %lu send errors\n",
+              static_cast<unsigned long>(
+                  thinned_stats.products_dropped_no_buffer),
+              static_cast<unsigned long>(thinned_stats.products_coalesced),
+              static_cast<unsigned long>(thinned_stats.send_errors));
   return pipeline->errors() == 0 ? 0 : 1;
 #endif
 }
@@ -1973,14 +2259,47 @@ int main(int argc, char** argv) {
     }
 
     std::vector<StemRxConfig> cfgs = parse_stem_rx_cfgs(root);
+    const stem::BurstWriterConfig burst_writer = parse_burst_writer_cfg(root);
+    const stem::ThinnedStreamConfig thinned_stream =
+        parse_thinned_stream_cfg(root);
+    validate_auxiliary_outputs(cfgs.front().processor, cfgs.front().writer,
+                               burst_writer, thinned_stream);
+    if (burst_writer.enabled || thinned_stream.enabled) {
+      for (const auto& cfg : cfgs) {
+        if (cfg.frames_per_tensor != cfgs.front().frames_per_tensor) {
+          throw std::runtime_error(
+              "burst/thinned outputs require the same frames_per_tensor for "
+              "all receivers");
+        }
+      }
+    }
     for (auto& cfg : cfgs) {
       if (cli_seconds > -1.5) { cfg.total_time_to_recv_s = cli_seconds; }
       print_rx_start(cfg);
     }
 
+    if (burst_writer.enabled) {
+      std::cout << "burst_writer enabled stage="
+                << stem::processing_stage_name(burst_writer.stage)
+                << " buckets_per_capture="
+                << burst_writer.buckets_per_capture
+                << " capture_count=" << burst_writer.capture_count
+                << " strict_complete="
+                << (burst_writer.strict_complete ? "true" : "false") << "\n";
+    }
+    if (thinned_stream.enabled) {
+      std::cout << "thinned_stream enabled stage="
+                << stem::processing_stage_name(thinned_stream.stage)
+                << " endpoint=" << thinned_stream.endpoint
+                << " total_refresh_hz=" << thinned_stream.total_refresh_hz
+                << " representative_frame_index="
+                << thinned_stream.representative_frame_index << "\n";
+    }
+
     auto pipeline = std::make_shared<FramePipeline>(
-        cfgs.front().processor, cfgs.front().writer, stem::FRAME_HEIGHT,
-        stem::FRAME_WIDTH);
+        cfgs.front().processor, cfgs.front().writer, burst_writer,
+        thinned_stream, stem::FRAME_HEIGHT, stem::FRAME_WIDTH,
+        cfgs.front().frames_per_tensor, static_cast<uint32_t>(cfgs.size()));
     if (pipeline->errors() > 0) { return 1; }
 
     if (daqiri::daqiri_init(argv[1]) != daqiri::Status::SUCCESS) {
@@ -1997,6 +2316,31 @@ int main(int argc, char** argv) {
                            std::ref(run_stats));
     }
     for (auto& t : threads) { t.join(); }
+
+    pipeline->drain_auxiliary();
+    const auto burst_stats = pipeline->burst_stats();
+    std::printf("stem_daqiri auxiliary output summary:\n");
+    std::printf("  burst captures   : %lu written / %lu started\n",
+                static_cast<unsigned long>(burst_stats.captures_written),
+                static_cast<unsigned long>(burst_stats.captures_started));
+    std::printf("  burst buckets    : %lu captured, %lu skipped busy\n",
+                static_cast<unsigned long>(burst_stats.buckets_captured),
+                static_cast<unsigned long>(
+                    burst_stats.buckets_skipped_busy));
+    std::printf("  burst rejected   : %lu incomplete, %lu aborted, %lu errors\n",
+                static_cast<unsigned long>(
+                    burst_stats.buckets_rejected_incomplete),
+                static_cast<unsigned long>(burst_stats.aborted_captures),
+                static_cast<unsigned long>(burst_stats.errors));
+    const auto thinned_stats = pipeline->thinned_stats();
+    std::printf("  thinned stream   : %lu published / %lu queued\n",
+                static_cast<unsigned long>(thinned_stats.products_published),
+                static_cast<unsigned long>(thinned_stats.products_queued));
+    std::printf("  thinned drops    : %lu no-buffer, %lu coalesced, %lu send errors\n",
+                static_cast<unsigned long>(
+                    thinned_stats.products_dropped_no_buffer),
+                static_cast<unsigned long>(thinned_stats.products_coalesced),
+                static_cast<unsigned long>(thinned_stats.send_errors));
 
     daqiri::print_stats();
     daqiri::shutdown();

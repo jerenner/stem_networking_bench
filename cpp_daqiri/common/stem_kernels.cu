@@ -639,4 +639,119 @@ void stem_sum_frames_float_to_frame(const float* input, float* output,
   check_cuda_launch("stem_sum_frames_float_to_frame_kernel");
 }
 
+__global__ void stem_threshold_frames_float_kernel(
+    const float* input, float* output, uint32_t total_values,
+    uint32_t frame_pixels, uint32_t width, uint32_t zlp_width,
+    float zlp_threshold, float core_threshold) {
+  const uint32_t stride = blockDim.x * gridDim.x;
+  for (uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < total_values; index += stride) {
+    const uint32_t pixel_idx = index % frame_pixels;
+    const uint32_t col = pixel_idx % width;
+    const float threshold = col < zlp_width ? zlp_threshold : core_threshold;
+    const float value = input[index];
+    output[index] = value > threshold ? value : 0.0f;
+  }
+}
+
+void stem_threshold_frames_float(const float* input, float* output,
+                                 uint32_t frames, uint32_t height,
+                                 uint32_t width, uint32_t zlp_width,
+                                 float zlp_threshold, float core_threshold,
+                                 cudaStream_t stream) {
+  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
+  const uint64_t total_values = static_cast<uint64_t>(frames) * frame_pixels;
+  if (total_values == 0) { return; }
+  const uint32_t threads = 256;
+  const uint64_t required_blocks = (total_values + threads - 1) / threads;
+  const uint32_t blocks = static_cast<uint32_t>(
+      required_blocks > 65535ULL ? 65535ULL : required_blocks);
+  stem_threshold_frames_float_kernel<<<blocks, threads, 0, stream>>>(
+      input, output, static_cast<uint32_t>(total_values),
+      static_cast<uint32_t>(frame_pixels), width, zlp_width, zlp_threshold,
+      core_threshold);
+  check_cuda_launch("stem_threshold_frames_float_kernel");
+}
+
+template <typename InputT>
+__global__ void stem_extract_representative_and_sum_kernel(
+    const InputT* input, const float* dark_frame, float* representative,
+    float* sum_output, uint32_t frames, uint32_t frame_pixels, uint32_t width,
+    uint32_t representative_frame_index, bool subtract_dark,
+    bool apply_threshold, uint32_t zlp_width, float zlp_threshold,
+    float core_threshold) {
+  const uint32_t stride = blockDim.x * gridDim.x;
+  for (uint32_t pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
+       pixel_idx < frame_pixels; pixel_idx += stride) {
+    const uint32_t col = pixel_idx % width;
+    const float dark_value = subtract_dark ? dark_frame[pixel_idx] : 0.0f;
+    const float threshold = col < zlp_width ? zlp_threshold : core_threshold;
+    float sum = 0.0f;
+    float representative_value = 0.0f;
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+      const uint64_t index =
+          static_cast<uint64_t>(frame) * frame_pixels + pixel_idx;
+      float value = static_cast<float>(input[index]) - dark_value;
+      if (apply_threshold && value <= threshold) { value = 0.0f; }
+      if (frame == representative_frame_index) {
+        representative_value = value;
+      }
+      sum += value;
+    }
+    if (representative != nullptr) {
+      representative[pixel_idx] = representative_value;
+    }
+    if (sum_output != nullptr) { sum_output[pixel_idx] = sum; }
+  }
+}
+
+template <typename InputT>
+void launch_stem_extract_representative_and_sum(
+    const InputT* input, const float* dark_frame, float* representative,
+    float* sum, uint32_t frames, uint32_t height, uint32_t width,
+    uint32_t representative_frame_index, bool subtract_dark,
+    bool apply_threshold, uint32_t zlp_width, float zlp_threshold,
+    float core_threshold, cudaStream_t stream) {
+  const uint64_t frame_pixels = static_cast<uint64_t>(height) * width;
+  if (frames == 0 || frame_pixels == 0) { return; }
+  const uint32_t threads = 256;
+  const uint64_t required_blocks = (frame_pixels + threads - 1) / threads;
+  const uint32_t blocks = static_cast<uint32_t>(
+      required_blocks > 65535ULL ? 65535ULL : required_blocks);
+  const uint32_t selected_frame =
+      representative_frame_index < frames ? representative_frame_index
+                                          : frames - 1;
+  stem_extract_representative_and_sum_kernel<InputT>
+      <<<blocks, threads, 0, stream>>>(
+          input, dark_frame, representative, sum, frames,
+          static_cast<uint32_t>(frame_pixels), width, selected_frame,
+          subtract_dark, apply_threshold, zlp_width, zlp_threshold,
+          core_threshold);
+  check_cuda_launch("stem_extract_representative_and_sum_kernel");
+}
+
+void stem_extract_representative_and_sum(
+    const uint16_t* input, const float* dark_frame, float* representative,
+    float* sum, uint32_t frames, uint32_t height, uint32_t width,
+    uint32_t representative_frame_index, bool subtract_dark,
+    bool apply_threshold, uint32_t zlp_width, float zlp_threshold,
+    float core_threshold, cudaStream_t stream) {
+  launch_stem_extract_representative_and_sum(
+      input, dark_frame, representative, sum, frames, height, width,
+      representative_frame_index, subtract_dark, apply_threshold, zlp_width,
+      zlp_threshold, core_threshold, stream);
+}
+
+void stem_extract_representative_and_sum(
+    const float* input, const float* dark_frame, float* representative,
+    float* sum, uint32_t frames, uint32_t height, uint32_t width,
+    uint32_t representative_frame_index, bool subtract_dark,
+    bool apply_threshold, uint32_t zlp_width, float zlp_threshold,
+    float core_threshold, cudaStream_t stream) {
+  launch_stem_extract_representative_and_sum(
+      input, dark_frame, representative, sum, frames, height, width,
+      representative_frame_index, subtract_dark, apply_threshold, zlp_width,
+      zlp_threshold, core_threshold, stream);
+}
+
 }  // namespace stem

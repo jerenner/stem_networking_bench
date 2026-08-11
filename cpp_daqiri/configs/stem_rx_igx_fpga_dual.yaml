@@ -122,3 +122,41 @@ writer:
   # receivers are serialized into the same dataset in arrival order.
   noop: true
   num_concurrent: 3
+
+# Controlled contiguous capture. This is independent of the continuous writer
+# above and therefore requires writer.noop: true. Once armed, each receiver
+# captures the next complete 128-frame bucket into its own file. While that
+# file is copied and written, later buckets are deliberately skipped by the
+# burst sink without stopping NIC polling or the processing pipeline.
+burst_writer:
+  enabled: false
+  processing_stage: "corrected"  # raw, dark_subtracted, dark_blr, corrected, thresholded
+  filepath_template: "/data/stem_burst_rx{receiver}_{capture}_{stage}.h5"
+  dataset_name: "/frames"
+  buckets_per_capture: 1
+  capture_count: 1               # 0 means unlimited captures
+  rearm_after_write: true
+  strict_complete: true
+  # Used only when processing_stage is thresholded. Corrected values at or
+  # below the region threshold are written as zero; retained values stay float.
+  threshold:
+    zlp: 0.0
+    core_loss: 0.0
+
+# Nonblocking live-view stream. The global 10-Hz scheduler alternates among
+# receivers, so this dual-RX configuration publishes about 5 products/s/RX.
+# Every multipart message contains JSON metadata followed by an overflow-safe
+# float32 representative frame and float32 sum over the complete bucket.
+thinned_stream:
+  enabled: false
+  endpoint: "tcp://*:5556"
+  topic_prefix: "stem"
+  total_refresh_hz: 10.0
+  processing_stage: "corrected"
+  representative_frame_index: 64
+  include_representative_frame: true
+  include_bucket_sum: true
+  queue_depth: 2
+  threshold:
+    zlp: 0.0
+    core_loss: 0.0

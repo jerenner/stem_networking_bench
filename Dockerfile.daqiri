@@ -42,6 +42,8 @@
 #   STEM_DAQIRI_BUILD_RX     ON to build the RX binary.
 #   STEM_DAQIRI_ENABLE_HDF5  ON to build the optional RX smoke/debug HDF5 writer.
 #   STEM_DAQIRI_REQUIRE_HDF5 ON to fail the build if HDF5 is unavailable.
+#   STEM_DAQIRI_ENABLE_ZMQ   ON to build the thinned ZeroMQ PUB stream.
+#   STEM_DAQIRI_REQUIRE_ZMQ  ON to fail the build if ZeroMQ is unavailable.
 
 ARG DAQIRI_BASE=daqiri-torch:local
 
@@ -53,12 +55,14 @@ ARG STEM_DAQIRI_BUILD_TX=OFF
 ARG STEM_DAQIRI_BUILD_RX=OFF
 ARG STEM_DAQIRI_ENABLE_HDF5=ON
 ARG STEM_DAQIRI_REQUIRE_HDF5=OFF
+ARG STEM_DAQIRI_ENABLE_ZMQ=ON
+ARG STEM_DAQIRI_REQUIRE_ZMQ=ON
 
 # build-essential, ninja, pkgconf, and CUDA dev headers are already in the
 # daqiri-torch:local image (DPDK was built from source there). yaml-cpp dev
 # headers come from daqiri's third_party/yaml-cpp via add_subdirectory.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libhdf5-dev \
+    && apt-get install -y --no-install-recommends libhdf5-dev libzmq3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace/stem
@@ -75,6 +79,8 @@ RUN rm -rf /workspace/stem/cpp_daqiri/build \
              -DSTEM_DAQIRI_BUILD_RX=${STEM_DAQIRI_BUILD_RX} \
              -DSTEM_DAQIRI_ENABLE_HDF5=${STEM_DAQIRI_ENABLE_HDF5} \
              -DSTEM_DAQIRI_REQUIRE_HDF5=${STEM_DAQIRI_REQUIRE_HDF5} \
+             -DSTEM_DAQIRI_ENABLE_ZMQ=${STEM_DAQIRI_ENABLE_ZMQ} \
+             -DSTEM_DAQIRI_REQUIRE_ZMQ=${STEM_DAQIRI_REQUIRE_ZMQ} \
              -DCMAKE_INSTALL_PREFIX=/opt/stem_daqiri \
     && cmake --build /workspace/stem/cpp_daqiri/build -j "$(nproc)" \
     && cmake --install /workspace/stem/cpp_daqiri/build
@@ -87,7 +93,7 @@ RUN rm -rf /workspace/stem/cpp_daqiri/build \
 FROM ${DAQIRI_BASE} AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libhdf5-dev \
+    && apt-get install -y --no-install-recommends libhdf5-dev libzmq5 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=stem-daqiri-build /opt/stem_daqiri /opt/stem_daqiri

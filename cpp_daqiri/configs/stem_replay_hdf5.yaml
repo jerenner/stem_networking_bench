@@ -35,3 +35,32 @@ writer:
   dataset_name: "/processed"
   noop: false
   num_concurrent: 3
+
+# Optional offline tests of the same auxiliary outputs used by the network RX.
+# Burst mode and the continuous writer are mutually exclusive.
+burst_writer:
+  enabled: false
+  processing_stage: "corrected"
+  filepath_template: "/tmp/stem_replay_burst_rx{receiver}_{capture}.h5"
+  dataset_name: "/frames"
+  buckets_per_capture: 1
+  capture_count: 1
+  rearm_after_write: true
+  strict_complete: true
+  threshold:
+    zlp: 0.0
+    core_loss: 0.0
+
+thinned_stream:
+  enabled: false
+  endpoint: "tcp://*:5556"
+  topic_prefix: "stem"
+  total_refresh_hz: 10.0
+  processing_stage: "corrected"
+  representative_frame_index: 64
+  include_representative_frame: true
+  include_bucket_sum: true
+  queue_depth: 2
+  threshold:
+    zlp: 0.0
+    core_loss: 0.0

@@ -431,6 +431,132 @@ writer:
   num_concurrent: 1
 """)
 
+write("stem_case_burst_raw.yaml", f"""%YAML 1.2
+---
+source: "hdf5"
+replayer:
+  filepath: "{common_input}"
+  dataset_name: "/frames"
+  repeat: false
+  start_frame: 0
+  frames_per_tensor: 2
+  count: 5
+processor:
+  noop: true
+  subtract_dark_frame: false
+  apply_valid_pixel_mask: false
+  apply_dynamic_half_column_mask: false
+writer:
+  noop: true
+burst_writer:
+  enabled: true
+  processing_stage: "raw"
+  filepath_template: "{tmp / 'stem_case_burst_raw_rx{receiver}_{capture}.h5'}"
+  dataset_name: "/frames"
+  buckets_per_capture: 2
+  capture_count: 1
+  strict_complete: true
+""")
+
+write("stem_case_burst_thresholded.yaml", f"""%YAML 1.2
+---
+source: "hdf5"
+replayer:
+  filepath: "{common_input}"
+  dataset_name: "/frames"
+  repeat: false
+  start_frame: 0
+  frames_per_tensor: 2
+  count: 2
+processor:
+  noop: true
+  subtract_dark_frame: true
+  dark_frame_path: "{common_corr}"
+  dark_frame_dataset: "/dark"
+  apply_valid_pixel_mask: true
+  valid_pixel_mask_dataset: "/valid_pixel_mask"
+  blr_zlp_width: 2
+  apply_dynamic_half_column_mask: false
+writer:
+  noop: true
+burst_writer:
+  enabled: true
+  processing_stage: "thresholded"
+  filepath_template: "{tmp / 'stem_case_burst_thresholded_rx{receiver}_{capture}.h5'}"
+  dataset_name: "/frames"
+  buckets_per_capture: 1
+  capture_count: 1
+  strict_complete: true
+  threshold:
+    zlp: 5.0
+    core_loss: 20.0
+""")
+
+write("stem_case_thinned.yaml", f"""%YAML 1.2
+---
+source: "hdf5"
+replayer:
+  filepath: "{common_input}"
+  dataset_name: "/frames"
+  repeat: false
+  start_frame: 0
+  frames_per_tensor: 2
+  count: 5
+processor:
+  noop: true
+writer:
+  noop: true
+thinned_stream:
+  enabled: true
+  endpoint: "tcp://127.0.0.1:5567"
+  topic_prefix: "stem-validation"
+  total_refresh_hz: 0.0
+  processing_stage: "raw"
+  representative_frame_index: 0
+  include_representative_frame: true
+  include_bucket_sum: true
+  queue_depth: 2
+""")
+
+write("stem_case_bad_writer_burst.yaml", f"""%YAML 1.2
+---
+source: "hdf5"
+replayer:
+  filepath: "{common_input}"
+  dataset_name: "/frames"
+  repeat: false
+  frames_per_tensor: 2
+  count: 2
+processor:
+  noop: true
+writer:
+  filepath: "{tmp / 'bad_writer_burst.h5'}"
+  noop: false
+burst_writer:
+  enabled: true
+  processing_stage: "raw"
+  filepath_template: "{tmp / 'bad_burst_rx{receiver}_{capture}.h5'}"
+""")
+
+write("stem_case_bad_counted.yaml", f"""%YAML 1.2
+---
+source: "hdf5"
+replayer:
+  filepath: "{common_input}"
+  dataset_name: "/frames"
+  repeat: false
+  frames_per_tensor: 2
+  count: 2
+processor:
+  noop: true
+writer:
+  noop: true
+thinned_stream:
+  enabled: true
+  processing_stage: "counted"
+  representative_frame_index: 0
+""")
+
 write("stem_case_bad_repeat.yaml", f"""%YAML 1.2
 ---
 source: "hdf5"
@@ -519,10 +645,15 @@ run_ok stem_case_reduce_correction.yaml
 run_ok stem_case_dynamic.yaml
 run_ok stem_case_dynamic_two_sided.yaml
 run_ok stem_case_blr.yaml
+run_ok stem_case_burst_raw.yaml
+run_ok stem_case_burst_thresholded.yaml
+run_ok stem_case_thinned.yaml
 
 run_fail stem_case_bad_repeat.yaml
 run_fail stem_case_bad_writer.yaml
 run_fail stem_case_bad_correction_shape.yaml
+run_fail stem_case_bad_writer_burst.yaml
+run_fail stem_case_bad_counted.yaml
 EOS
     chmod +x "${tmpdir}/run_hdf5_container.sh"
 
@@ -623,6 +754,29 @@ for name, (want, dtype, path) in expected.items():
     else:
         np.testing.assert_allclose(got, want, rtol=0.0, atol=0.0)
     print(f"PASS {name}: shape={got.shape} dtype={got.dtype} sum={float(np.sum(got))}")
+
+with h5py.File(tmp / "stem_case_burst_raw_rx0_0.h5", "r") as f:
+    raw_burst = f["/frames"][...]
+    assert f["/frames"].attrs["processing_stage"] == "raw"
+np.testing.assert_array_equal(raw_burst, frames[:4])
+print(f"PASS burst_raw: shape={raw_burst.shape} dtype={raw_burst.dtype}")
+
+corrected = np.where(
+    mask == 0.0,
+    0.0,
+    frames[:2].astype(np.float32) - dark,
+).astype(np.float32)
+thresholded = corrected.copy()
+thresholded[:, :, :2] = np.where(thresholded[:, :, :2] > 5.0, thresholded[:, :, :2], 0.0)
+thresholded[:, :, 2:] = np.where(thresholded[:, :, 2:] > 20.0, thresholded[:, :, 2:], 0.0)
+with h5py.File(tmp / "stem_case_burst_thresholded_rx0_0.h5", "r") as f:
+    got_thresholded = f["/frames"][...]
+    assert f["/frames"].attrs["processing_stage"] == "thresholded"
+np.testing.assert_allclose(got_thresholded, thresholded, rtol=0.0, atol=0.0)
+print(
+    f"PASS burst_thresholded: shape={got_thresholded.shape} "
+    f"dtype={got_thresholded.dtype} sum={float(np.sum(got_thresholded))}"
+)
 PY
 
     if [[ "${KEEP_TMP}" -eq 1 ]]; then

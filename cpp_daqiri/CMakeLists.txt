@@ -36,9 +36,27 @@ option(STEM_DAQIRI_BUILD_TX "Build the STEM daqiri TX binary" OFF)
 option(STEM_DAQIRI_BUILD_RX "Build the STEM daqiri RX binary" OFF)
 option(STEM_DAQIRI_ENABLE_HDF5 "Enable the RX debug HDF5 writer when HDF5 is available" ON)
 option(STEM_DAQIRI_REQUIRE_HDF5 "Require HDF5 support for parity-capable RX/replay builds" OFF)
+option(STEM_DAQIRI_ENABLE_ZMQ "Enable the RX thinned ZeroMQ output stream" ON)
+option(STEM_DAQIRI_REQUIRE_ZMQ "Require ZeroMQ support for RX builds" OFF)
 
 if(STEM_DAQIRI_REQUIRE_HDF5)
   set(STEM_DAQIRI_ENABLE_HDF5 ON CACHE BOOL "Enable HDF5 support" FORCE)
+endif()
+
+if(STEM_DAQIRI_REQUIRE_ZMQ)
+  set(STEM_DAQIRI_ENABLE_ZMQ ON CACHE BOOL "Enable ZeroMQ support" FORCE)
+endif()
+if(STEM_DAQIRI_ENABLE_ZMQ)
+  find_path(STEM_DAQIRI_ZMQ_INCLUDE_DIR zmq.h)
+  find_library(STEM_DAQIRI_ZMQ_LIBRARY NAMES zmq)
+  if(STEM_DAQIRI_ZMQ_INCLUDE_DIR AND STEM_DAQIRI_ZMQ_LIBRARY)
+    set(STEM_DAQIRI_ZMQ_FOUND TRUE)
+    message(STATUS "ZeroMQ found; stem_daqiri_rx will include thinned PUB output")
+  elseif(STEM_DAQIRI_REQUIRE_ZMQ)
+    message(FATAL_ERROR "ZeroMQ was required but zmq.h/libzmq were not found")
+  else()
+    message(WARNING "ZeroMQ not found; thinned_stream.enabled=true will be unavailable")
+  endif()
 endif()
 if(STEM_DAQIRI_ENABLE_HDF5)
   if(STEM_DAQIRI_REQUIRE_HDF5)
@@ -139,7 +157,10 @@ endif()
 # RX binary
 # ---------------------------------------------------------------------------
 if(STEM_DAQIRI_BUILD_RX)
-  add_executable(stem_daqiri_rx rx/stem_rx_main.cpp)
+  add_executable(stem_daqiri_rx
+    rx/stem_rx_main.cpp
+    rx/stem_aux_output.cpp
+  )
   target_link_libraries(stem_daqiri_rx PRIVATE
     stem_daqiri_common
     daqiri::daqiri
@@ -150,6 +171,13 @@ if(STEM_DAQIRI_BUILD_RX)
     target_compile_definitions(stem_daqiri_rx PRIVATE STEM_DAQIRI_HAVE_HDF5=1)
     target_include_directories(stem_daqiri_rx PRIVATE ${HDF5_INCLUDE_DIRS})
     target_link_libraries(stem_daqiri_rx PRIVATE ${HDF5_CXX_LIBRARIES})
+  endif()
+  if(STEM_DAQIRI_ENABLE_ZMQ AND STEM_DAQIRI_ZMQ_FOUND)
+    target_compile_definitions(stem_daqiri_rx PRIVATE STEM_DAQIRI_HAVE_ZMQ=1)
+    target_include_directories(stem_daqiri_rx PRIVATE
+      ${STEM_DAQIRI_ZMQ_INCLUDE_DIR}
+    )
+    target_link_libraries(stem_daqiri_rx PRIVATE ${STEM_DAQIRI_ZMQ_LIBRARY})
   endif()
 endif()
 

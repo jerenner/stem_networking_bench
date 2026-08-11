@@ -444,6 +444,124 @@ timeline, CPU-core heatmap, Markdown summary, and machine-readable JSON metrics.
 The dashboard reports startup NIC-drop events separately from steady-state
 pipeline backpressure and labels the compatibility tile discard as intentional.
 
+### Controlled burst acquisition
+
+`burst_writer` captures a configured number of contiguous frame buckets without
+turning the continuous HDF5 writer into a source of uncontrolled backpressure:
+
+```yaml
+writer:
+  noop: true
+
+burst_writer:
+  enabled: true
+  processing_stage: "corrected"
+  filepath_template: "/data/stem_burst_rx{receiver}_{capture}_{stage}.h5"
+  dataset_name: "/frames"
+  buckets_per_capture: 1
+  capture_count: 1          # 0 means unlimited
+  rearm_after_write: true
+  strict_complete: true
+  threshold:                # used only for processing_stage: thresholded
+    zlp: 0.0
+    core_loss: 0.0
+```
+
+The burst sink starts armed. With `strict_complete: true`, it waits for the
+next complete bucket. It reserves all buffers needed by
+`buckets_per_capture`, copies those consecutive buckets into sink-owned GPU
+buffers, and writes one HDF5 file. NIC polling, assembly, and GPU processing
+continue while the file drains; later buckets are deliberately omitted from
+the burst sink and counted as `burst buckets ... skipped busy`. They are not
+reported as NIC drops. After writing, the sink rearms unless the capture limit
+was reached or `rearm_after_write` is false.
+
+The two HDF5 modes are intentionally mutually exclusive: set `writer.noop` to
+true whenever `burst_writer.enabled` is true. For multiple receivers, the
+filepath template must include `{receiver}`. Supported substitutions are
+`{receiver}`, `{capture}`, `{stage}`, and `{first_frame}`.
+
+Supported stages are:
+
+| Stage | Burst dtype | Definition |
+|---|---|---|
+| `raw` | input dtype | Assembled frames before detector corrections |
+| `dark_subtracted` | `float32` | Raw minus the configured dark frame |
+| `dark_blr` | `float32` | Dark subtraction plus grouped BLR, before masks |
+| `corrected` | `float32` | Dark + BLR + valid-pixel and dynamic masks |
+| `thresholded` | `float32` | Corrected analog values above the configured positive regional threshold; all others zero |
+
+`counted` is reserved for the future STEMPy-style local-maximum event counter
+and is rejected rather than being silently approximated by thresholding.
+
+Burst buffers are allocated before DAQIRI starts, avoiding runtime allocation
+on the packet path. This is intentionally memory intensive: one 128-frame
+1024x3840 bucket uses 960 MiB as `uint16` or 1,920 MiB as `float32`, in both
+GPU and pinned host memory, per receiver. Increase `buckets_per_capture` only
+after checking the available GPU and host memory.
+
+Mount the output directory when running the container:
+
+```bash
+-v /absolute/host/burst_output:/data
+```
+
+### Thinned ZeroMQ stream
+
+`thinned_stream` publishes display products without retaining or transmitting
+the full 128-frame bucket:
+
+```yaml
+thinned_stream:
+  enabled: true
+  endpoint: "tcp://*:5556"
+  topic_prefix: "stem"
+  total_refresh_hz: 10.0
+  processing_stage: "corrected"
+  representative_frame_index: 64
+  include_representative_frame: true
+  include_bucket_sum: true
+  queue_depth: 2
+  threshold:
+    zlp: 0.0
+    core_loss: 0.0
+```
+
+The refresh rate is global. Receivers are selected round-robin, so two active
+receivers at 10 Hz produce approximately 5 messages/s per receiver. A value of
+zero publishes every round-robin opportunity and is intended for validation,
+not live full-rate operation. The acquisition thread launches one GPU kernel
+that extracts the representative frame and accumulates the bucket sum, then
+copies only those enabled products to pinned memory. Both are `float32`, even
+for raw input, so a 128-frame sum cannot overflow `uint16`.
+
+The publisher has a bounded slot pool and coalesces queued products to the
+newest one. A slow or disconnected viewer therefore loses display updates but
+cannot backpressure frame assembly. Runtime counters report queued, published,
+coalesced, and no-buffer products.
+
+Each publication is a ZeroMQ PUB multipart message:
+
+1. Topic: `stem/rx/<receiver>/<processing_stage>`
+2. UTF-8 JSON metadata with schema `stem.thinned.v1`
+3. Optional representative `[height,width]` little-endian `float32` bytes
+4. Optional bucket-sum `[height,width]` little-endian `float32` bytes
+
+With Docker `--network host`, a remote viewer connects directly to
+`tcp://<IGX-management-IP>:5556`. Install `pyzmq` and NumPy on a viewer machine
+and inspect the stream with:
+
+```bash
+python cpp_daqiri/scripts/inspect_thinned_stream.py \
+  --endpoint tcp://192.168.10.42:5556 \
+  --topic stem/ \
+  --count 10
+```
+
+Use `--save-dir PATH` to save metadata and raw float32 arrays for viewer
+development. ZeroMQ PUB/SUB is live-only: connect the subscriber before the
+desired acquisition if the first products matter.
+
 RX assembly is now tile-only (`gather_tile_packets_by_placement`); the legacy
 row-based gather and its `--validate-ramp` correctness gate were removed
 because LBNL's FPGA cannot emit row-shaped payloads. The test TX still emits

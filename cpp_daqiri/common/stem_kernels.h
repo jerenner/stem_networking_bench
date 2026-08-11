@@ -179,4 +179,29 @@ void stem_sum_frames_float_to_frame(const float* input, float* output,
                                     uint32_t frames, uint32_t height,
                                     uint32_t width, cudaStream_t stream);
 
+// Positive thresholding keeps the corrected analog value when it exceeds the
+// configured detector-region threshold and writes zero otherwise.
+void stem_threshold_frames_float(const float* input, float* output,
+                                 uint32_t frames, uint32_t height,
+                                 uint32_t width, uint32_t zlp_width,
+                                 float zlp_threshold, float core_threshold,
+                                 cudaStream_t stream);
+
+// Produce the live-view products without materializing another frame batch.
+// Both outputs are float32 so raw sums cannot overflow uint16. Either output
+// pointer may be null when that product is disabled.
+void stem_extract_representative_and_sum(
+    const uint16_t* input, const float* dark_frame, float* representative,
+    float* sum, uint32_t frames, uint32_t height, uint32_t width,
+    uint32_t representative_frame_index, bool subtract_dark,
+    bool apply_threshold, uint32_t zlp_width, float zlp_threshold,
+    float core_threshold, cudaStream_t stream);
+
+void stem_extract_representative_and_sum(
+    const float* input, const float* dark_frame, float* representative,
+    float* sum, uint32_t frames, uint32_t height, uint32_t width,
+    uint32_t representative_frame_index, bool subtract_dark,
+    bool apply_threshold, uint32_t zlp_width, float zlp_threshold,
+    float core_threshold, cudaStream_t stream);
+
 }  // namespace stem
