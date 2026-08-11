@@ -24,10 +24,34 @@ canonical CPU/NumPy reproduction of the `PyTorchProcessorOp` correction chain.
   write publication-style summary products.
   `run_nio_threshold_study.py` sweeps ImageJ-style positive thresholds before
   column-spectrum accumulation.
+  `run_nio_counting_study.py` applies the full correction chain, calibrates a
+  STEMPy standard electron-counting threshold against processed dark frames,
+  identifies the sparse counting-valid spectral region from measured event
+  occupancy, and compares tail fluctuations with the true `1/sqrt(N)` count
+  statistic. It requires the optional `stempy` package and is exposed through
+  the top-level `run_nio_counting_study.py` compatibility wrapper.
+  `apply_dead_adc_spectrum_correction.py` reconstructs the known dead top-half
+  ADC block at columns 2272..2287 after row aggregation, using a calibrated
+  bottom-half spectral contribution and preserving reconstruction uncertainty.
+  `analyze_tail_noise.py` compares corrected and thresholded tail fluctuations
+  with counting-statistics expectations across the beam-current study.
 - `diagnostics/`: narrower scripts used to investigate BLR artifacts,
   dark-frame recovery trends, single-frame samples, or local sanity checks.
   `plot_raw_frame_qc.py` writes per-frame TIFF figures that combine a raw 2D
   frame view with ZLP/CoreLoss BLR-row baseline diagnostics.
+  `plot_nio_counted_frame_qc.py` verifies representative STEMPy-counted EELS
+  frames against the saved frame/channel matrix and writes corrected-frame,
+  event-density, per-frame-spectrum, zoomed event-overlay, and lossless binary
+  event-mask views.
+  `plot_nio_counted_poisson_band.py` overlays the counted tail with a local
+  smooth expectation and its `mu +/- sqrt(mu)` (equivalently relative
+  `1 +/- 1/sqrt(mu)`) band. This is a visual complement to, not a replacement
+  for, the independent batch-fluctuation test.
+  `plot_nio_counted_full_analog.py` compares the complete final analog spectrum,
+  including its folded ZLP, with the counting-valid CoreLoss-only STEMPy result.
+  `analyze_coreloss_features.py` localizes persistent CoreLoss structures such
+  as the dead ADC block and separates detector artifacts from repeatable spectral
+  features across files and beam currents.
 
 ## Invocation
 
