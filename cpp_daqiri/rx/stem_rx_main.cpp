@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -41,15 +42,20 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>
 
 #ifdef STEM_DAQIRI_HAVE_HDF5
 #include <H5Cpp.h>
@@ -58,6 +64,7 @@
 #include <daqiri/daqiri.h>
 
 #include "stem_aux_output.h"
+#include "stem_control_server.h"
 #include "stem_kernels.h"
 #include "stem_packet.h"
 
@@ -264,6 +271,7 @@ stem::BurstWriterConfig parse_burst_writer_cfg(const YAML::Node& root) {
   if (!root["burst_writer"]) { return cfg; }
   const auto node = root["burst_writer"];
   cfg.enabled = node["enabled"].as<bool>(cfg.enabled);
+  cfg.start_armed = node["start_armed"].as<bool>(cfg.start_armed);
   cfg.stage = stem::parse_processing_stage(
       node["processing_stage"].as<std::string>(
           stem::processing_stage_name(cfg.stage)));
@@ -288,6 +296,8 @@ stem::ThinnedStreamConfig parse_thinned_stream_cfg(const YAML::Node& root) {
   if (!root["thinned_stream"]) { return cfg; }
   const auto node = root["thinned_stream"];
   cfg.enabled = node["enabled"].as<bool>(cfg.enabled);
+  cfg.start_publishing =
+      node["start_publishing"].as<bool>(cfg.start_publishing);
   cfg.stage = stem::parse_processing_stage(
       node["processing_stage"].as<std::string>(
           stem::processing_stage_name(cfg.stage)));
@@ -307,6 +317,17 @@ stem::ThinnedStreamConfig parse_thinned_stream_cfg(const YAML::Node& root) {
   cfg.queue_depth =
       node["queue_depth"].as<uint32_t>(cfg.queue_depth);
   cfg.threshold = parse_threshold_cfg(node["threshold"]);
+  return cfg;
+}
+
+stem::ControlServerConfig parse_control_cfg(const YAML::Node& root) {
+  stem::ControlServerConfig cfg;
+  if (!root["control"]) { return cfg; }
+  const auto node = root["control"];
+  cfg.enabled = node["enabled"].as<bool>(cfg.enabled);
+  cfg.endpoint = node["endpoint"].as<std::string>(cfg.endpoint);
+  cfg.runtime_config_path = node["runtime_config_path"].as<std::string>(
+      cfg.runtime_config_path);
   return cfg;
 }
 
@@ -786,8 +807,6 @@ class FramePipeline {
                 uint32_t height, uint32_t width, uint32_t frames_per_bucket,
                 uint32_t receiver_count, bool raw_input_float32 = false)
       : processor_(processor),
-        burst_writer_cfg_(burst_writer),
-        thinned_stream_cfg_(thinned_stream),
         height_(height),
         width_(width),
         sink_(writer),
@@ -897,16 +916,23 @@ class FramePipeline {
                                   const void* input, bool float32,
                                   bool subtract_dark,
                                   bool apply_threshold) {
-      if (!thinned_reservation || thinned_stream_cfg_.stage != stage) { return; }
+      if (!thinned_reservation || thinned_reservation->stage != stage) {
+        return;
+      }
       const uint32_t representative_index =
-          thinned_stream_cfg_.representative_frame_index;
-      const auto& threshold = thinned_stream_cfg_.threshold;
+          thinned_reservation->representative_frame_index;
+      const auto& threshold = thinned_reservation->threshold;
       if (float32) {
         stem::stem_extract_representative_and_sum(
             static_cast<const float*>(input),
             subtract_dark ? gpu_dark_frame_ : nullptr,
-            thinned_reservation->representative_device,
-            thinned_reservation->sum_device, frames, height_, width_,
+            thinned_reservation->include_representative_frame
+                ? thinned_reservation->representative_device
+                : nullptr,
+            thinned_reservation->include_bucket_sum
+                ? thinned_reservation->sum_device
+                : nullptr,
+            frames, height_, width_,
             representative_index, subtract_dark, apply_threshold,
             processor_.blr_zlp_width, threshold.zlp, threshold.core_loss,
             stream);
@@ -914,8 +940,13 @@ class FramePipeline {
         stem::stem_extract_representative_and_sum(
             static_cast<const uint16_t*>(input),
             subtract_dark ? gpu_dark_frame_ : nullptr,
-            thinned_reservation->representative_device,
-            thinned_reservation->sum_device, frames, height_, width_,
+            thinned_reservation->include_representative_frame
+                ? thinned_reservation->representative_device
+                : nullptr,
+            thinned_reservation->include_bucket_sum
+                ? thinned_reservation->sum_device
+                : nullptr,
+            frames, height_, width_,
             representative_index, subtract_dark, apply_threshold,
             processor_.blr_zlp_width, threshold.zlp, threshold.core_loss,
             stream);
@@ -925,7 +956,7 @@ class FramePipeline {
 
     const auto emit_burst_copy = [&](stem::ProcessingStage stage,
                                      const void* input, bool float32) {
-      if (!burst_reservation || burst_writer_cfg_.stage != stage) { return; }
+      if (!burst_reservation || burst_reservation->stage != stage) { return; }
       burst_writer_.submit_copy(*burst_reservation, input, float32, stream);
     };
 
@@ -934,7 +965,7 @@ class FramePipeline {
                  false, false);
 
     if (burst_reservation &&
-        burst_writer_cfg_.stage == stem::ProcessingStage::kDarkSubtracted) {
+        burst_reservation->stage == stem::ProcessingStage::kDarkSubtracted) {
       if (input_float) {
         stem::stem_correct_with_blr_and_mean(
             static_cast<const float*>(original_input), gpu_dark_frame_, nullptr,
@@ -1028,12 +1059,13 @@ class FramePipeline {
                    false, false);
 
       if (burst_reservation &&
-          burst_writer_cfg_.stage == stem::ProcessingStage::kThresholded) {
+          burst_reservation->stage == stem::ProcessingStage::kThresholded) {
         stem::stem_threshold_frames_float(
             slot->gpu_float,
             static_cast<float*>(burst_reservation->device_ptr), frames, height_,
-            width_, processor_.blr_zlp_width, burst_writer_cfg_.threshold.zlp,
-            burst_writer_cfg_.threshold.core_loss, stream);
+            width_, processor_.blr_zlp_width,
+            burst_reservation->threshold.zlp,
+            burst_reservation->threshold.core_loss, stream);
         burst_writer_.submit_direct(*burst_reservation, stream);
       }
       emit_thinned(stem::ProcessingStage::kThresholded, slot->gpu_float, true,
@@ -1085,6 +1117,22 @@ class FramePipeline {
   stem::BurstWriterStats burst_stats() const { return burst_writer_.stats(); }
   stem::ThinnedStreamStats thinned_stats() const {
     return thinned_stream_.stats();
+  }
+  stem::BurstRuntimeState burst_runtime_state() const {
+    return burst_writer_.runtime_state();
+  }
+  stem::ThinnedRuntimeState thinned_runtime_state() const {
+    return thinned_stream_.runtime_state();
+  }
+  void configure_burst(const stem::BurstRuntimeConfig& config) {
+    burst_writer_.configure(config);
+  }
+  void arm_burst() { burst_writer_.arm(); }
+  void disarm_burst(bool abort_capture) {
+    burst_writer_.disarm(abort_capture);
+  }
+  void configure_thinned(const stem::ThinnedRuntimeConfig& config) {
+    thinned_stream_.configure(config);
   }
 
  private:
@@ -1148,8 +1196,6 @@ class FramePipeline {
   }
 
   ProcessorConfig processor_;
-  stem::BurstWriterConfig burst_writer_cfg_;
-  stem::ThinnedStreamConfig thinned_stream_cfg_;
   uint32_t height_ = 0;
   uint32_t width_ = 0;
   float* gpu_dark_frame_ = nullptr;
@@ -1157,6 +1203,415 @@ class FramePipeline {
   AsyncFrameSink sink_;
   stem::BurstWriter burst_writer_;
   stem::ThinnedStreamPublisher thinned_stream_;
+};
+
+std::string control_json_escape(const std::string& value) {
+  std::ostringstream output;
+  for (const unsigned char character : value) {
+    switch (character) {
+      case '\\': output << "\\\\"; break;
+      case '"': output << "\\\""; break;
+      case '\n': output << "\\n"; break;
+      case '\r': output << "\\r"; break;
+      case '\t': output << "\\t"; break;
+      default:
+        if (character < 0x20) {
+          char escaped[7];
+          std::snprintf(escaped, sizeof(escaped), "\\u%04x", character);
+          output << escaped;
+        } else {
+          output << character;
+        }
+    }
+  }
+  return output.str();
+}
+
+bool scalar_is_number(const std::string& value) {
+  if (value.empty()) { return false; }
+  char* end = nullptr;
+  std::strtod(value.c_str(), &end);
+  return end != value.c_str() && end != nullptr && *end == '\0';
+}
+
+std::string yaml_node_to_json(const YAML::Node& node) {
+  if (!node || node.IsNull()) { return "null"; }
+  if (node.IsMap()) {
+    std::ostringstream output;
+    output << "{";
+    bool first = true;
+    for (const auto& entry : node) {
+      if (!first) { output << ","; }
+      first = false;
+      output << "\"" << control_json_escape(entry.first.as<std::string>())
+             << "\":" << yaml_node_to_json(entry.second);
+    }
+    output << "}";
+    return output.str();
+  }
+  if (node.IsSequence()) {
+    std::ostringstream output;
+    output << "[";
+    for (size_t index = 0; index < node.size(); ++index) {
+      if (index != 0) { output << ","; }
+      output << yaml_node_to_json(node[index]);
+    }
+    output << "]";
+    return output.str();
+  }
+  const std::string scalar = node.as<std::string>();
+  if (scalar == "true" || scalar == "false" || scalar == "null" ||
+      scalar_is_number(scalar)) {
+    return scalar;
+  }
+  return "\"" + control_json_escape(scalar) + "\"";
+}
+
+void merge_yaml_nodes(YAML::Node target, const YAML::Node& update) {
+  if (!update || !update.IsMap()) {
+    throw std::runtime_error("restart updates must be a JSON object");
+  }
+  for (const auto& entry : update) {
+    const std::string key = entry.first.as<std::string>();
+    if (entry.second.IsMap() && target[key] && target[key].IsMap()) {
+      merge_yaml_nodes(target[key], entry.second);
+    } else {
+      target[key] = YAML::Clone(entry.second);
+    }
+  }
+}
+
+class RuntimeController {
+ public:
+  RuntimeController(YAML::Node root, stem::ControlServerConfig control,
+                    std::shared_ptr<FramePipeline> pipeline,
+                    std::atomic<bool>& stop,
+                    std::atomic<bool>& restart_requested)
+      : effective_root_(YAML::Clone(root)),
+        pending_root_(YAML::Clone(root)),
+        control_(std::move(control)),
+        pipeline_(std::move(pipeline)),
+        stop_(stop),
+        restart_requested_(restart_requested) {}
+
+  std::string handle(const std::string& request_text) {
+    try {
+      const YAML::Node request = YAML::Load(request_text);
+      if (!request || !request.IsMap()) {
+        throw std::runtime_error("control request must be a JSON object");
+      }
+      const std::string command =
+          request["command"].as<std::string>(std::string("get_state"));
+      std::lock_guard<std::mutex> lock(mu_);
+      if (command == "get_state") { return state_json(true); }
+      if (command == "set_runtime") {
+        apply_runtime(request);
+        return state_json(true);
+      }
+      if (command == "stage_restart") {
+        if (!request["updates"]) {
+          throw std::runtime_error("stage_restart requires updates");
+        }
+        merge_yaml_nodes(pending_root_, request["updates"]);
+        pending_restart_ = true;
+        return state_json(true);
+      }
+      if (command == "discard_restart") {
+        pending_root_ = YAML::Clone(effective_root_);
+        pending_restart_ = false;
+        return state_json(true);
+      }
+      if (command == "restart") {
+        write_restart_config();
+        restart_requested_.store(true);
+        stop_.store(true);
+        return state_json(true, "restart accepted");
+      }
+      if (command == "shutdown") {
+        stop_.store(true);
+        return state_json(true, "shutdown accepted");
+      }
+      throw std::runtime_error("unknown control command: " + command);
+    } catch (const std::exception& error) {
+      return std::string("{\"ok\":false,\"error\":\"") +
+             control_json_escape(error.what()) + "\"}";
+    }
+  }
+
+ private:
+  void apply_runtime(const YAML::Node& request) {
+    if (request["thinned_stream"]) {
+      auto state = pipeline_->thinned_runtime_state();
+      auto value = state.config;
+      const auto node = request["thinned_stream"];
+      value.publishing =
+          node["publishing"].as<bool>(value.publishing);
+      value.stage = stem::parse_processing_stage(
+          node["processing_stage"].as<std::string>(
+              stem::processing_stage_name(value.stage)));
+      value.topic_prefix =
+          node["topic_prefix"].as<std::string>(value.topic_prefix);
+      value.total_refresh_hz =
+          node["total_refresh_hz"].as<double>(value.total_refresh_hz);
+      value.representative_frame_index =
+          node["representative_frame_index"].as<uint32_t>(
+              value.representative_frame_index);
+      value.include_representative_frame =
+          node["include_representative_frame"].as<bool>(
+              value.include_representative_frame);
+      value.include_bucket_sum =
+          node["include_bucket_sum"].as<bool>(value.include_bucket_sum);
+      if (node["threshold"]) {
+        value.threshold.zlp =
+            node["threshold"]["zlp"].as<float>(value.threshold.zlp);
+        value.threshold.core_loss = node["threshold"]["core_loss"].as<float>(
+            value.threshold.core_loss);
+      }
+      const ProcessorConfig processor =
+          parse_processor_cfg(effective_root_, YAML::Node());
+      validate_processing_stage(value.stage, processor, value.threshold,
+                                "thinned_stream");
+      pipeline_->configure_thinned(value);
+      write_thinned_runtime(effective_root_, value);
+      write_thinned_runtime(pending_root_, value);
+    }
+
+    if (request["burst_writer"]) {
+      auto state = pipeline_->burst_runtime_state();
+      auto value = state.config;
+      const auto node = request["burst_writer"];
+      const std::string action =
+          node["action"].as<std::string>(std::string());
+      bool has_configuration = false;
+      const auto update = [&](const char* key) {
+        if (node[key]) { has_configuration = true; }
+      };
+      update("processing_stage");
+      update("filepath_template");
+      update("dataset_name");
+      update("buckets_per_capture");
+      update("capture_count");
+      update("rearm_after_write");
+      update("strict_complete");
+      update("threshold");
+      value.stage = stem::parse_processing_stage(
+          node["processing_stage"].as<std::string>(
+              stem::processing_stage_name(value.stage)));
+      value.filepath_template = node["filepath_template"].as<std::string>(
+          value.filepath_template);
+      value.dataset_name =
+          node["dataset_name"].as<std::string>(value.dataset_name);
+      value.buckets_per_capture =
+          node["buckets_per_capture"].as<uint32_t>(
+              value.buckets_per_capture);
+      value.capture_count =
+          node["capture_count"].as<uint64_t>(value.capture_count);
+      value.rearm_after_write =
+          node["rearm_after_write"].as<bool>(value.rearm_after_write);
+      value.strict_complete =
+          node["strict_complete"].as<bool>(value.strict_complete);
+      if (node["threshold"]) {
+        value.threshold.zlp =
+            node["threshold"]["zlp"].as<float>(value.threshold.zlp);
+        value.threshold.core_loss = node["threshold"]["core_loss"].as<float>(
+            value.threshold.core_loss);
+      }
+      if (has_configuration) {
+        const ProcessorConfig processor =
+            parse_processor_cfg(effective_root_, YAML::Node());
+        validate_processing_stage(value.stage, processor, value.threshold,
+                                  "burst_writer");
+        pipeline_->configure_burst(value);
+        write_burst_runtime(effective_root_, value);
+        write_burst_runtime(pending_root_, value);
+      }
+      if (action == "arm") {
+        pipeline_->arm_burst();
+      } else if (action == "disarm") {
+        pipeline_->disarm_burst(false);
+      } else if (action == "abort") {
+        pipeline_->disarm_burst(true);
+      } else if (!action.empty()) {
+        throw std::runtime_error("burst action must be arm, disarm, or abort");
+      }
+      const auto updated = pipeline_->burst_runtime_state();
+      effective_root_["burst_writer"]["start_armed"] = updated.armed;
+      pending_root_["burst_writer"]["start_armed"] = updated.armed;
+    }
+  }
+
+  static void write_thinned_runtime(YAML::Node root,
+                                    const stem::ThinnedRuntimeConfig& value) {
+    auto node = root["thinned_stream"];
+    node["start_publishing"] = value.publishing;
+    node["processing_stage"] = stem::processing_stage_name(value.stage);
+    node["topic_prefix"] = value.topic_prefix;
+    node["total_refresh_hz"] = value.total_refresh_hz;
+    node["representative_frame_index"] =
+        value.representative_frame_index;
+    node["include_representative_frame"] =
+        value.include_representative_frame;
+    node["include_bucket_sum"] = value.include_bucket_sum;
+    node["threshold"]["zlp"] = value.threshold.zlp;
+    node["threshold"]["core_loss"] = value.threshold.core_loss;
+  }
+
+  static void write_burst_runtime(YAML::Node root,
+                                  const stem::BurstRuntimeConfig& value) {
+    auto node = root["burst_writer"];
+    node["start_armed"] = value.armed;
+    node["processing_stage"] = stem::processing_stage_name(value.stage);
+    node["filepath_template"] = value.filepath_template;
+    node["dataset_name"] = value.dataset_name;
+    node["buckets_per_capture"] = value.buckets_per_capture;
+    node["capture_count"] = value.capture_count;
+    node["rearm_after_write"] = value.rearm_after_write;
+    node["strict_complete"] = value.strict_complete;
+    node["threshold"]["zlp"] = value.threshold.zlp;
+    node["threshold"]["core_loss"] = value.threshold.core_loss;
+  }
+
+  void write_restart_config() {
+    const std::string source = pending_root_["source"].as<std::string>(
+        std::string("network"));
+    if (source != "network") {
+      throw std::runtime_error(
+          "live control restart currently supports source=network");
+    }
+    const auto receiver_configs = parse_stem_rx_cfgs(pending_root_);
+    const auto burst = parse_burst_writer_cfg(pending_root_);
+    const auto thinned = parse_thinned_stream_cfg(pending_root_);
+    validate_auxiliary_outputs(receiver_configs.front().processor,
+                               receiver_configs.front().writer, burst,
+                               thinned);
+    for (const auto& receiver : receiver_configs) {
+      if ((burst.enabled || thinned.enabled) &&
+          receiver.frames_per_tensor !=
+              receiver_configs.front().frames_per_tensor) {
+        throw std::runtime_error(
+            "auxiliary outputs require equal frames_per_tensor for all "
+            "receivers");
+      }
+    }
+    const auto staged_control = parse_control_cfg(pending_root_);
+    if (!staged_control.enabled || staged_control.endpoint.empty()) {
+      throw std::runtime_error(
+          "restart configuration must retain an enabled control endpoint");
+    }
+
+    const std::filesystem::path path(control_.runtime_config_path);
+    if (path.has_parent_path()) {
+      std::filesystem::create_directories(path.parent_path());
+    }
+    const std::filesystem::path temporary =
+        path.string() + ".tmp";
+    YAML::Emitter output;
+    output << pending_root_;
+    std::ofstream file(temporary);
+    if (!file) {
+      throw std::runtime_error("cannot create restart config " +
+                               temporary.string());
+    }
+    file << "%YAML 1.2\n---\n" << output.c_str() << "\n";
+    file.close();
+    if (!file) {
+      throw std::runtime_error("failed writing restart config " +
+                               temporary.string());
+    }
+    std::filesystem::rename(temporary, path);
+  }
+
+  std::string state_json(bool ok, const std::string& message = {}) const {
+    const auto burst = pipeline_->burst_runtime_state();
+    const auto thinned = pipeline_->thinned_runtime_state();
+    const auto burst_stats = pipeline_->burst_stats();
+    const auto thinned_stats = pipeline_->thinned_stats();
+    std::ostringstream json;
+    json << "{\"ok\":" << (ok ? "true" : "false")
+         << ",\"schema\":\"stem.control.v1\""
+         << ",\"message\":\"" << control_json_escape(message) << "\""
+         << ",\"acquisition\":{\"running\":"
+         << (!stop_.load() ? "true" : "false")
+         << ",\"restart_pending\":"
+         << (pending_restart_ ? "true" : "false")
+         << ",\"restart_requested\":"
+         << (restart_requested_.load() ? "true" : "false") << "}"
+         << ",\"burst_writer\":{\"capability_enabled\":"
+         << (burst.capability_enabled ? "true" : "false")
+         << ",\"armed\":" << (burst.armed ? "true" : "false")
+         << ",\"busy\":" << (burst.busy ? "true" : "false")
+         << ",\"output_float32\":"
+         << (burst.output_float32 ? "true" : "false")
+         << ",\"capacity_buckets\":" << burst.capacity_buckets
+         << ",\"processing_stage\":\""
+         << stem::processing_stage_name(burst.config.stage) << "\""
+         << ",\"filepath_template\":\""
+         << control_json_escape(burst.config.filepath_template) << "\""
+         << ",\"dataset_name\":\""
+         << control_json_escape(burst.config.dataset_name) << "\""
+         << ",\"buckets_per_capture\":"
+         << burst.config.buckets_per_capture
+         << ",\"capture_count\":" << burst.config.capture_count
+         << ",\"rearm_after_write\":"
+         << (burst.config.rearm_after_write ? "true" : "false")
+         << ",\"strict_complete\":"
+         << (burst.config.strict_complete ? "true" : "false")
+         << ",\"threshold\":{\"zlp\":" << burst.config.threshold.zlp
+         << ",\"core_loss\":" << burst.config.threshold.core_loss << "}"
+         << ",\"stats\":{\"captures_started\":"
+         << burst_stats.captures_started
+         << ",\"captures_written\":" << burst_stats.captures_written
+         << ",\"buckets_captured\":" << burst_stats.buckets_captured
+         << ",\"buckets_skipped_busy\":"
+         << burst_stats.buckets_skipped_busy
+         << ",\"rejected_incomplete\":"
+         << burst_stats.buckets_rejected_incomplete
+         << ",\"aborted\":" << burst_stats.aborted_captures
+         << ",\"errors\":" << burst_stats.errors << "}}"
+         << ",\"thinned_stream\":{\"capability_enabled\":"
+         << (thinned.capability_enabled ? "true" : "false")
+         << ",\"publishing\":"
+         << (thinned.config.publishing ? "true" : "false")
+         << ",\"endpoint\":\"" << control_json_escape(thinned.endpoint)
+         << "\",\"queue_depth\":" << thinned.queue_depth
+         << ",\"processing_stage\":\""
+         << stem::processing_stage_name(thinned.config.stage) << "\""
+         << ",\"topic_prefix\":\""
+         << control_json_escape(thinned.config.topic_prefix) << "\""
+         << ",\"total_refresh_hz\":"
+         << thinned.config.total_refresh_hz
+         << ",\"representative_frame_index\":"
+         << thinned.config.representative_frame_index
+         << ",\"include_representative_frame\":"
+         << (thinned.config.include_representative_frame ? "true" : "false")
+         << ",\"include_bucket_sum\":"
+         << (thinned.config.include_bucket_sum ? "true" : "false")
+         << ",\"threshold\":{\"zlp\":" << thinned.config.threshold.zlp
+         << ",\"core_loss\":" << thinned.config.threshold.core_loss << "}"
+         << ",\"stats\":{\"products_queued\":"
+         << thinned_stats.products_queued
+         << ",\"products_published\":"
+         << thinned_stats.products_published
+         << ",\"products_coalesced\":"
+         << thinned_stats.products_coalesced
+         << ",\"dropped_no_buffer\":"
+         << thinned_stats.products_dropped_no_buffer
+         << ",\"send_errors\":" << thinned_stats.send_errors << "}}"
+         << ",\"effective_config\":"
+         << yaml_node_to_json(effective_root_)
+         << ",\"pending_config\":" << yaml_node_to_json(pending_root_)
+         << "}";
+    return json.str();
+  }
+
+  mutable std::mutex mu_;
+  YAML::Node effective_root_;
+  YAML::Node pending_root_;
+  stem::ControlServerConfig control_;
+  std::shared_ptr<FramePipeline> pipeline_;
+  std::atomic<bool>& stop_;
+  std::atomic<bool>& restart_requested_;
+  bool pending_restart_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -2262,6 +2717,7 @@ int main(int argc, char** argv) {
     const stem::BurstWriterConfig burst_writer = parse_burst_writer_cfg(root);
     const stem::ThinnedStreamConfig thinned_stream =
         parse_thinned_stream_cfg(root);
+    const stem::ControlServerConfig control = parse_control_cfg(root);
     validate_auxiliary_outputs(cfgs.front().processor, cfgs.front().writer,
                                burst_writer, thinned_stream);
     if (burst_writer.enabled || thinned_stream.enabled) {
@@ -2295,6 +2751,11 @@ int main(int argc, char** argv) {
                 << " representative_frame_index="
                 << thinned_stream.representative_frame_index << "\n";
     }
+    if (control.enabled) {
+      std::cout << "control enabled endpoint=" << control.endpoint
+                << " runtime_config_path=" << control.runtime_config_path
+                << "\n";
+    }
 
     auto pipeline = std::make_shared<FramePipeline>(
         cfgs.front().processor, cfgs.front().writer, burst_writer,
@@ -2308,6 +2769,13 @@ int main(int argc, char** argv) {
     }
 
     std::atomic<bool> stop{false};
+    std::atomic<bool> restart_requested{false};
+    auto runtime_controller = std::make_shared<RuntimeController>(
+        root, control, pipeline, stop, restart_requested);
+    stem::ControlServer control_server(
+        control, [runtime_controller](const std::string& request) {
+          return runtime_controller->handle(request);
+        });
     RxRunStats run_stats;
     std::vector<std::thread> threads;
     threads.reserve(cfgs.size());
@@ -2344,6 +2812,28 @@ int main(int argc, char** argv) {
 
     daqiri::print_stats();
     daqiri::shutdown();
+    control_server.stop();
+    if (restart_requested.load()) {
+      std::vector<std::string> restart_arguments;
+      restart_arguments.reserve(argc);
+      for (int index = 0; index < argc; ++index) {
+        restart_arguments.emplace_back(argv[index]);
+      }
+      restart_arguments[1] = control.runtime_config_path;
+      std::vector<char*> restart_argv;
+      restart_argv.reserve(restart_arguments.size() + 1);
+      for (auto& argument : restart_arguments) {
+        restart_argv.push_back(argument.data());
+      }
+      restart_argv.push_back(nullptr);
+      std::cout << "Restarting acquisition from "
+                << control.runtime_config_path << "\n";
+      std::cout.flush();
+      execv("/proc/self/exe", restart_argv.data());
+      throw std::runtime_error(
+          std::string("failed to restart acquisition: ") +
+          std::strerror(errno));
+    }
     if (run_stats.worker_errors.load(std::memory_order_relaxed) > 0 ||
         run_stats.output_pool_drops.load(std::memory_order_relaxed) > 0 ||
         pipeline->errors() > 0) {

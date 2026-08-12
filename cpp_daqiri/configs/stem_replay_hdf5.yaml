@@ -40,6 +40,7 @@ writer:
 # Burst mode and the continuous writer are mutually exclusive.
 burst_writer:
   enabled: false
+  start_armed: true
   processing_stage: "corrected"
   filepath_template: "/tmp/stem_replay_burst_rx{receiver}_{capture}.h5"
   dataset_name: "/frames"
@@ -53,6 +54,7 @@ burst_writer:
 
 thinned_stream:
   enabled: false
+  start_publishing: true
   endpoint: "tcp://*:5556"
   topic_prefix: "stem"
   total_refresh_hz: 10.0

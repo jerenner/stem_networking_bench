@@ -129,7 +129,10 @@ writer:
 # file is copied and written, later buckets are deliberately skipped by the
 # burst sink without stopping NIC polling or the processing pipeline.
 burst_writer:
-  enabled: false
+  # enabled allocates burst capability at startup; start_armed controls
+  # whether it captures immediately. The GUI can arm/disarm without restart.
+  enabled: true
+  start_armed: false
   processing_stage: "corrected"  # raw, dark_subtracted, dark_blr, corrected, thresholded
   filepath_template: "/data/stem_burst_rx{receiver}_{capture}_{stage}.h5"
   dataset_name: "/frames"
@@ -148,7 +151,8 @@ burst_writer:
 # Every multipart message contains JSON metadata followed by an overflow-safe
 # float32 representative frame and float32 sum over the complete bucket.
 thinned_stream:
-  enabled: false
+  enabled: true
+  start_publishing: true
   endpoint: "tcp://*:5556"
   topic_prefix: "stem"
   total_refresh_hz: 10.0
@@ -160,3 +164,11 @@ thinned_stream:
   threshold:
     zlp: 0.0
     core_loss: 0.0
+
+# Runtime-safe DAQ controls use REP on this independent endpoint. Settings that
+# alter allocations, processor kernels, packet geometry, or NIC configuration
+# are written to runtime_config_path and applied by a graceful self-restart.
+control:
+  enabled: true
+  endpoint: "tcp://*:5557"
+  runtime_config_path: "/tmp/stem_daqiri_runtime.yaml"

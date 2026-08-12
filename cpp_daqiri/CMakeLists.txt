@@ -160,6 +160,7 @@ if(STEM_DAQIRI_BUILD_RX)
   add_executable(stem_daqiri_rx
     rx/stem_rx_main.cpp
     rx/stem_aux_output.cpp
+    rx/stem_control_server.cpp
   )
   target_link_libraries(stem_daqiri_rx PRIVATE
     stem_daqiri_common

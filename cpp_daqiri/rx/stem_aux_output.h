@@ -33,6 +33,7 @@ struct ThresholdConfig {
 
 struct BurstWriterConfig {
   bool enabled = false;
+  bool start_armed = true;
   ProcessingStage stage = ProcessingStage::kCorrected;
   std::string filepath_template =
       "/tmp/stem_burst_rx{receiver}_{capture}.h5";
@@ -44,8 +45,30 @@ struct BurstWriterConfig {
   ThresholdConfig threshold;
 };
 
+struct BurstRuntimeConfig {
+  bool armed = false;
+  ProcessingStage stage = ProcessingStage::kCorrected;
+  std::string filepath_template;
+  std::string dataset_name;
+  uint32_t buckets_per_capture = 1;
+  uint64_t capture_count = 1;
+  bool rearm_after_write = true;
+  bool strict_complete = true;
+  ThresholdConfig threshold;
+};
+
+struct BurstRuntimeState {
+  bool capability_enabled = false;
+  bool armed = false;
+  bool busy = false;
+  bool output_float32 = false;
+  uint32_t capacity_buckets = 0;
+  BurstRuntimeConfig config;
+};
+
 struct ThinnedStreamConfig {
   bool enabled = false;
+  bool start_publishing = true;
   ProcessingStage stage = ProcessingStage::kCorrected;
   std::string endpoint = "tcp://*:5556";
   std::string topic_prefix = "stem";
@@ -55,6 +78,24 @@ struct ThinnedStreamConfig {
   bool include_bucket_sum = true;
   uint32_t queue_depth = 2;
   ThresholdConfig threshold;
+};
+
+struct ThinnedRuntimeConfig {
+  bool publishing = false;
+  ProcessingStage stage = ProcessingStage::kCorrected;
+  std::string topic_prefix = "stem";
+  double total_refresh_hz = 10.0;
+  uint32_t representative_frame_index = 64;
+  bool include_representative_frame = true;
+  bool include_bucket_sum = true;
+  ThresholdConfig threshold;
+};
+
+struct ThinnedRuntimeState {
+  bool capability_enabled = false;
+  std::string endpoint;
+  uint32_t queue_depth = 0;
+  ThinnedRuntimeConfig config;
 };
 
 struct BatchMetadata {
@@ -85,6 +126,8 @@ class BurstWriter {
     void* device_ptr = nullptr;
     size_t bytes = 0;
     bool float32 = false;
+    ProcessingStage stage = ProcessingStage::kRaw;
+    ThresholdConfig threshold;
 
     explicit operator bool() const { return token != nullptr; }
   };
@@ -99,6 +142,10 @@ class BurstWriter {
 
   bool enabled() const;
   ProcessingStage stage() const;
+  BurstRuntimeState runtime_state() const;
+  void configure(const BurstRuntimeConfig& config);
+  void arm();
+  void disarm(bool abort_capture);
   std::optional<Reservation> reserve(const BatchMetadata& metadata);
   void submit_copy(const Reservation& reservation, const void* source,
                    bool source_float32, cudaStream_t stream);
@@ -125,6 +172,11 @@ class ThinnedStreamPublisher {
     void* token = nullptr;
     float* representative_device = nullptr;
     float* sum_device = nullptr;
+    ProcessingStage stage = ProcessingStage::kCorrected;
+    uint32_t representative_frame_index = 0;
+    bool include_representative_frame = true;
+    bool include_bucket_sum = true;
+    ThresholdConfig threshold;
 
     explicit operator bool() const { return token != nullptr; }
   };
@@ -139,6 +191,8 @@ class ThinnedStreamPublisher {
 
   bool enabled() const;
   ProcessingStage stage() const;
+  ThinnedRuntimeState runtime_state() const;
+  void configure(const ThinnedRuntimeConfig& config);
   std::optional<Reservation> reserve(const BatchMetadata& metadata);
   void submit(const Reservation& reservation, cudaStream_t stream);
   void drain();

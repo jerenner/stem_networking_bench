@@ -170,7 +170,9 @@ struct BurstWriter::Impl {
     bool capturing = false;
     bool writing = false;
     bool done = false;
-    uint64_t captures_started = 0;
+    bool abort_requested = false;
+    uint64_t session_captures_started = 0;
+    uint64_t next_capture_index = 0;
     uint64_t next_expected_batch = 0;
     size_t next_buffer = 0;
     std::vector<Buffer*> active_buffers;
@@ -180,6 +182,7 @@ struct BurstWriter::Impl {
     uint32_t receiver_id = 0;
     uint64_t capture_index = 0;
     bool write = true;
+    BurstRuntimeConfig runtime;
     std::vector<Buffer*> buffers;
   };
 
@@ -191,7 +194,17 @@ struct BurstWriter::Impl {
         width(frame_width),
         frames_per_bucket(bucket_frames),
         receiver_count(receivers),
+        raw_input_float32(raw_float),
         output_float(config.stage != ProcessingStage::kRaw || raw_float) {
+    runtime.armed = config.start_armed;
+    runtime.stage = config.stage;
+    runtime.filepath_template = config.filepath_template;
+    runtime.dataset_name = config.dataset_name;
+    runtime.buckets_per_capture = config.buckets_per_capture;
+    runtime.capture_count = config.capture_count;
+    runtime.rearm_after_write = config.rearm_after_write;
+    runtime.strict_complete = config.strict_complete;
+    runtime.threshold = config.threshold;
     if (!config.enabled) { return; }
 #ifndef STEM_DAQIRI_HAVE_HDF5
     throw std::runtime_error(
@@ -252,9 +265,12 @@ struct BurstWriter::Impl {
   }
 
   bool capture_limit_reached(const ReceiverState& state) const {
-    if (!config.rearm_after_write && state.captures_started >= 1) { return true; }
-    return config.capture_count > 0 &&
-           state.captures_started >= config.capture_count;
+    if (!runtime.rearm_after_write &&
+        state.session_captures_started >= 1) {
+      return true;
+    }
+    return runtime.capture_count > 0 &&
+           state.session_captures_started >= runtime.capture_count;
   }
 
   void queue_abort_locked(uint32_t receiver_id) {
@@ -270,6 +286,7 @@ struct BurstWriter::Impl {
       state.active_buffers[index]->reserved = false;
     }
     state.capturing = false;
+    state.abort_requested = false;
     state.active_buffers.clear();
     state.next_buffer = 0;
     stats.aborted_captures++;
@@ -291,7 +308,9 @@ struct BurstWriter::Impl {
 
     std::lock_guard<std::mutex> lock(mu);
     ReceiverState& state = states[metadata.receiver_id];
-    if (state.done || capture_limit_reached(state)) {
+    if (!runtime.armed && !state.capturing) { return std::nullopt; }
+    if (!state.capturing &&
+        (state.done || capture_limit_reached(state))) {
       state.done = true;
       return std::nullopt;
     }
@@ -301,20 +320,21 @@ struct BurstWriter::Impl {
     }
     if (state.capturing &&
         (metadata.batch_index != state.next_expected_batch ||
-         (config.strict_complete && !metadata.complete))) {
-      if (config.strict_complete && !metadata.complete) {
+         (runtime.strict_complete && !metadata.complete))) {
+      if (runtime.strict_complete && !metadata.complete) {
         stats.buckets_rejected_incomplete++;
       }
       queue_abort_locked(metadata.receiver_id);
       return std::nullopt;
     }
     if (!state.capturing) {
-      if (config.strict_complete && !metadata.complete) {
+      if (runtime.strict_complete && !metadata.complete) {
         stats.buckets_rejected_incomplete++;
         return std::nullopt;
       }
       state.active_buffers.clear();
-      for (auto& buffer : buffers[metadata.receiver_id]) {
+      for (uint32_t index = 0; index < runtime.buckets_per_capture; ++index) {
+        auto& buffer = buffers[metadata.receiver_id][index];
         if (buffer->reserved) {
           throw std::runtime_error("burst buffer remained reserved after drain");
         }
@@ -336,7 +356,8 @@ struct BurstWriter::Impl {
       throw std::runtime_error("burst batch exceeds preallocated buffer size");
     }
     return BurstWriter::Reservation{buffer, buffer->device, buffer->bytes,
-                                    output_float};
+                                    output_float, runtime.stage,
+                                    runtime.threshold};
   }
 
   void finish_submission(Buffer* buffer) {
@@ -347,13 +368,19 @@ struct BurstWriter::Impl {
     }
     state.next_buffer++;
     state.next_expected_batch++;
+    if (state.abort_requested) {
+      state.abort_requested = false;
+      queue_abort_locked(buffer->metadata.receiver_id);
+      return;
+    }
     if (state.next_buffer != state.active_buffers.size()) { return; }
 
     Job job;
     job.receiver_id = buffer->metadata.receiver_id;
-    job.capture_index = state.captures_started;
+    job.capture_index = state.next_capture_index++;
+    job.runtime = runtime;
     job.buffers = state.active_buffers;
-    state.captures_started++;
+    state.session_captures_started++;
     state.capturing = false;
     state.writing = true;
     state.active_buffers.clear();
@@ -365,10 +392,10 @@ struct BurstWriter::Impl {
   }
 
   std::string output_path(const Job& job) const {
-    std::string path = config.filepath_template;
+    std::string path = job.runtime.filepath_template;
     replace_all(path, "{receiver}", std::to_string(job.receiver_id));
     replace_all(path, "{capture}", std::to_string(job.capture_index));
-    replace_all(path, "{stage}", processing_stage_name(config.stage));
+    replace_all(path, "{stage}", processing_stage_name(job.runtime.stage));
     if (!job.buffers.empty()) {
       replace_all(path, "{first_frame}",
                   std::to_string(job.buffers.front()->metadata.first_frame));
@@ -397,7 +424,7 @@ struct BurstWriter::Impl {
     const H5::DataType type = output_float ? H5::PredType::NATIVE_FLOAT
                                            : H5::PredType::NATIVE_UINT16;
     H5::DataSet dataset = file.createDataSet(
-        normalized_dataset_path(config.dataset_name), type, filespace,
+        normalized_dataset_path(job.runtime.dataset_name), type, filespace,
         properties);
 
     hsize_t frame_offset = 0;
@@ -422,7 +449,7 @@ struct BurstWriter::Impl {
     write_u32_attribute(dataset, "buckets", job.buffers.size());
     write_u32_attribute(dataset, "frames_per_bucket", frames_per_bucket);
     write_string_attribute(dataset, "processing_stage",
-                           processing_stage_name(config.stage));
+                           processing_stage_name(job.runtime.stage));
     write_string_attribute(dataset, "interface_name", first.interface_name);
     write_string_attribute(dataset, "dtype",
                            output_float ? "float32" : "uint16");
@@ -481,7 +508,15 @@ struct BurstWriter::Impl {
         } else if (job.write) {
           stats.errors++;
         }
-        if (capture_limit_reached(state)) { state.done = true; }
+        if (!runtime.armed || capture_limit_reached(state)) {
+          state.done = true;
+        }
+        if (std::all_of(states.begin(), states.end(),
+                        [](const ReceiverState& receiver) {
+                          return receiver.done;
+                        })) {
+          runtime.armed = false;
+        }
         active_jobs--;
       }
       cv.notify_all();
@@ -508,11 +543,115 @@ struct BurstWriter::Impl {
     return stats;
   }
 
+  BurstRuntimeState runtime_snapshot() const {
+    std::lock_guard<std::mutex> lock(mu);
+    BurstRuntimeState state;
+    state.capability_enabled = config.enabled;
+    state.armed = runtime.armed;
+    state.output_float32 = output_float;
+    state.capacity_buckets = config.buckets_per_capture;
+    state.config = runtime;
+    state.busy = !jobs.empty() || active_jobs != 0 ||
+                 std::any_of(states.begin(), states.end(),
+                             [](const ReceiverState& receiver) {
+                               return receiver.capturing || receiver.writing;
+                             });
+    return state;
+  }
+
+  void configure_runtime(const BurstRuntimeConfig& value) {
+    if (!config.enabled) {
+      throw std::runtime_error(
+          "burst capability was not allocated; enable it and restart");
+    }
+    if (value.stage == ProcessingStage::kCounted) {
+      throw std::runtime_error("counted burst output is not implemented");
+    }
+    if (value.buckets_per_capture == 0 ||
+        value.buckets_per_capture > config.buckets_per_capture) {
+      throw std::runtime_error(
+          "buckets_per_capture exceeds the startup allocation; restart with "
+          "a larger burst_writer.buckets_per_capture");
+    }
+    const bool requested_float =
+        value.stage != ProcessingStage::kRaw || raw_input_float32;
+    if (requested_float != output_float) {
+      throw std::runtime_error(
+          "changing between raw uint16 and processed float32 burst output "
+          "requires restart");
+    }
+    if (value.filepath_template.empty()) {
+      throw std::runtime_error("burst filepath_template cannot be empty");
+    }
+    if (receiver_count > 1 &&
+        value.filepath_template.find("{receiver}") == std::string::npos) {
+      throw std::runtime_error(
+          "burst filepath_template must contain {receiver} for multiple "
+          "receivers");
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    const bool busy = !jobs.empty() || active_jobs != 0 ||
+                      std::any_of(states.begin(), states.end(),
+                                  [](const ReceiverState& receiver) {
+                                    return receiver.capturing ||
+                                           receiver.writing;
+                                  });
+    if (busy) {
+      throw std::runtime_error(
+          "burst configuration can only change while capture is idle");
+    }
+    runtime = value;
+    for (auto& state : states) {
+      state.session_captures_started = 0;
+      state.done = false;
+    }
+  }
+
+  void arm_runtime() {
+    if (!config.enabled) {
+      throw std::runtime_error(
+          "burst capability was not allocated; enable it and restart");
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    const bool busy =
+        std::any_of(states.begin(), states.end(),
+                    [](const ReceiverState& receiver) {
+                      return receiver.capturing || receiver.writing;
+                    });
+    if (busy) {
+      throw std::runtime_error(
+          "burst capture can only be armed while all receivers are idle");
+    }
+    runtime.armed = true;
+    for (auto& state : states) {
+      if (!state.capturing && !state.writing) {
+        state.session_captures_started = 0;
+        state.done = false;
+      }
+    }
+  }
+
+  void disarm_runtime(bool abort_capture) {
+    if (!config.enabled) { return; }
+    std::lock_guard<std::mutex> lock(mu);
+    runtime.armed = false;
+    for (uint32_t receiver = 0; receiver < states.size(); ++receiver) {
+      states[receiver].done = true;
+      if (abort_capture && states[receiver].capturing) {
+        // The producer may still be recording the CUDA event for its current
+        // reservation. Let finish_submission queue the abort only after that
+        // event is valid, avoiding a control-thread synchronization race.
+        states[receiver].abort_requested = true;
+      }
+    }
+  }
+
   BurstWriterConfig config;
   uint32_t height = 0;
   uint32_t width = 0;
   uint32_t frames_per_bucket = 0;
   uint32_t receiver_count = 0;
+  bool raw_input_float32 = false;
   bool output_float = false;
   std::vector<std::vector<std::unique_ptr<Buffer>>> buffers;
   std::vector<ReceiverState> states;
@@ -524,6 +663,7 @@ struct BurstWriter::Impl {
   bool stopping = false;
   std::thread worker;
   BurstWriterStats stats;
+  BurstRuntimeConfig runtime;
 };
 
 BurstWriter::BurstWriter(const BurstWriterConfig& config, uint32_t height,
@@ -536,7 +676,23 @@ BurstWriter::~BurstWriter() = default;
 
 bool BurstWriter::enabled() const { return impl_->config.enabled; }
 
-ProcessingStage BurstWriter::stage() const { return impl_->config.stage; }
+ProcessingStage BurstWriter::stage() const {
+  return impl_->runtime_snapshot().config.stage;
+}
+
+BurstRuntimeState BurstWriter::runtime_state() const {
+  return impl_->runtime_snapshot();
+}
+
+void BurstWriter::configure(const BurstRuntimeConfig& config) {
+  impl_->configure_runtime(config);
+}
+
+void BurstWriter::arm() { impl_->arm_runtime(); }
+
+void BurstWriter::disarm(bool abort_capture) {
+  impl_->disarm_runtime(abort_capture);
+}
 
 std::optional<BurstWriter::Reservation> BurstWriter::reserve(
     const BatchMetadata& metadata) {
@@ -586,6 +742,7 @@ struct ThinnedStreamPublisher::Impl {
     cudaEvent_t ready = nullptr;
     SlotState state = SlotState::kFree;
     BatchMetadata metadata;
+    ThinnedRuntimeConfig runtime;
 
     ~Slot() {
       if (ready) { cudaEventDestroy(ready); }
@@ -603,6 +760,16 @@ struct ThinnedStreamPublisher::Impl {
         width(frame_width),
         frames_per_bucket(bucket_frames),
         receiver_count(receivers) {
+    runtime.publishing = config.start_publishing;
+    runtime.stage = config.stage;
+    runtime.topic_prefix = config.topic_prefix;
+    runtime.total_refresh_hz = config.total_refresh_hz;
+    runtime.representative_frame_index =
+        config.representative_frame_index;
+    runtime.include_representative_frame =
+        config.include_representative_frame;
+    runtime.include_bucket_sum = config.include_bucket_sum;
+    runtime.threshold = config.threshold;
     if (!config.enabled) { return; }
 #ifndef STEM_DAQIRI_HAVE_ZMQ
     throw std::runtime_error(
@@ -632,18 +799,14 @@ struct ThinnedStreamPublisher::Impl {
     slots.reserve(slot_count);
     for (uint32_t index = 0; index < slot_count; ++index) {
       auto slot = std::make_unique<Slot>();
-      if (config.include_representative_frame) {
-        check_cuda(cudaMalloc(&slot->representative_device, frame_bytes),
-                   "cudaMalloc thinned representative device buffer");
-        check_cuda(cudaMallocHost(&slot->representative_host, frame_bytes),
-                   "cudaMallocHost thinned representative host buffer");
-      }
-      if (config.include_bucket_sum) {
-        check_cuda(cudaMalloc(&slot->sum_device, frame_bytes),
-                   "cudaMalloc thinned sum device buffer");
-        check_cuda(cudaMallocHost(&slot->sum_host, frame_bytes),
-                   "cudaMallocHost thinned sum host buffer");
-      }
+      check_cuda(cudaMalloc(&slot->representative_device, frame_bytes),
+                 "cudaMalloc thinned representative device buffer");
+      check_cuda(cudaMallocHost(&slot->representative_host, frame_bytes),
+                 "cudaMallocHost thinned representative host buffer");
+      check_cuda(cudaMalloc(&slot->sum_device, frame_bytes),
+                 "cudaMalloc thinned sum device buffer");
+      check_cuda(cudaMallocHost(&slot->sum_host, frame_bytes),
+                 "cudaMallocHost thinned sum host buffer");
       check_cuda(cudaEventCreateWithFlags(&slot->ready,
                                           cudaEventDisableTiming),
                  "cudaEventCreate thinned slot");
@@ -674,9 +837,9 @@ struct ThinnedStreamPublisher::Impl {
 
   void advance_schedule(std::chrono::steady_clock::time_point now) {
     next_receiver = (next_receiver + 1) % receiver_count;
-    if (config.total_refresh_hz > 0.0) {
+    if (runtime.total_refresh_hz > 0.0) {
       const auto period = std::chrono::duration<double>(
-          1.0 / config.total_refresh_hz);
+          1.0 / runtime.total_refresh_hz);
       next_due = now +
                  std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                      period);
@@ -690,9 +853,10 @@ struct ThinnedStreamPublisher::Impl {
       throw std::runtime_error("thinned metadata receiver_id is out of range");
     }
     std::lock_guard<std::mutex> lock(mu);
+    if (!runtime.publishing) { return std::nullopt; }
     const auto now = std::chrono::steady_clock::now();
     if (metadata.receiver_id != next_receiver ||
-        (config.total_refresh_hz > 0.0 && now < next_due)) {
+        (runtime.total_refresh_hz > 0.0 && now < next_due)) {
       return std::nullopt;
     }
     advance_schedule(now);
@@ -707,20 +871,24 @@ struct ThinnedStreamPublisher::Impl {
     Slot* slot = available->get();
     slot->state = SlotState::kFilling;
     slot->metadata = metadata;
+    slot->runtime = runtime;
     return ThinnedStreamPublisher::Reservation{
-        slot, slot->representative_device, slot->sum_device};
+        slot, slot->representative_device, slot->sum_device,
+        slot->runtime.stage, slot->runtime.representative_frame_index,
+        slot->runtime.include_representative_frame,
+        slot->runtime.include_bucket_sum, slot->runtime.threshold};
   }
 
   void submit(Slot* slot, cudaStream_t stream) {
     const size_t frame_bytes = static_cast<size_t>(height) * width *
                                sizeof(float);
-    if (config.include_representative_frame) {
+    if (slot->runtime.include_representative_frame) {
       check_cuda(cudaMemcpyAsync(slot->representative_host,
                                  slot->representative_device, frame_bytes,
                                  cudaMemcpyDeviceToHost, stream),
                  "cudaMemcpyAsync thinned representative");
     }
-    if (config.include_bucket_sum) {
+    if (slot->runtime.include_bucket_sum) {
       check_cuda(cudaMemcpyAsync(slot->sum_host, slot->sum_device, frame_bytes,
                                  cudaMemcpyDeviceToHost, stream),
                  "cudaMemcpyAsync thinned sum");
@@ -740,10 +908,10 @@ struct ThinnedStreamPublisher::Impl {
   }
 
   std::string topic(const Slot& slot) const {
-    std::string prefix = config.topic_prefix;
+    std::string prefix = slot.runtime.topic_prefix;
     while (!prefix.empty() && prefix.back() == '/') { prefix.pop_back(); }
     return prefix + "/rx/" + std::to_string(slot.metadata.receiver_id) + "/" +
-           processing_stage_name(config.stage);
+           processing_stage_name(slot.runtime.stage);
   }
 
   std::string metadata_json(const Slot& slot) const {
@@ -757,13 +925,17 @@ struct ThinnedStreamPublisher::Impl {
          << (slot.metadata.complete ? "true" : "false")
          << ",\"received_packets\":" << slot.metadata.received_packets
          << ",\"expected_packets\":" << slot.metadata.expected_packets
-         << ",\"processing_stage\":\"" << processing_stage_name(config.stage)
+         << ",\"processing_stage\":\""
+         << processing_stage_name(slot.runtime.stage)
          << "\",\"dtype\":\"float32\",\"byte_order\":\"little\""
          << ",\"height\":" << height << ",\"width\":" << width
          << ",\"representative_frame_index\":"
-         << config.representative_frame_index << ",\"parts\":[\"metadata\"";
-    if (config.include_representative_frame) { json << ",\"representative\""; }
-    if (config.include_bucket_sum) { json << ",\"sum\""; }
+         << slot.runtime.representative_frame_index
+         << ",\"parts\":[\"metadata\"";
+    if (slot.runtime.include_representative_frame) {
+      json << ",\"representative\"";
+    }
+    if (slot.runtime.include_bucket_sum) { json << ",\"sum\""; }
     json << "]}";
     return json.str();
   }
@@ -780,21 +952,21 @@ struct ThinnedStreamPublisher::Impl {
     const size_t frame_bytes = static_cast<size_t>(height) * width *
                                sizeof(float);
     const uint32_t payload_parts =
-        static_cast<uint32_t>(config.include_representative_frame) +
-        static_cast<uint32_t>(config.include_bucket_sum);
+        static_cast<uint32_t>(slot.runtime.include_representative_frame) +
+        static_cast<uint32_t>(slot.runtime.include_bucket_sum);
     if (!send_part(socket, topic_value.data(), topic_value.size(), true) ||
         !send_part(socket, json.data(), json.size(), payload_parts > 0)) {
       return false;
     }
     uint32_t remaining = payload_parts;
-    if (config.include_representative_frame) {
+    if (slot.runtime.include_representative_frame) {
       remaining--;
       if (!send_part(socket, slot.representative_host, frame_bytes,
                      remaining > 0)) {
         return false;
       }
     }
-    if (config.include_bucket_sum) {
+    if (slot.runtime.include_bucket_sum) {
       remaining--;
       if (!send_part(socket, slot.sum_host, frame_bytes, remaining > 0)) {
         return false;
@@ -915,6 +1087,44 @@ struct ThinnedStreamPublisher::Impl {
     return stats;
   }
 
+  ThinnedRuntimeState runtime_snapshot() const {
+    std::lock_guard<std::mutex> lock(mu);
+    ThinnedRuntimeState state;
+    state.capability_enabled = config.enabled;
+    state.endpoint = config.endpoint;
+    state.queue_depth = config.queue_depth;
+    state.config = runtime;
+    return state;
+  }
+
+  void configure_runtime(const ThinnedRuntimeConfig& value) {
+    if (!config.enabled) {
+      throw std::runtime_error(
+          "thinned-stream capability was not allocated; enable it and "
+          "restart");
+    }
+    if (value.stage == ProcessingStage::kCounted) {
+      throw std::runtime_error("counted thinned output is not implemented");
+    }
+    if (!value.include_representative_frame && !value.include_bucket_sum) {
+      throw std::runtime_error(
+          "thinned stream must include a representative frame, bucket sum, "
+          "or both");
+    }
+    if (value.representative_frame_index >= frames_per_bucket) {
+      throw std::runtime_error(
+          "representative_frame_index is outside the bucket");
+    }
+    if (value.total_refresh_hz < 0.0) {
+      throw std::runtime_error("total_refresh_hz must be non-negative");
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    const bool rate_changed =
+        value.total_refresh_hz != runtime.total_refresh_hz;
+    runtime = value;
+    if (rate_changed) { next_due = std::chrono::steady_clock::now(); }
+  }
+
   ThinnedStreamConfig config;
   uint32_t height = 0;
   uint32_t width = 0;
@@ -934,6 +1144,7 @@ struct ThinnedStreamPublisher::Impl {
   uint32_t next_receiver = 0;
   std::chrono::steady_clock::time_point next_due;
   ThinnedStreamStats stats;
+  ThinnedRuntimeConfig runtime;
 };
 
 ThinnedStreamPublisher::ThinnedStreamPublisher(
@@ -947,7 +1158,15 @@ ThinnedStreamPublisher::~ThinnedStreamPublisher() = default;
 bool ThinnedStreamPublisher::enabled() const { return impl_->config.enabled; }
 
 ProcessingStage ThinnedStreamPublisher::stage() const {
-  return impl_->config.stage;
+  return impl_->runtime_snapshot().config.stage;
+}
+
+ThinnedRuntimeState ThinnedStreamPublisher::runtime_state() const {
+  return impl_->runtime_snapshot();
+}
+
+void ThinnedStreamPublisher::configure(const ThinnedRuntimeConfig& config) {
+  impl_->configure_runtime(config);
 }
 
 std::optional<ThinnedStreamPublisher::Reservation>

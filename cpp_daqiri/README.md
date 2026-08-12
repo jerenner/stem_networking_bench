@@ -44,14 +44,15 @@ cd ../..
 documentation used `DAQIRI_MGR`; the STEM CMake wrapper still accepts it as a
 compatibility alias, but new builds should use `DAQIRI_ENGINE`.
 
-Build the parity-capable STEM daqiri image with TX, RX, and mandatory HDF5
-replay/writer/correction-file support:
+Build the parity-capable STEM daqiri image with TX, RX, mandatory HDF5
+replay/writer/correction-file support, and ZeroMQ output/control support:
 
 ```bash
 docker build -f Dockerfile.daqiri \
     --build-arg STEM_DAQIRI_BUILD_TX=ON \
     --build-arg STEM_DAQIRI_BUILD_RX=ON \
     --build-arg STEM_DAQIRI_REQUIRE_HDF5=ON \
+    --build-arg STEM_DAQIRI_REQUIRE_ZMQ=ON \
     -t stem_daqiri:parity-hdf5 .
 ```
 
@@ -455,6 +456,7 @@ writer:
 
 burst_writer:
   enabled: true
+  start_armed: false
   processing_stage: "corrected"
   filepath_template: "/data/stem_burst_rx{receiver}_{capture}_{stage}.h5"
   dataset_name: "/frames"
@@ -467,8 +469,10 @@ burst_writer:
     core_loss: 0.0
 ```
 
-The burst sink starts armed. With `strict_complete: true`, it waits for the
-next complete bucket. It reserves all buffers needed by
+The `enabled` flag allocates sink-owned GPU and pinned-host buffers at process
+startup. `start_armed` chooses the initial state; the control API can arm or
+disarm later without allocating memory. With `strict_complete: true`, it
+waits for the next complete bucket. It reserves all buffers needed by
 `buckets_per_capture`, copies those consecutive buckets into sink-owned GPU
 buffers, and writes one HDF5 file. NIC polling, assembly, and GPU processing
 continue while the file drains; later buckets are deliberately omitted from
@@ -514,6 +518,7 @@ the full 128-frame bucket:
 ```yaml
 thinned_stream:
   enabled: true
+  start_publishing: true
   endpoint: "tcp://*:5556"
   topic_prefix: "stem"
   total_refresh_hz: 10.0
@@ -561,6 +566,80 @@ python cpp_daqiri/scripts/inspect_thinned_stream.py \
 Use `--save-dir PATH` to save metadata and raw float32 arrays for viewer
 development. ZeroMQ PUB/SUB is live-only: connect the subscriber before the
 desired acquisition if the first products matter.
+
+### Live DAQ control and Qt console
+
+An independent ZeroMQ REP endpoint controls runtime-safe settings and stages
+restart-required settings:
+
+```yaml
+control:
+  enabled: true
+  endpoint: "tcp://*:5557"
+  runtime_config_path: "/tmp/stem_daqiri_runtime.yaml"
+```
+
+Runtime-safe controls are applied between bucket reservations:
+
+- arm, disarm, or abort controlled burst capture
+- change burst filename, dataset, capture count, completeness policy,
+  thresholds, and bucket count up to the startup allocation
+- enable/disable publication and change its stage, refresh rate, representative
+  frame, topic, products, and thresholds
+
+The burst output dtype family is fixed by its startup allocation. Changing
+between network raw `uint16` and processed `float32`, increasing the maximum
+burst size, enabling an unallocated output, changing ZeroMQ endpoints/queue
+depth, processor kernels/calibration, continuous writer settings, or receiver
+packet/NIC geometry requires restart.
+
+`stage_restart` merges requested values into a complete pending YAML tree.
+`restart` first validates that tree and atomically writes
+`runtime_config_path`; only then does it stop RX, drain outputs, shut down
+DAQIRI, and replace the process with the same binary and CLI arguments using
+the generated configuration. The control socket is briefly unavailable while
+the process relaunches. The STEM application validates its staged settings
+before acquisition stops. DAQIRI engine-level NIC/queue changes cannot be
+preflighted while DPDK owns the
+interfaces; those are validated by `daqiri_init` after relaunch and can still
+cause the restarted process to exit with its configuration error.
+
+The PySide6 console combines the SUB viewer with the REP controls:
+
+```bash
+python3 -m venv .venv-stem-daq
+source .venv-stem-daq/bin/activate
+pip install -r cpp_daqiri/gui/requirements.txt
+python cpp_daqiri/gui/stem_daq_gui.py \
+  --stream-endpoint tcp://127.0.0.1:15556 \
+  --control-endpoint tcp://127.0.0.1:15557
+```
+
+For an IGX reached through `qdaq01`, forward both ports from the local
+machine:
+
+```bash
+ssh -N \
+  -L 15556:igx-daq2:5556 \
+  -L 15557:igx-daq2:5557 \
+  -i ~/.ssh/qdaq01_key user@qdaq01
+```
+
+If `qdaq01` cannot resolve or route `igx-daq2`, use the IGX management IP
+in both forwarding targets. The DAQ container must use `--network host`.
+The REP protocol is intentionally lightweight and has no built-in
+authentication; firewall port 5557 to the management network and normally
+access it only through an SSH tunnel.
+
+Develop and test the GUI without CUDA, DAQIRI, or detector hardware by running
+the synthetic server and connecting to its default local ports:
+
+```bash
+python cpp_daqiri/gui/mock_stem_daq.py
+python cpp_daqiri/gui/stem_daq_gui.py \
+  --stream-endpoint tcp://127.0.0.1:5556 \
+  --control-endpoint tcp://127.0.0.1:5557
+```
 
 RX assembly is now tile-only (`gather_tile_packets_by_placement`); the legacy
 row-based gather and its `--validate-ramp` correctness gate were removed
@@ -711,6 +790,10 @@ a live 100 Gb/s stream and therefore is not a receiver keep-up test.
 | `common/stem_kernels.{cu,h}` | TX header update, RX header extract, gather, processor kernels |
 | `tx/stem_tx_main.cpp` | paced STEM TX |
 | `rx/stem_rx_main.cpp` | daqiri RX, frame assembly, output sink |
+| `rx/stem_aux_output.{cpp,h}` | controlled burst and latest-only PUB outputs |
+| `rx/stem_control_server.{cpp,h}` | JSON-over-ZeroMQ REP control transport |
+| `gui/stem_daq_gui.py` | PySide6 live viewer and DAQ controller |
+| `gui/mock_stem_daq.py` | hardware-free synthetic PUB/REP development server |
 | `scripts/compare_h5_outputs.py` | pixel-level HDF5 parity comparator |
 | `configs/stem_rx_igx_production.yaml` | IGX RX-only production config |
 | `configs/stem_rx_igx_fpga_dual.yaml` | Dual-interface IGX FPGA production config |
