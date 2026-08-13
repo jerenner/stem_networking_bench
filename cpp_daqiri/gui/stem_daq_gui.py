@@ -216,6 +216,15 @@ def add_row(layout: QtWidgets.QFormLayout, label: str, widget) -> Any:
     return widget
 
 
+def stacked_form(parent: QtWidgets.QWidget) -> QtWidgets.QFormLayout:
+    layout = QtWidgets.QFormLayout(parent)
+    layout.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapAllRows)
+    layout.setFieldGrowthPolicy(
+        QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+    )
+    return layout
+
+
 @dataclass
 class Product:
     topic: str
@@ -240,6 +249,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.products: dict[int, Product] = {}
         self.dirty_receivers: set[int] = set()
         self.rendered_views: set[tuple[int, int]] = set()
+        self.acquisition_running: bool | None = None
+        self.supervised = False
         self.initialized_from_state = False
         self.restart_after_stage = False
         self.control_poll_pending = False
@@ -352,6 +363,26 @@ class MainWindow(QtWidgets.QMainWindow):
         return panel
 
     def _build_controls(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+
+        lifecycle = QtWidgets.QGroupBox("Acquisition lifecycle")
+        lifecycle_layout = QtWidgets.QVBoxLayout(lifecycle)
+        self.acquisition_state = Badge("Connecting")
+        lifecycle_layout.addWidget(self.acquisition_state)
+        self.start_acquisition_button = QtWidgets.QPushButton("Start acquisition")
+        self.start_acquisition_button.clicked.connect(
+            lambda: self.send_control(
+                "start_acquisition", {"command": "start_acquisition"}
+            )
+        )
+        self.stop_acquisition_button = QtWidgets.QPushButton("Stop acquisition")
+        self.stop_acquisition_button.setObjectName("danger")
+        self.stop_acquisition_button.clicked.connect(self.stop_acquisition)
+        lifecycle_layout.addWidget(self.start_acquisition_button)
+        lifecycle_layout.addWidget(self.stop_acquisition_button)
+        layout.addWidget(lifecycle)
+
         tabs = QtWidgets.QTabWidget()
         tabs.addTab(self._runtime_tab(), "Live controls")
         tabs.addTab(self._restart_tab(), "Apply on restart")
@@ -361,7 +392,8 @@ class MainWindow(QtWidgets.QMainWindow):
         status_layout = QtWidgets.QVBoxLayout(status)
         status_layout.addWidget(self.status_text)
         tabs.addTab(status, "DAQ state")
-        return tabs
+        layout.addWidget(tabs, 1)
+        return panel
 
     def _runtime_tab(self) -> QtWidgets.QWidget:
         content = QtWidgets.QWidget()
@@ -382,17 +414,13 @@ class MainWindow(QtWidgets.QMainWindow):
             form, "Send bucket sum", QtWidgets.QCheckBox()
         )
         self.thin_topic = add_row(form, "Topic prefix", QtWidgets.QLineEdit("stem"))
-        threshold_row = QtWidgets.QHBoxLayout()
         self.thin_zlp_threshold = double_spin(0, 1e9)
         self.thin_core_threshold = double_spin(0, 1e9)
-        threshold_row.addWidget(QtWidgets.QLabel("ZLP"))
-        threshold_row.addWidget(self.thin_zlp_threshold)
-        threshold_row.addWidget(QtWidgets.QLabel("CoreLoss"))
-        threshold_row.addWidget(self.thin_core_threshold)
-        form.addRow("Thresholds", threshold_row)
-        button = QtWidgets.QPushButton("Apply visualization settings")
-        button.clicked.connect(self.apply_thinned)
-        form.addRow(button)
+        form.addRow("ZLP threshold", self.thin_zlp_threshold)
+        form.addRow("CoreLoss threshold", self.thin_core_threshold)
+        self.thin_apply = QtWidgets.QPushButton("Apply visualization settings")
+        self.thin_apply.clicked.connect(self.apply_thinned)
+        form.addRow(self.thin_apply)
         layout.addWidget(thinned)
 
         burst = QtWidgets.QGroupBox("Controlled burst capture")
@@ -416,14 +444,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.burst_strict = add_row(
             form, "Require complete buckets", QtWidgets.QCheckBox()
         )
-        threshold_row = QtWidgets.QHBoxLayout()
         self.burst_zlp_threshold = double_spin(0, 1e9)
         self.burst_core_threshold = double_spin(0, 1e9)
-        threshold_row.addWidget(QtWidgets.QLabel("ZLP"))
-        threshold_row.addWidget(self.burst_zlp_threshold)
-        threshold_row.addWidget(QtWidgets.QLabel("CoreLoss"))
-        threshold_row.addWidget(self.burst_core_threshold)
-        form.addRow("Thresholds", threshold_row)
+        form.addRow("ZLP threshold", self.burst_zlp_threshold)
+        form.addRow("CoreLoss threshold", self.burst_core_threshold)
         self.burst_configure = QtWidgets.QPushButton("Apply capture settings")
         self.burst_configure.setToolTip(
             "Update burst settings without starting a capture; accepted only while idle."
@@ -457,6 +481,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         scroll.setWidget(content)
         return scroll
 
@@ -465,7 +492,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(content)
 
         capabilities = QtWidgets.QGroupBox("Output allocations and endpoints")
-        form = QtWidgets.QFormLayout(capabilities)
+        form = stacked_form(capabilities)
         self.restart_burst_enabled = add_row(
             form, "Allocate burst writer", QtWidgets.QCheckBox()
         )
@@ -485,7 +512,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(capabilities)
 
         processor = QtWidgets.QGroupBox("GPU processor")
-        form = QtWidgets.QFormLayout(processor)
+        form = stacked_form(processor)
         self.restart_noop = add_row(form, "No reduction", QtWidgets.QCheckBox())
         self.restart_dark = add_row(
             form, "Subtract dark frame", QtWidgets.QCheckBox()
@@ -503,79 +530,52 @@ class MainWindow(QtWidgets.QMainWindow):
             form, "Mask dataset", QtWidgets.QLineEdit("/valid_pixel_mask")
         )
         self.restart_blr = add_row(form, "Apply BLR", QtWidgets.QCheckBox())
-        blr_row = QtWidgets.QHBoxLayout()
         self.restart_blr_rows = spin(1, 512, 30)
         self.restart_blr_zlp = spin(1, 3840, 768)
         self.restart_blr_zgroup = spin(1, 3840, 4)
         self.restart_blr_cgroup = spin(1, 3840, 16)
-        for label, widget in [
-            ("Rows", self.restart_blr_rows),
-            ("ZLP width", self.restart_blr_zlp),
-            ("ZLP group", self.restart_blr_zgroup),
-            ("Core group", self.restart_blr_cgroup),
-        ]:
-            blr_row.addWidget(QtWidgets.QLabel(label))
-            blr_row.addWidget(widget)
-        form.addRow("BLR geometry", blr_row)
+        form.addRow("BLR edge rows", self.restart_blr_rows)
+        form.addRow("BLR ZLP width", self.restart_blr_zlp)
+        form.addRow("BLR ZLP group columns", self.restart_blr_zgroup)
+        form.addRow("BLR CoreLoss group columns", self.restart_blr_cgroup)
         self.restart_dynamic = add_row(
             form, "Dynamic half-column mask", QtWidgets.QCheckBox()
         )
-        dynamic_row = QtWidgets.QHBoxLayout()
         self.restart_dynamic_window = spin(1, 129, 31)
         self.restart_dynamic_ratio = double_spin(0, 1e6, 1)
         self.restart_dynamic_offset = double_spin(0, 1e9, 500)
         self.restart_dynamic_edge = spin(0, 511, 32)
-        for label, widget in [
-            ("Window", self.restart_dynamic_window),
-            ("Ratio", self.restart_dynamic_ratio),
-            ("Offset", self.restart_dynamic_offset),
-            ("Edge rows", self.restart_dynamic_edge),
-        ]:
-            dynamic_row.addWidget(QtWidgets.QLabel(label))
-            dynamic_row.addWidget(widget)
-        form.addRow("Dynamic-mask parameters", dynamic_row)
+        form.addRow("Dynamic median window", self.restart_dynamic_window)
+        form.addRow("Dynamic threshold ratio", self.restart_dynamic_ratio)
+        form.addRow("Dynamic threshold offset", self.restart_dynamic_offset)
+        form.addRow("Dynamic excluded edge rows", self.restart_dynamic_edge)
         self.restart_two_sided = add_row(
             form, "Two-sided outliers", QtWidgets.QCheckBox()
         )
         layout.addWidget(processor)
 
         acquisition = QtWidgets.QGroupBox("Acquisition geometry and continuous writer")
-        form = QtWidgets.QFormLayout(acquisition)
-        receiver_row = QtWidgets.QHBoxLayout()
+        form = stacked_form(acquisition)
         self.restart_receivers = spin(1, 8, 2)
         self.restart_frames = spin(1, 4096, 128)
         self.restart_source_mask = QtWidgets.QLineEdit("0x0f")
-        receiver_row.addWidget(QtWidgets.QLabel("Receivers"))
-        receiver_row.addWidget(self.restart_receivers)
-        receiver_row.addWidget(QtWidgets.QLabel("Frames/bucket"))
-        receiver_row.addWidget(self.restart_frames)
-        receiver_row.addWidget(QtWidgets.QLabel("Source mask"))
-        receiver_row.addWidget(self.restart_source_mask)
-        form.addRow("Stream assembly", receiver_row)
-        packet_row = QtWidgets.QHBoxLayout()
+        form.addRow("Receivers", self.restart_receivers)
+        form.addRow("Frames per bucket", self.restart_frames)
+        form.addRow("Expected source mask", self.restart_source_mask)
         self.restart_header = spin(0, 65535, 42)
         self.restart_payload = spin(0, 65535, 7680)
         self.restart_slack = spin(0, 10_000_000, 512)
-        packet_row.addWidget(QtWidgets.QLabel("Header"))
-        packet_row.addWidget(self.restart_header)
-        packet_row.addWidget(QtWidgets.QLabel("Payload"))
-        packet_row.addWidget(self.restart_payload)
-        packet_row.addWidget(QtWidgets.QLabel("Close slack"))
-        packet_row.addWidget(self.restart_slack)
-        form.addRow("Packet geometry (bytes)", packet_row)
-        flags = QtWidgets.QHBoxLayout()
-        self.restart_gpu_headers = QtWidgets.QCheckBox("GPU header extraction")
-        self.restart_hds = QtWidgets.QCheckBox("Header/data split")
-        self.restart_duplicate = QtWidgets.QCheckBox("Duplicate tile prefix")
-        self.restart_latency = QtWidgets.QCheckBox("Capture latency")
-        for widget in [
-            self.restart_gpu_headers,
-            self.restart_hds,
-            self.restart_duplicate,
-            self.restart_latency,
-        ]:
-            flags.addWidget(widget)
-        form.addRow("Receiver flags", flags)
+        form.addRow("Packet header bytes", self.restart_header)
+        form.addRow("Packet payload bytes", self.restart_payload)
+        form.addRow("Batch-close slack packets", self.restart_slack)
+        self.restart_gpu_headers = QtWidgets.QCheckBox()
+        self.restart_hds = QtWidgets.QCheckBox()
+        self.restart_duplicate = QtWidgets.QCheckBox()
+        self.restart_latency = QtWidgets.QCheckBox()
+        form.addRow("GPU header extraction", self.restart_gpu_headers)
+        form.addRow("Header/data split", self.restart_hds)
+        form.addRow("Duplicate tile prefix", self.restart_duplicate)
+        form.addRow("Capture latency", self.restart_latency)
         self.restart_writer = add_row(
             form, "Continuous HDF5 writer", QtWidgets.QCheckBox()
         )
@@ -592,12 +592,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         advanced = QtWidgets.QGroupBox("Advanced restart override")
         advanced_layout = QtWidgets.QVBoxLayout(advanced)
-        advanced_layout.addWidget(
-            QtWidgets.QLabel(
-                "Optional JSON object merged into the YAML configuration. "
-                "Use this for DAQIRI NIC, queue, memory-region, or flow changes."
-            )
+        advanced_help = QtWidgets.QLabel(
+            "Optional JSON object merged into the YAML configuration. "
+            "Use this for DAQIRI NIC, queue, memory-region, or flow changes."
         )
+        advanced_help.setWordWrap(True)
+        advanced_layout.addWidget(advanced_help)
         self.restart_override = QtWidgets.QPlainTextEdit()
         self.restart_override.setPlaceholderText(
             '{"daqiri":{"cfg":{"rx_meta_buffers":2048}}}'
@@ -606,25 +606,37 @@ class MainWindow(QtWidgets.QMainWindow):
         advanced_layout.addWidget(self.restart_override)
         layout.addWidget(advanced)
 
-        actions = QtWidgets.QHBoxLayout()
-        stage = QtWidgets.QPushButton("Stage restart settings")
-        stage.clicked.connect(lambda: self.stage_restart(False))
-        discard = QtWidgets.QPushButton("Discard staged changes")
-        discard.setObjectName("secondary")
-        discard.clicked.connect(
+        actions = QtWidgets.QVBoxLayout()
+        self.stage_restart_button = QtWidgets.QPushButton("Stage restart settings")
+        self.stage_restart_button.clicked.connect(lambda: self.stage_restart(False))
+        self.discard_restart_button = QtWidgets.QPushButton("Discard staged changes")
+        self.discard_restart_button.setObjectName("secondary")
+        self.discard_restart_button.clicked.connect(
             lambda: self.send_control("discard", {"command": "discard_restart"})
         )
-        restart = QtWidgets.QPushButton("Restart acquisition")
-        restart.setObjectName("danger")
-        restart.clicked.connect(lambda: self.stage_restart(True))
-        actions.addWidget(stage)
-        actions.addWidget(discard)
-        actions.addWidget(restart)
+        self.restart_acquisition_button = QtWidgets.QPushButton(
+            "Apply settings and restart acquisition"
+        )
+        self.restart_acquisition_button.setObjectName("danger")
+        self.restart_acquisition_button.clicked.connect(
+            lambda: self.stage_restart(True)
+        )
+        self.restart_setting_buttons = [
+            self.stage_restart_button,
+            self.discard_restart_button,
+            self.restart_acquisition_button,
+        ]
+        actions.addWidget(self.stage_restart_button)
+        actions.addWidget(self.discard_restart_button)
+        actions.addWidget(self.restart_acquisition_button)
         layout.addLayout(actions)
         layout.addStretch()
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         scroll.setWidget(content)
         return scroll
 
@@ -675,7 +687,8 @@ class MainWindow(QtWidgets.QMainWindow):
         receiver = int(metadata["receiver_id"])
         self.products[receiver] = Product(topic, metadata, arrays, time.time())
         self.dirty_receivers.add(receiver)
-        self.stream_badge.set_state("DATA ONLINE", True)
+        if self.acquisition_running is not False:
+            self.stream_badge.set_state("DATA ONLINE", True)
         if self.receiver.findText(str(receiver)) < 0:
             self.receiver.addItem(str(receiver))
 
@@ -793,6 +806,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "burst_action",
             {"command": "set_runtime", "burst_writer": {"action": action}},
         )
+
+    def stop_acquisition(self) -> None:
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Stop acquisition",
+            "Stop RX cleanly and release DPDK, NIC, and GPU acquisition resources? "
+            "The supervisor and control connection will remain online.",
+        )
+        if answer == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.send_control(
+                "stop_acquisition", {"command": "stop_acquisition"}
+            )
 
     def restart_updates(self) -> dict:
         try:
@@ -912,7 +937,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Avoid opening a fresh SSH forwarding channel every second
                 # while the DAQ control endpoint is not listening.
                 self.next_control_poll_at = time.monotonic() + 5.0
-            if tag != "poll":
+            if tag not in {"initial", "poll"}:
                 QtWidgets.QMessageBox.warning(
                     self, "DAQ control rejected", response.get("error", "Unknown error")
                 )
@@ -925,19 +950,72 @@ class MainWindow(QtWidgets.QMainWindow):
             answer = QtWidgets.QMessageBox.question(
                 self,
                 "Restart acquisition",
-                "The current acquisition will stop cleanly and relaunch with "
-                "the staged settings. Continue?",
+                "The current RX child will stop cleanly. The persistent supervisor "
+                "will then relaunch it with the staged settings. Continue?",
             )
             if answer == QtWidgets.QMessageBox.StandardButton.Yes:
                 self.send_control("restart", {"command": "restart"})
         if tag == "restart":
             self.statusBar().showMessage(
-                "Restart accepted; reconnecting to the control endpoint", 8000
+                "Restart accepted; the supervisor remains online while RX relaunches",
+                8000,
+            )
+        elif tag == "start_acquisition":
+            self.statusBar().showMessage("Acquisition start requested", 5000)
+        elif tag == "stop_acquisition":
+            self.statusBar().showMessage(
+                "Acquisition stopping; supervisor remains online", 5000
             )
 
     def update_state(self, state: dict, populate: bool) -> None:
         burst, thinned = state["burst_writer"], state["thinned_stream"]
         acquisition = state["acquisition"]
+        running = bool(
+            state.get("supervisor", {}).get(
+                "acquisition_running", acquisition.get("running", False)
+            )
+        )
+        lifecycle = state.get("supervisor", {}).get(
+            "state", "running" if running else "stopped"
+        )
+        supervised = "supervisor" in state
+        self.supervised = supervised
+        was_running = self.acquisition_running
+        self.acquisition_running = running
+        self.acquisition_state.set_state(lifecycle.upper(), running)
+        self.start_acquisition_button.setEnabled(
+            supervised and lifecycle in {"stopped", "error"}
+        )
+        self.stop_acquisition_button.setEnabled(
+            supervised and lifecycle in {"starting", "running"}
+        )
+        lifecycle_tooltip = (
+            "Start/Stop requires stem_daqiri_supervisor rather than a direct "
+            "stem_daqiri_rx invocation."
+            if not supervised
+            else ""
+        )
+        self.start_acquisition_button.setToolTip(lifecycle_tooltip)
+        self.stop_acquisition_button.setToolTip(lifecycle_tooltip)
+        self.thin_apply.setEnabled(running)
+        for button in self.restart_setting_buttons:
+            button.setEnabled(running)
+            button.setToolTip(
+                "Restart settings are staged by the RX process; start acquisition first."
+                if not running
+                else ""
+            )
+        self.restart_control_endpoint.setEnabled(not supervised)
+        self.restart_control_endpoint.setToolTip(
+            "The persistent supervisor owns the public control endpoint; change it "
+            "in the startup YAML or STEM_DAQIRI_SUPERVISOR_ENDPOINT."
+            if supervised
+            else ""
+        )
+        if not running:
+            self.stream_badge.set_state("DATA IDLE", False)
+        elif was_running is False:
+            self.stream_badge.set_state("DATA WAITING", False)
         burst_available = bool(burst["capability_enabled"])
         if not burst_available:
             burst_label, burst_good = "NOT ALLOCATED", False
@@ -955,12 +1033,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.burst_state.setToolTip("Burst capability is allocated but not armed.")
         self.burst_state.set_state(burst_label, burst_good)
         for button in self.burst_live_buttons:
-            button.setEnabled(burst_available)
-            if not burst_available:
+            button.setEnabled(burst_available and running)
+            if not running:
+                button.setToolTip("Start acquisition before using live burst controls.")
+            elif not burst_available:
                 button.setToolTip(
                     "Burst buffers are not allocated. Enable them under Apply on restart."
                 )
         summary = {
+            "supervisor": state.get("supervisor", {}),
             "acquisition": acquisition,
             "burst_writer": {
                 key: burst[key]

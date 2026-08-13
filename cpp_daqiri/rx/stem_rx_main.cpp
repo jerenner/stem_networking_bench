@@ -33,7 +33,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
-#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -55,8 +54,6 @@
 #include <utility>
 #include <vector>
 
-#include <unistd.h>
-
 #ifdef STEM_DAQIRI_HAVE_HDF5
 #include <H5Cpp.h>
 #endif
@@ -69,6 +66,8 @@
 #include "stem_packet.h"
 
 namespace {
+
+constexpr int kSupervisorRestartExitCode = 75;
 
 constexpr size_t kMaxLatencySamples = 1'000'000;  // cap so RX doesn't blow RAM
 
@@ -2814,25 +2813,9 @@ int main(int argc, char** argv) {
     daqiri::shutdown();
     control_server.stop();
     if (restart_requested.load()) {
-      std::vector<std::string> restart_arguments;
-      restart_arguments.reserve(argc);
-      for (int index = 0; index < argc; ++index) {
-        restart_arguments.emplace_back(argv[index]);
-      }
-      restart_arguments[1] = control.runtime_config_path;
-      std::vector<char*> restart_argv;
-      restart_argv.reserve(restart_arguments.size() + 1);
-      for (auto& argument : restart_arguments) {
-        restart_argv.push_back(argument.data());
-      }
-      restart_argv.push_back(nullptr);
-      std::cout << "Restarting acquisition from "
-                << control.runtime_config_path << "\n";
-      std::cout.flush();
-      execv("/proc/self/exe", restart_argv.data());
-      throw std::runtime_error(
-          std::string("failed to restart acquisition: ") +
-          std::strerror(errno));
+      std::cout << "Restart requested from " << control.runtime_config_path
+                << "; exiting for the DAQ supervisor\n";
+      return kSupervisorRestartExitCode;
     }
     if (run_stats.worker_errors.load(std::memory_order_relaxed) > 0 ||
         run_stats.output_pool_drops.load(std::memory_order_relaxed) > 0 ||

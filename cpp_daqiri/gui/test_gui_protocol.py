@@ -55,6 +55,14 @@ class ControlProtocolTest(unittest.TestCase):
             self.state["pending_config"]["processor"]["apply_blr_correction"]
         )
 
+    def test_persistent_supervisor_start_stop(self) -> None:
+        response = handle(self.state, {"command": "stop_acquisition"})
+        self.assertFalse(response["acquisition"]["running"])
+        self.assertEqual(response["supervisor"]["state"], "stopped")
+        response = handle(self.state, {"command": "start_acquisition"})
+        self.assertTrue(response["acquisition"]["running"])
+        self.assertEqual(response["supervisor"]["state"], "running")
+
 
 class StreamProtocolTest(unittest.TestCase):
     def test_optional_payload_decoding(self) -> None:

@@ -80,7 +80,11 @@ def initial_state(pub_endpoint: str, control_endpoint: str) -> dict:
             "queue_depth": 2,
             "threshold": {"zlp": 0.0, "core_loss": 0.0},
         },
-        "control": {"enabled": True, "endpoint": control_endpoint},
+        "control": {
+            "enabled": True,
+            "start_acquisition": True,
+            "endpoint": control_endpoint,
+        },
     }
     return {
         "ok": True,
@@ -90,6 +94,14 @@ def initial_state(pub_endpoint: str, control_endpoint: str) -> dict:
             "running": True,
             "restart_pending": False,
             "restart_requested": False,
+        },
+        "supervisor": {
+            "state": "running",
+            "acquisition_running": True,
+            "pid": 12345,
+            "public_endpoint": control_endpoint,
+            "last_exit_code": 0,
+            "last_error": "",
         },
         "burst_writer": {
             "capability_enabled": True,
@@ -182,8 +194,15 @@ def handle(state: dict, request: dict) -> dict:
         state["acquisition"]["restart_pending"] = False
         state["message"] = "mock restart complete"
         return state
-    if command == "shutdown":
+    if command == "start_acquisition":
+        state["acquisition"]["running"] = True
+        state["supervisor"]["state"] = "running"
+        state["supervisor"]["acquisition_running"] = True
+        return state
+    if command in {"stop_acquisition", "shutdown"}:
         state["acquisition"]["running"] = False
+        state["supervisor"]["state"] = "stopped"
+        state["supervisor"]["acquisition_running"] = False
         return state
     if command != "get_state":
         return {"ok": False, "error": f"unknown command {command}"}
@@ -239,7 +258,8 @@ def main() -> None:
                 reply = {"ok": False, "error": str(error)}
             control.send_json(reply)
         if (
-            state["thinned_stream"]["publishing"]
+            state["acquisition"]["running"]
+            and state["thinned_stream"]["publishing"]
             and time.monotonic() >= next_product
         ):
             receiver = batch % 2

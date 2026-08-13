@@ -20,6 +20,7 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Capability opt-in flags. These keep the hello/link-check, TX, and RX build
@@ -179,6 +180,23 @@ if(STEM_DAQIRI_BUILD_RX)
       ${STEM_DAQIRI_ZMQ_INCLUDE_DIR}
     )
     target_link_libraries(stem_daqiri_rx PRIVATE ${STEM_DAQIRI_ZMQ_LIBRARY})
+
+    add_executable(stem_daqiri_supervisor
+      supervisor/stem_supervisor_main.cpp
+      rx/stem_control_server.cpp
+    )
+    target_compile_definitions(stem_daqiri_supervisor PRIVATE
+      STEM_DAQIRI_HAVE_ZMQ=1
+    )
+    target_include_directories(stem_daqiri_supervisor PRIVATE
+      ${STEM_DAQIRI_ZMQ_INCLUDE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/rx
+    )
+    target_link_libraries(stem_daqiri_supervisor PRIVATE
+      ${STEM_DAQIRI_YAML_TARGET}
+      ${STEM_DAQIRI_ZMQ_LIBRARY}
+      Threads::Threads
+    )
   endif()
 endif()
 
@@ -223,6 +241,9 @@ if(STEM_DAQIRI_BUILD_TX)
 endif()
 if(STEM_DAQIRI_BUILD_RX)
   list(APPEND STEM_DAQIRI_INSTALL_TARGETS stem_daqiri_rx)
+  if(TARGET stem_daqiri_supervisor)
+    list(APPEND STEM_DAQIRI_INSTALL_TARGETS stem_daqiri_supervisor)
+  endif()
 endif()
 
 install(TARGETS ${STEM_DAQIRI_INSTALL_TARGETS}

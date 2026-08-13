@@ -165,10 +165,14 @@ thinned_stream:
     zlp: 0.0
     core_loss: 0.0
 
-# Runtime-safe DAQ controls use REP on this independent endpoint. Settings that
-# alter allocations, processor kernels, packet geometry, or NIC configuration
-# are written to runtime_config_path and applied by a graceful self-restart.
+# The persistent supervisor owns this public REP endpoint. It launches RX with
+# a private IPC control endpoint, so this port remains available while RX is
+# stopped or restarting. Restart-required settings are written atomically to
+# runtime_config_path before the old RX child exits.
 control:
   enabled: true
+  # Keep the persistent service online but leave DPDK/GPU acquisition idle
+  # until Start acquisition is pressed in the GUI.
+  start_acquisition: false
   endpoint: "tcp://*:5557"
   runtime_config_path: "/tmp/stem_daqiri_runtime.yaml"

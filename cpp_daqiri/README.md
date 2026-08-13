@@ -582,6 +582,7 @@ restart-required settings:
 ```yaml
 control:
   enabled: true
+  start_acquisition: false
   endpoint: "tcp://*:5557"
   runtime_config_path: "/tmp/stem_daqiri_runtime.yaml"
 ```
@@ -600,16 +601,40 @@ burst size, enabling an unallocated output, changing ZeroMQ endpoints/queue
 depth, processor kernels/calibration, continuous writer settings, or receiver
 packet/NIC geometry requires restart.
 
+`stem_daqiri_supervisor` is the persistent DAQ service. It owns the public REP
+endpoint and launches `stem_daqiri_rx` as a disposable child with a private IPC
+control endpoint. Consequently, the GUI remains connected while acquisition is
+stopped or restarting. **Stop acquisition** drains RX and releases DPDK, NIC,
+GPU, and auxiliary-output resources without exiting the supervisor; **Start
+acquisition** launches a fresh child using the last active configuration.
+
 `stage_restart` merges requested values into a complete pending YAML tree.
-`restart` first validates that tree and atomically writes
-`runtime_config_path`; only then does it stop RX, drain outputs, shut down
-DAQIRI, and replace the process with the same binary and CLI arguments using
-the generated configuration. The control socket is briefly unavailable while
-the process relaunches. The STEM application validates its staged settings
-before acquisition stops. DAQIRI engine-level NIC/queue changes cannot be
-preflighted while DPDK owns the
-interfaces; those are validated by `daqiri_init` after relaunch and can still
-cause the restarted process to exit with its configuration error.
+`restart` validates that tree and atomically writes `runtime_config_path`; only
+then does RX drain outputs, shut down DAQIRI, and exit with status 75. The
+supervisor waits for complete child termination before launching a new RX child
+with the generated configuration. DAQIRI engine-level NIC/queue changes cannot
+be preflighted while DPDK owns the interfaces; those are validated by
+`daqiri_init` after relaunch and can still cause the new child to stop with its
+configuration error while the supervisor remains available for inspection.
+
+For a persistent, remotely controlled container invocation, run the installed
+supervisor instead of the RX binary:
+
+```bash
+/opt/stem_daqiri/bin/stem_daqiri_supervisor \
+  /run/stem_rx.yaml
+```
+
+The supervisor rewrites only the child copy of the YAML so RX binds a private
+`ipc:///tmp/stem_daqiri_rx_control.ipc` endpoint; `control.endpoint` remains the
+public supervisor address. With `control.start_acquisition: false`, only the
+supervisor starts; the GUI launches the first RX child. Set it to `true` to
+begin acquisition as soon as the service starts. `STEM_DAQIRI_START_STOPPED=1`
+overrides either setting and forces an idle launch. An optional `--seconds 120`
+limits each RX child to 120 seconds, but the supervisor stays online afterward;
+omit it for acquisition that runs until Stop. Running `stem_daqiri_rx` directly
+remains valid for noninteractive tests, but GUI Start/Stop requires the
+supervisor.
 
 The PySide6 console combines the SUB viewer with the REP controls:
 
