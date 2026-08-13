@@ -45,9 +45,9 @@ def decode_product(parts: list[bytes]) -> tuple[str, dict, dict[str, np.ndarray]
             raise ValueError(
                 f"{name} payload has {len(payload)} bytes; expected {expected_bytes}"
             )
-        arrays[name] = (
-            np.frombuffer(payload, dtype="<f4").reshape(height, width).copy()
-        )
+        # The immutable ZeroMQ bytes object remains the ndarray's backing store.
+        # Avoid copying each multi-megabyte image before it reaches the viewer.
+        arrays[name] = np.frombuffer(payload, dtype="<f4").reshape(height, width)
     return topic, metadata, arrays
 
 
@@ -73,7 +73,9 @@ class StreamWorker(QtCore.QObject):
             self._timer = QtCore.QTimer(self)
             self._timer.timeout.connect(self.poll)
             self._timer.start(20)
-            self.status.emit(f"Listening on {self.endpoint}", True)
+            # ZeroMQ connect is asynchronous; receipt of a product establishes
+            # that the data endpoint is actually online.
+            self.status.emit(f"Waiting for data on {self.endpoint}", False)
         except Exception as error:  # pragma: no cover - environment dependent
             self.status.emit(str(error), False)
 
@@ -163,6 +165,29 @@ class Badge(QtWidgets.QLabel):
         )
 
 
+class DetectorImageView(pg.PlotWidget):
+    """Lean detector image canvas without ImageView histogram/LUT recomputation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.image_item = pg.ImageItem()
+        self.addItem(self.image_item)
+        self.setLabel("bottom", "Detector column")
+        self.setLabel("left", "Detector row")
+        self.showGrid(x=True, y=True, alpha=0.12)
+        self.getViewBox().invertY(True)
+
+    def set_image(
+        self,
+        image: np.ndarray,
+        levels: tuple[float, float] | None,
+        auto_range: bool,
+    ) -> None:
+        self.image_item.setImage(image, autoLevels=False, levels=levels)
+        if auto_range:
+            self.getViewBox().autoRange()
+
+
 def combo(items: list[str]) -> QtWidgets.QComboBox:
     widget = QtWidgets.QComboBox()
     widget.addItems(items)
@@ -202,21 +227,32 @@ class Product:
 class MainWindow(QtWidgets.QMainWindow):
     control_request = QtCore.Signal(str, object)
 
-    def __init__(self, stream_endpoint: str, control_endpoint: str, topic: str):
+    def __init__(
+        self,
+        stream_endpoint: str,
+        control_endpoint: str,
+        topic: str,
+        max_render_hz: float,
+    ):
         super().__init__()
         self.setWindowTitle("STEM DAQ Console")
         self.resize(1540, 960)
         self.products: dict[int, Product] = {}
+        self.dirty_receivers: set[int] = set()
+        self.rendered_views: set[tuple[int, int]] = set()
         self.initialized_from_state = False
         self.restart_after_stage = False
+        self.control_poll_pending = False
+        self.next_control_poll_at = 0.0
         self._build_ui(stream_endpoint, control_endpoint)
         self._start_workers(stream_endpoint, control_endpoint, topic)
+        self.render_timer = QtCore.QTimer(self)
+        self.render_timer.timeout.connect(self.render_latest)
+        self.render_timer.start(max(20, round(1000.0 / max_render_hz)))
         self.poll_timer = QtCore.QTimer(self)
-        self.poll_timer.timeout.connect(
-            lambda: self.send_control("poll", {"command": "get_state"})
-        )
-        self.poll_timer.start(1200)
-        self.send_control("initial", {"command": "get_state"})
+        self.poll_timer.timeout.connect(self.poll_control)
+        self.poll_timer.start(1000)
+        self.poll_control(initial=True)
 
     def _build_ui(self, stream_endpoint: str, control_endpoint: str) -> None:
         central = QtWidgets.QWidget()
@@ -301,17 +337,18 @@ class MainWindow(QtWidgets.QMainWindow):
         tools.addWidget(self.auto_levels)
         layout.addLayout(tools)
 
-        tabs = QtWidgets.QTabWidget()
-        self.representative_view = pg.ImageView()
-        self.sum_view = pg.ImageView()
+        self.viewer_tabs = QtWidgets.QTabWidget()
+        self.representative_view = DetectorImageView()
+        self.sum_view = DetectorImageView()
         self.profile_plot = pg.PlotWidget()
         self.profile_plot.setLabel("bottom", "Detector column")
         self.profile_plot.setLabel("left", "Mean signal")
         self.profile_plot.showGrid(x=True, y=True, alpha=0.2)
-        tabs.addTab(self.representative_view, "Single frame")
-        tabs.addTab(self.sum_view, "128-frame sum")
-        tabs.addTab(self.profile_plot, "Column profile")
-        layout.addWidget(tabs, 1)
+        self.viewer_tabs.addTab(self.representative_view, "Single frame")
+        self.viewer_tabs.addTab(self.sum_view, "128-frame sum")
+        self.viewer_tabs.addTab(self.profile_plot, "Column profile")
+        self.viewer_tabs.currentChanged.connect(self.refresh_view)
+        layout.addWidget(self.viewer_tabs, 1)
         return panel
 
     def _build_controls(self) -> QtWidgets.QWidget:
@@ -387,21 +424,33 @@ class MainWindow(QtWidgets.QMainWindow):
         threshold_row.addWidget(QtWidgets.QLabel("CoreLoss"))
         threshold_row.addWidget(self.burst_core_threshold)
         form.addRow("Thresholds", threshold_row)
-        configure = QtWidgets.QPushButton("Apply while idle")
-        configure.clicked.connect(lambda: self.apply_burst(""))
-        arm = QtWidgets.QPushButton("Arm next complete burst")
-        arm.clicked.connect(lambda: self.apply_burst("arm"))
-        disarm = QtWidgets.QPushButton("Disarm after current burst")
-        disarm.setObjectName("secondary")
-        disarm.clicked.connect(lambda: self.burst_action("disarm"))
-        abort = QtWidgets.QPushButton("Abort current burst")
-        abort.setObjectName("danger")
-        abort.clicked.connect(lambda: self.burst_action("abort"))
+        self.burst_configure = QtWidgets.QPushButton("Apply capture settings")
+        self.burst_configure.setToolTip(
+            "Update burst settings without starting a capture; accepted only while idle."
+        )
+        self.burst_configure.clicked.connect(lambda: self.apply_burst(""))
+        self.burst_arm = QtWidgets.QPushButton("Apply settings and arm")
+        self.burst_arm.setToolTip(
+            "Update the settings, then capture the next eligible bucket sequence."
+        )
+        self.burst_arm.clicked.connect(lambda: self.apply_burst("arm"))
+        self.burst_disarm = QtWidgets.QPushButton("Disarm after current burst")
+        self.burst_disarm.setObjectName("secondary")
+        self.burst_disarm.clicked.connect(lambda: self.burst_action("disarm"))
+        self.burst_abort = QtWidgets.QPushButton("Abort current burst")
+        self.burst_abort.setObjectName("danger")
+        self.burst_abort.clicked.connect(lambda: self.burst_action("abort"))
+        self.burst_live_buttons = [
+            self.burst_configure,
+            self.burst_arm,
+            self.burst_disarm,
+            self.burst_abort,
+        ]
         buttons = QtWidgets.QGridLayout()
-        buttons.addWidget(configure, 0, 0)
-        buttons.addWidget(arm, 0, 1)
-        buttons.addWidget(disarm, 1, 0)
-        buttons.addWidget(abort, 1, 1)
+        buttons.addWidget(self.burst_configure, 0, 0)
+        buttons.addWidget(self.burst_arm, 0, 1)
+        buttons.addWidget(self.burst_disarm, 1, 0)
+        buttons.addWidget(self.burst_abort, 1, 1)
         form.addRow(buttons)
         layout.addWidget(burst)
         layout.addStretch()
@@ -602,6 +651,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def send_control(self, tag: str, request: dict) -> None:
         self.control_request.emit(tag, request)
 
+    def poll_control(self, initial: bool = False) -> None:
+        if self.control_poll_pending or time.monotonic() < self.next_control_poll_at:
+            return
+        self.control_poll_pending = True
+        self.send_control("initial" if initial else "poll", {"command": "get_state"})
+
     @QtCore.Slot(str, bool)
     def on_stream_status(self, text: str, good: bool) -> None:
         self.stream_badge.set_state("DATA ONLINE" if good else "DATA OFFLINE", good)
@@ -619,10 +674,30 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_product(self, topic: str, metadata: dict, arrays: dict) -> None:
         receiver = int(metadata["receiver_id"])
         self.products[receiver] = Product(topic, metadata, arrays, time.time())
+        self.dirty_receivers.add(receiver)
+        self.stream_badge.set_state("DATA ONLINE", True)
         if self.receiver.findText(str(receiver)) < 0:
             self.receiver.addItem(str(receiver))
-        if int(self.receiver.currentText()) == receiver:
-            self.refresh_view()
+
+    def render_latest(self) -> None:
+        if not self.receiver.currentText():
+            return
+        receiver = int(self.receiver.currentText())
+        if receiver not in self.dirty_receivers:
+            return
+        self.dirty_receivers.discard(receiver)
+        self.refresh_view()
+
+    @staticmethod
+    def display_levels(image: np.ndarray) -> tuple[float, float] | None:
+        sample = image[::8, ::8]
+        finite = sample[np.isfinite(sample)]
+        if finite.size == 0:
+            return None
+        low, high = np.percentile(finite, (1.0, 99.5))
+        if low == high:
+            high = low + 1.0
+        return float(low), float(high)
 
     def refresh_view(self) -> None:
         if not self.receiver.currentText():
@@ -636,21 +711,41 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{metadata['processing_stage']}  |  batch {metadata['batch_index']}  |  "
             f"first frame {metadata['first_frame']}  |  {complete}"
         )
-        auto = self.auto_levels.isChecked()
-        if "representative" in arrays:
-            self.representative_view.setImage(
-                arrays["representative"], autoLevels=auto, autoRange=False
+        tab = self.viewer_tabs.currentIndex()
+        receiver = int(self.receiver.currentText())
+        view_key = (receiver, tab)
+        auto_range = view_key not in self.rendered_views
+        if tab == 0 and "representative" in arrays:
+            levels = (
+                self.display_levels(arrays["representative"])
+                if self.auto_levels.isChecked()
+                else None
             )
-        if "sum" in arrays:
-            self.sum_view.setImage(arrays["sum"], autoLevels=auto, autoRange=False)
-        profile_source = arrays.get("sum", arrays.get("representative"))
-        if profile_source is not None:
+            self.representative_view.set_image(
+                arrays["representative"],
+                levels=levels,
+                auto_range=auto_range,
+            )
+        elif tab == 1 and "sum" in arrays:
+            levels = (
+                self.display_levels(arrays["sum"])
+                if self.auto_levels.isChecked()
+                else None
+            )
+            self.sum_view.set_image(
+                arrays["sum"], levels=levels, auto_range=auto_range
+            )
+        elif tab == 2:
+            profile_source = arrays.get("sum", arrays.get("representative"))
+            if profile_source is None:
+                return
             profile = np.nanmean(profile_source, axis=0)
             self.profile_plot.clear()
             self.profile_plot.plot(
                 profile,
                 pen=pg.mkPen("#e1763f", width=1.5),
             )
+        self.rendered_views.add(view_key)
 
     def apply_thinned(self) -> None:
         request = {
@@ -810,12 +905,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str, object)
     def on_control_response(self, tag: str, response: dict) -> None:
+        if tag in {"initial", "poll"}:
+            self.control_poll_pending = False
         if not response.get("ok"):
+            if tag in {"initial", "poll"}:
+                # Avoid opening a fresh SSH forwarding channel every second
+                # while the DAQ control endpoint is not listening.
+                self.next_control_poll_at = time.monotonic() + 5.0
             if tag != "poll":
                 QtWidgets.QMessageBox.warning(
                     self, "DAQ control rejected", response.get("error", "Unknown error")
                 )
             return
+        if tag in {"initial", "poll"}:
+            self.next_control_poll_at = time.monotonic() + 1.0
         self.update_state(response, populate=not self.initialized_from_state or tag != "poll")
         if tag == "stage_and_restart" and self.restart_after_stage:
             self.restart_after_stage = False
@@ -835,10 +938,28 @@ class MainWindow(QtWidgets.QMainWindow):
     def update_state(self, state: dict, populate: bool) -> None:
         burst, thinned = state["burst_writer"], state["thinned_stream"]
         acquisition = state["acquisition"]
-        self.burst_state.set_state(
-            "ARMED" if burst["armed"] else ("BUSY" if burst["busy"] else "IDLE"),
-            not burst["busy"],
-        )
+        burst_available = bool(burst["capability_enabled"])
+        if not burst_available:
+            burst_label, burst_good = "NOT ALLOCATED", False
+            self.burst_state.setToolTip(
+                "Enable 'Allocate burst writer' under Apply on restart, then restart acquisition."
+            )
+        elif burst["busy"]:
+            burst_label, burst_good = "CAPTURING / WRITING", False
+            self.burst_state.setToolTip("A burst capture or asynchronous file write is active.")
+        elif burst["armed"]:
+            burst_label, burst_good = "ARMED / WAITING", True
+            self.burst_state.setToolTip("Waiting for the next eligible bucket sequence.")
+        else:
+            burst_label, burst_good = "IDLE", True
+            self.burst_state.setToolTip("Burst capability is allocated but not armed.")
+        self.burst_state.set_state(burst_label, burst_good)
+        for button in self.burst_live_buttons:
+            button.setEnabled(burst_available)
+            if not burst_available:
+                button.setToolTip(
+                    "Burst buffers are not allocated. Enable them under Apply on restart."
+                )
         summary = {
             "acquisition": acquisition,
             "burst_writer": {
@@ -966,6 +1087,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.poll_timer.stop()
+        self.render_timer.stop()
         QtCore.QMetaObject.invokeMethod(
             self.stream_worker,
             "stop",
@@ -996,7 +1118,16 @@ def parse_args() -> argparse.Namespace:
         help="control REQ endpoint, usually an SSH-forwarded local port",
     )
     parser.add_argument("--topic", default="stem/", help="subscription prefix")
-    return parser.parse_args()
+    parser.add_argument(
+        "--max-render-hz",
+        type=float,
+        default=5.0,
+        help="maximum Qt redraw rate; products are still received newest-only",
+    )
+    args = parser.parse_args()
+    if args.max_render_hz <= 0:
+        parser.error("--max-render-hz must be greater than zero")
+    return args
 
 
 def main() -> None:
@@ -1004,7 +1135,12 @@ def main() -> None:
     pg.setConfigOptions(imageAxisOrder="row-major", antialias=True)
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("STEM DAQ Console")
-    window = MainWindow(args.stream_endpoint, args.control_endpoint, args.topic)
+    window = MainWindow(
+        args.stream_endpoint,
+        args.control_endpoint,
+        args.topic,
+        args.max_render_hz,
+    )
     window.show()
     raise SystemExit(app.exec())
 

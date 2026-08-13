@@ -504,6 +504,13 @@ on the packet path. This is intentionally memory intensive: one 128-frame
 GPU and pinned host memory, per receiver. Increase `buckets_per_capture` only
 after checking the available GPU and host memory.
 
+In the Qt console, **Apply capture settings** changes stage/path/count policy
+without starting a capture and is accepted only while the burst sink is idle.
+**Apply settings and arm** makes the same update and then waits for the next
+eligible bucket sequence. If the state is **NOT ALLOCATED**, enable **Allocate
+burst writer** under **Apply on restart** and restart acquisition first; live
+controls cannot create the multi-gigabyte startup buffer allocation.
+
 Mount the output directory when running the container:
 
 ```bash
@@ -612,8 +619,15 @@ source .venv-stem-daq/bin/activate
 pip install -r cpp_daqiri/gui/requirements.txt
 python cpp_daqiri/gui/stem_daq_gui.py \
   --stream-endpoint tcp://127.0.0.1:15556 \
-  --control-endpoint tcp://127.0.0.1:15557
+  --control-endpoint tcp://127.0.0.1:15557 \
+  --max-render-hz 5
 ```
+
+`--max-render-hz` limits expensive Qt image redraws without changing the DAQ
+publication rate. The viewer retains only the newest received product and only
+renders the selected image/profile tab. Changing the publication rate in the
+GUI takes effect only after **Apply visualization settings** succeeds through
+the control endpoint.
 
 For an IGX reached through `qdaq01`, forward both ports from the local
 machine:
@@ -630,6 +644,19 @@ in both forwarding targets. The DAQ container must use `--network host`.
 The REP protocol is intentionally lightweight and has no built-in
 authentication; firewall port 5557 to the management network and normally
 access it only through an SSH tunnel.
+
+If DATA is online but CONTROL remains offline and SSH reports `connect failed:
+Connection refused`, the PUB endpoint is working but nothing is listening on
+IGX port 5557. Confirm that the host configuration mounted into the container
+contains the `control:` block above, rebuild/restart with the control-capable
+image, and check the host-network listener while RX is running:
+
+```bash
+sudo ss -ltnp | grep ':5557'
+```
+
+The application startup log also reports the enabled control endpoint. The GUI
+backs failed status probes off to avoid accumulating SSH forwarding channels.
 
 Develop and test the GUI without CUDA, DAQIRI, or detector hardware by running
 the synthetic server and connecting to its default local ports:

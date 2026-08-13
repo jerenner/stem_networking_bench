@@ -71,6 +71,8 @@ class StreamProtocolTest(unittest.TestCase):
         self.assertEqual(topic, "stem/rx/0/corrected")
         self.assertEqual(decoded["height"], 3)
         np.testing.assert_array_equal(arrays["sum"], image)
+        self.assertFalse(arrays["sum"].flags.owndata)
+        self.assertFalse(arrays["sum"].flags.writeable)
 
 
 if __name__ == "__main__":

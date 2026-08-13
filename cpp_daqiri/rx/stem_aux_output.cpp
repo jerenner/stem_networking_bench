@@ -196,7 +196,10 @@ struct BurstWriter::Impl {
         receiver_count(receivers),
         raw_input_float32(raw_float),
         output_float(config.stage != ProcessingStage::kRaw || raw_float) {
-    runtime.armed = config.start_armed;
+    // An unallocated burst writer cannot meaningfully be armed. Keeping this
+    // false also prevents control clients from presenting a disabled capability
+    // as ready to capture.
+    runtime.armed = config.enabled && config.start_armed;
     runtime.stage = config.stage;
     runtime.filepath_template = config.filepath_template;
     runtime.dataset_name = config.dataset_name;
