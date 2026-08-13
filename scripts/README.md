@@ -30,6 +30,32 @@ canonical CPU/NumPy reproduction of the `PyTorchProcessorOp` correction chain.
   occupancy, and compares tail fluctuations with the true `1/sqrt(N)` count
   statistic. It requires the optional `stempy` package and is exposed through
   the top-level `run_nio_counting_study.py` compatibility wrapper.
+  `run_nio_per_pixel_counting_study.py` calibrates a fixed threshold map from
+  each CoreLoss pixel's temporal dark distribution, validates it on held-out
+  dark files, and applies the STEMPy Classic strict local-maximum rule with a
+  configurable per-pixel sigma cut (4.5 by default).
+
+  For an independent 15 pA calibration/validation split, first build the dark
+  reference from files 1--3 only, then reserve file 4 for false-count testing:
+
+  ```bash
+  python make_dark_frame_from_dm4.py \
+    "NiO 15pA Dark 0001.dm4" "NiO 15pA Dark 0002.dm4" \
+    "NiO 15pA Dark 0003.dm4" \
+    --output dark_frame_files_1_3.h5 --output-dir dark_calibration
+
+  python run_nio_per_pixel_counting_study.py \
+    --study-root /path/to/studies \
+    --output-dir /path/to/per_pixel_counting \
+    --dark-frame-path dark_frame_files_1_3.h5 \
+    --current-key 0015pA --sigma-multiplier 4.5
+  ```
+
+  STEMPy Classic accepts only a scalar background threshold. The per-pixel
+  runner therefore reproduces its strict eight-neighbor local-maximum rule in
+  NumPy while comparing each candidate against `mean[p] + k * sigma[p]` in
+  corrected detector units. Treat the held-out-dark false-count rate as a
+  required acceptance metric rather than choosing `k` from spectrum appearance.
   `apply_dead_adc_spectrum_correction.py` reconstructs the known dead top-half
   ADC block at columns 2272..2287 after row aggregation, using a calibrated
   bottom-half spectral contribution and preserving reconstruction uncertainty.
@@ -49,6 +75,9 @@ canonical CPU/NumPy reproduction of the `PyTorchProcessorOp` correction chain.
   for, the independent batch-fluctuation test.
   `plot_nio_counted_full_analog.py` compares the complete final analog spectrum,
   including its folded ZLP, with the counting-valid CoreLoss-only STEMPy result.
+  `plot_per_pixel_dark_threshold_examples.py` plots representative temporal
+  dark distributions, fitted Gaussian models, fixed per-pixel thresholds, and
+  independently held-out dark samples, including false-count-prone pixels.
   `analyze_coreloss_features.py` localizes persistent CoreLoss structures such
   as the dead ADC block and separates detector artifacts from repeatable spectral
   features across files and beam currents.
