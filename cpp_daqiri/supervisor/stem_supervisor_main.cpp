@@ -131,6 +131,20 @@ std::string yaml_to_json(const YAML::Node& node) {
   return "\"" + json_escape(scalar) + "\"";
 }
 
+template <typename T>
+T yaml_map_value(const YAML::Node& map, const char* key, const T& fallback) {
+  if (!map || !map.IsMap()) { return fallback; }
+  const YAML::Node value = map[key];
+  if (!value || value.IsNull()) { return fallback; }
+  return value.as<T>(fallback);
+}
+
+YAML::Node yaml_map_node(const YAML::Node& map, const char* key) {
+  if (!map || !map.IsMap()) { return {}; }
+  const YAML::Node value = map[key];
+  return value && value.IsMap() ? value : YAML::Node{};
+}
+
 void write_yaml_atomic(const YAML::Node& root,
                        const std::filesystem::path& path) {
   if (path.has_parent_path()) {
@@ -373,10 +387,14 @@ class PersistentSupervisor {
   std::string initial_state(const YAML::Node& root) const {
     const YAML::Node burst = root["burst_writer"];
     const YAML::Node thinned = root["thinned_stream"];
-    const bool burst_enabled = burst["enabled"].as<bool>(false);
-    const std::string burst_stage = burst["processing_stage"].as<std::string>(
-        std::string("corrected"));
-    const bool thinned_enabled = thinned["enabled"].as<bool>(false);
+    const YAML::Node burst_threshold = yaml_map_node(burst, "threshold");
+    const YAML::Node thinned_threshold = yaml_map_node(thinned, "threshold");
+    const bool burst_enabled = yaml_map_value(burst, "enabled", false);
+    const std::string burst_stage = yaml_map_value<std::string>(
+        burst, "processing_stage", "corrected");
+    const uint32_t burst_buckets =
+        yaml_map_value<uint32_t>(burst, "buckets_per_capture", 1);
+    const bool thinned_enabled = yaml_map_value(thinned, "enabled", false);
     std::ostringstream state;
     state << "{\"ok\":true,\"schema\":\"stem.control.v1\",\"message\":\"\""
           << ",\"acquisition\":{\"running\":false,\"restart_pending\":false,"
@@ -386,52 +404,63 @@ class PersistentSupervisor {
           << ",\"armed\":false,\"busy\":false,\"output_float32\":"
           << (burst_stage == "raw" ? "false" : "true")
           << ",\"capacity_buckets\":"
-          << burst["buckets_per_capture"].as<uint32_t>(1)
+          << burst_buckets
           << ",\"processing_stage\":\"" << json_escape(burst_stage) << "\""
           << ",\"filepath_template\":\""
-          << json_escape(burst["filepath_template"].as<std::string>(
+          << json_escape(yaml_map_value<std::string>(
+                 burst, "filepath_template",
                  "/data/stem_burst_rx{receiver}_{capture}_{stage}.h5"))
           << "\",\"dataset_name\":\""
-          << json_escape(burst["dataset_name"].as<std::string>("/frames"))
+          << json_escape(
+                 yaml_map_value<std::string>(burst, "dataset_name", "/frames"))
           << "\",\"buckets_per_capture\":"
-          << burst["buckets_per_capture"].as<uint32_t>(1)
-          << ",\"capture_count\":" << burst["capture_count"].as<uint64_t>(1)
+          << burst_buckets
+          << ",\"capture_count\":"
+          << yaml_map_value<uint64_t>(burst, "capture_count", 1)
           << ",\"rearm_after_write\":"
-          << (burst["rearm_after_write"].as<bool>(true) ? "true" : "false")
+          << (yaml_map_value(burst, "rearm_after_write", true) ? "true"
+                                                                  : "false")
           << ",\"strict_complete\":"
-          << (burst["strict_complete"].as<bool>(true) ? "true" : "false")
+          << (yaml_map_value(burst, "strict_complete", true) ? "true"
+                                                                 : "false")
           << ",\"threshold\":{\"zlp\":"
-          << burst["threshold"]["zlp"].as<double>(0.0)
+          << yaml_map_value(burst_threshold, "zlp", 0.0)
           << ",\"core_loss\":"
-          << burst["threshold"]["core_loss"].as<double>(0.0)
+          << yaml_map_value(burst_threshold, "core_loss", 0.0)
           << "},\"stats\":{\"captures_started\":0,\"captures_written\":0,"
              "\"buckets_captured\":0,\"buckets_skipped_busy\":0,"
              "\"rejected_incomplete\":0,\"aborted\":0,\"errors\":0}}"
           << ",\"thinned_stream\":{\"capability_enabled\":"
           << (thinned_enabled ? "true" : "false")
           << ",\"publishing\":"
-          << (thinned["start_publishing"].as<bool>(true) ? "true" : "false")
+          << (yaml_map_value(thinned, "start_publishing", true) ? "true"
+                                                                    : "false")
           << ",\"endpoint\":\""
-          << json_escape(thinned["endpoint"].as<std::string>("tcp://*:5556"))
-          << "\",\"queue_depth\":" << thinned["queue_depth"].as<uint32_t>(2)
+          << json_escape(yaml_map_value<std::string>(
+                 thinned, "endpoint", "tcp://*:5556"))
+          << "\",\"queue_depth\":"
+          << yaml_map_value<uint32_t>(thinned, "queue_depth", 2)
           << ",\"processing_stage\":\""
-          << json_escape(thinned["processing_stage"].as<std::string>(
-                 "corrected"))
+          << json_escape(yaml_map_value<std::string>(
+                 thinned, "processing_stage", "corrected"))
           << "\",\"topic_prefix\":\""
-          << json_escape(thinned["topic_prefix"].as<std::string>("stem"))
+          << json_escape(
+                 yaml_map_value<std::string>(thinned, "topic_prefix", "stem"))
           << "\",\"total_refresh_hz\":"
-          << thinned["total_refresh_hz"].as<double>(10.0)
+          << yaml_map_value(thinned, "total_refresh_hz", 10.0)
           << ",\"representative_frame_index\":"
-          << thinned["representative_frame_index"].as<uint32_t>(64)
+          << yaml_map_value<uint32_t>(thinned, "representative_frame_index", 64)
           << ",\"include_representative_frame\":"
-          << (thinned["include_representative_frame"].as<bool>(true) ? "true"
-                                                                           : "false")
+          << (yaml_map_value(thinned, "include_representative_frame", true)
+                  ? "true"
+                  : "false")
           << ",\"include_bucket_sum\":"
-          << (thinned["include_bucket_sum"].as<bool>(true) ? "true" : "false")
+          << (yaml_map_value(thinned, "include_bucket_sum", true) ? "true"
+                                                                      : "false")
           << ",\"threshold\":{\"zlp\":"
-          << thinned["threshold"]["zlp"].as<double>(0.0)
+          << yaml_map_value(thinned_threshold, "zlp", 0.0)
           << ",\"core_loss\":"
-          << thinned["threshold"]["core_loss"].as<double>(0.0)
+          << yaml_map_value(thinned_threshold, "core_loss", 0.0)
           << "},\"stats\":{\"products_queued\":0,\"products_published\":0,"
              "\"products_coalesced\":0,\"dropped_no_buffer\":0,"
              "\"send_errors\":0}}"
