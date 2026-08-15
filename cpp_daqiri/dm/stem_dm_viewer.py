@@ -45,8 +45,13 @@ class DMImageWindow(object):
     """One persistent DigitalMicrograph image and its mapped NumPy storage."""
 
     def __init__(self, dm_module, title, array):
-        initial = np.ascontiguousarray(array, dtype=np.float32)
+        # Decoded ZeroMQ arrays are views over immutable message bytes. DM's
+        # CreateImage requires an owning NumPy array, not merely a contiguous
+        # view, so an explicit copy is required at window creation.
+        initial = np.array(array, dtype=np.float32, order="C", copy=True)
         self._image = dm_module.CreateImage(initial)
+        if self._image is None:
+            raise RuntimeError("DigitalMicrograph CreateImage returned no image")
         self._image.SetName(title)
         self._image.ShowImage()
         self._array = self._image.GetNumArray()

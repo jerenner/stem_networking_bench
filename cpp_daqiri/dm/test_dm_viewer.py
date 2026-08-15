@@ -34,6 +34,8 @@ class FakeDM(object):
         self.images = []
 
     def CreateImage(self, array):
+        if not array.flags.owndata:
+            raise ValueError("DigitalMicrograph requires an owning NumPy array")
         image = FakeImage(array)
         self.images.append(image)
         return image
@@ -73,6 +75,16 @@ class StreamProtocolTest(unittest.TestCase):
 
 
 class DigitalMicrographAdapterTest(unittest.TestCase):
+    def test_passes_an_owning_array_to_create_image(self):
+        dm = FakeDM()
+        viewer = DigitalMicrographViewer(dm, ("representative",))
+        source = np.arange(12, dtype="<f4").reshape(3, 4)
+        _topic, metadata, arrays = decode_product(product_parts(source))
+        self.assertFalse(arrays["representative"].flags.owndata)
+        viewer.display(metadata, arrays)
+        self.assertEqual(len(dm.images), 1)
+        viewer.release()
+
     def test_reuses_window_and_updates_mapped_storage(self):
         dm = FakeDM()
         viewer = DigitalMicrographViewer(dm, ("representative",))
@@ -104,4 +116,3 @@ class DigitalMicrographAdapterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
