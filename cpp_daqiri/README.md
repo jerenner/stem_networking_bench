@@ -654,6 +654,21 @@ renders the selected image/profile tab. Changing the publication rate in the
 GUI takes effect only after **Apply visualization settings** succeeds through
 the control endpoint.
 
+When DigitalMicrograph (or another application) owns the live display, run the
+Qt application as a compact controller:
+
+```bash
+python cpp_daqiri/gui/stem_daq_gui.py \
+  --controls-only \
+  --control-endpoint tcp://127.0.0.1:15557
+```
+
+Controls-only mode does not create a ZeroMQ SUB socket, receive image payloads,
+or run the Qt image renderer. It therefore leaves the thinned data stream to
+DigitalMicrograph while retaining all lifecycle, burst, runtime, restart, and
+state controls. Only the control port needs to be forwarded for this process;
+DigitalMicrograph still needs the data-port forwarding shown below.
+
 For an IGX reached through `qdaq01`, forward both ports from the local
 machine:
 
@@ -698,8 +713,9 @@ python cpp_daqiri/gui/stem_daq_gui.py \
 `dm/stem_dm_viewer.py` is a lightweight subscriber for Gatan
 DigitalMicrograph's embedded Python environment. It creates persistent DM image
 windows for each receiver's representative frame and bucket sum while the
-standalone Qt console continues to provide DAQ controls. The DM adapter, Qt
-viewer, and command-line inspector all use `dm/stem_stream_protocol.py`, so
+standalone Qt console, preferably in `--controls-only` mode, continues to
+provide DAQ controls. The DM adapter, full Qt viewer, and command-line inspector
+all use `dm/stem_stream_protocol.py`, so
 multipart validation and array interpretation remain identical.
 
 See [`dm/README.md`](dm/README.md) for the Windows/GMS environment check,

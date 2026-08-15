@@ -227,10 +227,14 @@ class MainWindow(QtWidgets.QMainWindow):
         control_endpoint: str,
         topic: str,
         max_render_hz: float,
+        controls_only: bool = False,
     ):
         super().__init__()
-        self.setWindowTitle("STEM DAQ Console")
-        self.resize(1540, 960)
+        self.controls_only = controls_only
+        self.setWindowTitle(
+            "STEM DAQ Control" if controls_only else "STEM DAQ Console"
+        )
+        self.resize(680 if controls_only else 1540, 920 if controls_only else 960)
         self.products: dict[int, Product] = {}
         self.dirty_receivers: set[int] = set()
         self.rendered_views: set[tuple[int, int]] = set()
@@ -242,9 +246,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.next_control_poll_at = 0.0
         self._build_ui(stream_endpoint, control_endpoint)
         self._start_workers(stream_endpoint, control_endpoint, topic)
-        self.render_timer = QtCore.QTimer(self)
-        self.render_timer.timeout.connect(self.render_latest)
-        self.render_timer.start(max(20, round(1000.0 / max_render_hz)))
+        self.render_timer: QtCore.QTimer | None = None
+        if not controls_only:
+            self.render_timer = QtCore.QTimer(self)
+            self.render_timer.timeout.connect(self.render_latest)
+            self.render_timer.start(max(20, round(1000.0 / max_render_hz)))
         self.poll_timer = QtCore.QTimer(self)
         self.poll_timer.timeout.connect(self.poll_control)
         self.poll_timer.start(1000)
@@ -259,34 +265,46 @@ class MainWindow(QtWidgets.QMainWindow):
 
         header = QtWidgets.QHBoxLayout()
         title_box = QtWidgets.QVBoxLayout()
-        title = QtWidgets.QLabel("STEM DAQ CONSOLE")
+        title = QtWidgets.QLabel(
+            "STEM DAQ CONTROL" if self.controls_only else "STEM DAQ CONSOLE"
+        )
         title.setObjectName("title")
         subtitle = QtWidgets.QLabel(
-            "Live detector products, controlled bursts, and acquisition lifecycle"
+            "Acquisition lifecycle, controlled bursts, and runtime configuration"
+            if self.controls_only
+            else "Live detector products, controlled bursts, and acquisition lifecycle"
         )
         subtitle.setObjectName("subtitle")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header.addLayout(title_box)
         header.addStretch()
-        self.stream_badge = Badge("Stream connecting")
+        self.stream_badge: Badge | None = None
         self.control_badge = Badge("Control connecting")
-        header.addWidget(self.stream_badge)
+        if not self.controls_only:
+            self.stream_badge = Badge("Stream connecting")
+            header.addWidget(self.stream_badge)
         header.addWidget(self.control_badge)
         root.addLayout(header)
 
-        endpoints = QtWidgets.QLabel(
-            f"DATA  {stream_endpoint}     CONTROL  {control_endpoint}"
+        endpoint_text = (
+            f"CONTROL  {control_endpoint}"
+            if self.controls_only
+            else f"DATA  {stream_endpoint}     CONTROL  {control_endpoint}"
         )
+        endpoints = QtWidgets.QLabel(endpoint_text)
         endpoints.setObjectName("endpoint")
         root.addWidget(endpoints)
 
-        splitter = QtWidgets.QSplitter()
-        splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
-        splitter.addWidget(self._build_viewer())
-        splitter.addWidget(self._build_controls())
-        splitter.setSizes([940, 560])
-        root.addWidget(splitter, 1)
+        if self.controls_only:
+            root.addWidget(self._build_controls(), 1)
+        else:
+            splitter = QtWidgets.QSplitter()
+            splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
+            splitter.addWidget(self._build_viewer())
+            splitter.addWidget(self._build_controls())
+            splitter.setSizes([940, 560])
+            root.addWidget(splitter, 1)
         self.statusBar().showMessage("Waiting for DAQ state")
 
         self.setStyleSheet(
@@ -628,13 +646,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_workers(
         self, stream_endpoint: str, control_endpoint: str, topic: str
     ) -> None:
-        self.stream_thread = QtCore.QThread(self)
-        self.stream_worker = StreamWorker(stream_endpoint, topic)
-        self.stream_worker.moveToThread(self.stream_thread)
-        self.stream_thread.started.connect(self.stream_worker.start)
-        self.stream_worker.product.connect(self.on_product)
-        self.stream_worker.status.connect(self.on_stream_status)
-        self.stream_thread.start()
+        self.stream_thread: QtCore.QThread | None = None
+        self.stream_worker: StreamWorker | None = None
+        if not self.controls_only:
+            self.stream_thread = QtCore.QThread(self)
+            self.stream_worker = StreamWorker(stream_endpoint, topic)
+            self.stream_worker.moveToThread(self.stream_thread)
+            self.stream_thread.started.connect(self.stream_worker.start)
+            self.stream_worker.product.connect(self.on_product)
+            self.stream_worker.status.connect(self.on_stream_status)
+            self.stream_thread.start()
 
         self.control_thread = QtCore.QThread(self)
         self.control_worker = ControlWorker(control_endpoint)
@@ -656,7 +677,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str, bool)
     def on_stream_status(self, text: str, good: bool) -> None:
-        self.stream_badge.set_state("DATA ONLINE" if good else "DATA OFFLINE", good)
+        if self.stream_badge is not None:
+            self.stream_badge.set_state(
+                "DATA ONLINE" if good else "DATA OFFLINE", good
+            )
         self.statusBar().showMessage(text, 5000)
 
     @QtCore.Slot(str, bool)
@@ -672,7 +696,10 @@ class MainWindow(QtWidgets.QMainWindow):
         receiver = int(metadata["receiver_id"])
         self.products[receiver] = Product(topic, metadata, arrays, time.time())
         self.dirty_receivers.add(receiver)
-        if self.acquisition_running is not False:
+        if (
+            self.acquisition_running is not False
+            and self.stream_badge is not None
+        ):
             self.stream_badge.set_state("DATA ONLINE", True)
         if self.receiver.findText(str(receiver)) < 0:
             self.receiver.addItem(str(receiver))
@@ -997,9 +1024,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if supervised
             else ""
         )
-        if not running:
+        if not running and self.stream_badge is not None:
             self.stream_badge.set_state("DATA IDLE", False)
-        elif was_running is False:
+        elif was_running is False and self.stream_badge is not None:
             self.stream_badge.set_state("DATA WAITING", False)
         burst_available = bool(burst["capability_enabled"])
         if not burst_available:
@@ -1153,14 +1180,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.poll_timer.stop()
-        self.render_timer.stop()
-        QtCore.QMetaObject.invokeMethod(
-            self.stream_worker,
-            "stop",
-            QtCore.Qt.ConnectionType.BlockingQueuedConnection,
-        )
-        self.stream_thread.quit()
-        self.stream_thread.wait(1500)
+        if self.render_timer is not None:
+            self.render_timer.stop()
+        if self.stream_worker is not None and self.stream_thread is not None:
+            QtCore.QMetaObject.invokeMethod(
+                self.stream_worker,
+                "stop",
+                QtCore.Qt.ConnectionType.BlockingQueuedConnection,
+            )
+            self.stream_thread.quit()
+            self.stream_thread.wait(1500)
         QtCore.QMetaObject.invokeMethod(
             self.control_worker,
             "stop",
@@ -1190,6 +1219,14 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="maximum Qt redraw rate; products are still received newest-only",
     )
+    parser.add_argument(
+        "--controls-only",
+        action="store_true",
+        help=(
+            "show a compact control console without connecting to the thinned "
+            "data stream"
+        ),
+    )
     args = parser.parse_args()
     if args.max_render_hz <= 0:
         parser.error("--max-render-hz must be greater than zero")
@@ -1206,6 +1243,7 @@ def main() -> None:
         args.control_endpoint,
         args.topic,
         args.max_render_hz,
+        args.controls_only,
     )
     window.show()
     raise SystemExit(app.exec())

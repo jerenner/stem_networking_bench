@@ -4,6 +4,8 @@ This directory is a self-contained first integration between the DAQIRI STEM
 thinned ZeroMQ stream and Gatan DigitalMicrograph (DM). It displays persistent
 DM images for each receiver's representative frame and 128-frame sum. The
 standalone Qt console remains responsible for DAQ controls during this phase.
+Run it with `--controls-only` so it does not also subscribe to and decode the
+large image products displayed by DM.
 
 ## Install pyzmq into GMS
 
@@ -51,6 +53,22 @@ The viewer drains queued messages and renders only the newest product at up to
 `MAX_DISPLAY_HZ`. Slow DM display updates therefore do not backpressure DAQ
 acquisition. The ZeroMQ publisher remains live-only, so start the viewer before
 the products that need to be observed.
+
+## Companion control console
+
+Start the compact controller from PowerShell in the environment containing the
+Qt GUI dependencies:
+
+```powershell
+python .\cpp_daqiri\gui\stem_daq_gui.py `
+  --controls-only `
+  --control-endpoint tcp://127.0.0.1:15557
+```
+
+This process connects only to the control endpoint. It does not open the
+thinned-stream endpoint or duplicate DM's image traffic. Keep both SSH forwards
+active: port `15556` supplies images to DM and port `15557` supplies state and
+commands to the Qt controller.
 
 ## Local tests
 
