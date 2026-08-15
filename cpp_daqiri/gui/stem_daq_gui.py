@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import sys
 import threading
@@ -18,6 +19,14 @@ import zmq
 from PySide6 import QtCore, QtGui, QtWidgets
 
 
+STREAM_PROTOCOL_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "dm")
+)
+if STREAM_PROTOCOL_DIR not in sys.path:
+    sys.path.insert(0, STREAM_PROTOCOL_DIR)
+from stem_stream_protocol import decode_product  # noqa: E402
+
+
 STAGES = [
     "raw",
     "dark_subtracted",
@@ -25,30 +34,6 @@ STAGES = [
     "corrected",
     "thresholded",
 ]
-
-
-def decode_product(parts: list[bytes]) -> tuple[str, dict, dict[str, np.ndarray]]:
-    if len(parts) < 3:
-        raise ValueError(f"expected at least 3 message parts, received {len(parts)}")
-    topic = parts[0].decode("utf-8")
-    metadata = json.loads(parts[1].decode("utf-8"))
-    if metadata.get("schema") != "stem.thinned.v1":
-        raise ValueError(f"unsupported stream schema {metadata.get('schema')!r}")
-    height, width = int(metadata["height"]), int(metadata["width"])
-    names = [name for name in metadata["parts"] if name != "metadata"]
-    if len(names) != len(parts) - 2:
-        raise ValueError("metadata parts do not match multipart payload")
-    expected_bytes = height * width * np.dtype("<f4").itemsize
-    arrays: dict[str, np.ndarray] = {}
-    for name, payload in zip(names, parts[2:], strict=True):
-        if len(payload) != expected_bytes:
-            raise ValueError(
-                f"{name} payload has {len(payload)} bytes; expected {expected_bytes}"
-            )
-        # The immutable ZeroMQ bytes object remains the ndarray's backing store.
-        # Avoid copying each multi-megabyte image before it reaches the viewer.
-        arrays[name] = np.frombuffer(payload, dtype="<f4").reshape(height, width)
-    return topic, metadata, arrays
 
 
 class StreamWorker(QtCore.QObject):

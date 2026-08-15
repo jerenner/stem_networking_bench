@@ -693,6 +693,20 @@ python cpp_daqiri/gui/stem_daq_gui.py \
   --control-endpoint tcp://127.0.0.1:5557
 ```
 
+### DigitalMicrograph prototype
+
+`dm/stem_dm_viewer.py` is a lightweight subscriber for Gatan
+DigitalMicrograph's embedded Python environment. It creates persistent DM image
+windows for each receiver's representative frame and bucket sum while the
+standalone Qt console continues to provide DAQ controls. The DM adapter, Qt
+viewer, and command-line inspector all use `dm/stem_stream_protocol.py`, so
+multipart validation and array interpretation remain identical.
+
+See [`dm/README.md`](dm/README.md) for the Windows/GMS environment check,
+`pyzmq` installation, synthetic-stream test, and execution instructions. The
+DM script must be run with **Execute in background** enabled so its receive loop
+does not block the DigitalMicrograph user interface.
+
 RX assembly is now tile-only (`gather_tile_packets_by_placement`); the legacy
 row-based gather and its `--validate-ramp` correctness gate were removed
 because LBNL's FPGA cannot emit row-shaped payloads. The test TX still emits
@@ -846,6 +860,8 @@ a live 100 Gb/s stream and therefore is not a receiver keep-up test.
 | `rx/stem_control_server.{cpp,h}` | JSON-over-ZeroMQ REP control transport |
 | `gui/stem_daq_gui.py` | PySide6 live viewer and DAQ controller |
 | `gui/mock_stem_daq.py` | hardware-free synthetic PUB/REP development server |
+| `dm/stem_dm_viewer.py` | embedded-Python DigitalMicrograph live viewer |
+| `dm/stem_stream_protocol.py` | shared thinned-stream multipart decoder |
 | `scripts/compare_h5_outputs.py` | pixel-level HDF5 parity comparator |
 | `configs/stem_rx_igx_production.yaml` | IGX RX-only production config |
 | `configs/stem_rx_igx_fpga_dual.yaml` | Dual-interface IGX FPGA production config |

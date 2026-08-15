@@ -5,7 +5,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import sys
+
+
+STREAM_PROTOCOL_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "dm")
+)
+if STREAM_PROTOCOL_DIR not in sys.path:
+    sys.path.insert(0, STREAM_PROTOCOL_DIR)
+from stem_stream_protocol import decode_product  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,30 +61,6 @@ def require_dependencies():
     return np, zmq
 
 
-def decode_message(parts: list[bytes], np):
-    if len(parts) < 3:
-        raise ValueError(f"expected at least 3 multipart sections, received {len(parts)}")
-    topic = parts[0].decode("utf-8")
-    metadata = json.loads(parts[1].decode("utf-8"))
-    if metadata.get("schema") != "stem.thinned.v1":
-        raise ValueError(f"unsupported schema: {metadata.get('schema')!r}")
-    height = int(metadata["height"])
-    width = int(metadata["width"])
-    expected_bytes = height * width * np.dtype("<f4").itemsize
-    payload_names = [name for name in metadata["parts"] if name != "metadata"]
-    if len(payload_names) != len(parts) - 2:
-        raise ValueError("metadata parts list does not match multipart payload")
-
-    arrays = {}
-    for name, payload in zip(payload_names, parts[2:], strict=True):
-        if len(payload) != expected_bytes:
-            raise ValueError(
-                f"{name}: expected {expected_bytes} bytes, received {len(payload)}"
-            )
-        arrays[name] = np.frombuffer(payload, dtype="<f4").reshape(height, width).copy()
-    return topic, metadata, arrays
-
-
 def save_message(save_dir: Path, index: int, topic: str, metadata: dict, arrays) -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
     stem = f"product_{index:06d}_rx{metadata['receiver_id']}_{metadata['processing_stage']}"
@@ -111,7 +97,7 @@ def main() -> None:
                 raise SystemExit(
                     f"No thinned product received within {args.timeout_ms} ms"
                 ) from error
-            topic, metadata, arrays = decode_message(parts, np)
+            topic, metadata, arrays = decode_product(parts, copy_arrays=True)
             received += 1
             summaries = []
             for name, array in arrays.items():

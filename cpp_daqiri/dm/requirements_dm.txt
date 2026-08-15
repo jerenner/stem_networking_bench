@@ -1,0 +1,3 @@
+# GMS supplies its own compatible NumPy. Do not replace it.
+pyzmq==25.1.2
+
