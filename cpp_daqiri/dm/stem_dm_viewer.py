@@ -38,7 +38,13 @@ def _add_module_directory():
 
 
 _add_module_directory()
-from stem_stream_protocol import decode_product  # noqa: E402
+try:
+    from stem_stream_protocol import decode_product  # noqa: E402
+except ImportError as error:
+    raise ImportError(
+        "Cannot import stem_stream_protocol. Run install_dm_module_path.py "
+        "with the GMS Python environment, then restart DigitalMicrograph."
+    ) from error
 
 
 class DMImageWindow(object):

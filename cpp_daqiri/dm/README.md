@@ -14,7 +14,15 @@ DM and install only the compatible ZeroMQ binding:
 ```bat
 activate GMS_VENV_PYTHON
 python -m pip install -r C:\path\to\stem_networking_bench\cpp_daqiri\dm\requirements_dm.txt
+cd C:\path\to\stem_networking_bench
+python .\cpp_daqiri\dm\install_dm_module_path.py
 ```
+
+The installer writes one `stem_daqiri_dm.pth` path file into the active Python
+environment. It does not copy modules or modify NumPy, and it follows future
+`git pull` updates in the same clone. If the GMS environment under
+`C:\ProgramData` is not writable, run the command from an Administrator shell.
+Restart DM afterward so its embedded Python processes the new path file.
 
 Run `check_dm_environment.py` once in DM. Its Results output should list the
 Python, NumPy, and pyzmq versions and report a successful image update.
@@ -52,4 +60,3 @@ installation:
 ```bash
 python cpp_daqiri/dm/test_dm_viewer.py
 ```
-

@@ -705,7 +705,9 @@ multipart validation and array interpretation remain identical.
 See [`dm/README.md`](dm/README.md) for the Windows/GMS environment check,
 `pyzmq` installation, synthetic-stream test, and execution instructions. The
 DM script must be run with **Execute in background** enabled so its receive loop
-does not block the DigitalMicrograph user interface.
+does not block the DigitalMicrograph user interface. Run the module-path
+installer documented there because DM's script editor does not define the
+source file path needed to discover adjacent Python modules.
 
 RX assembly is now tile-only (`gather_tile_packets_by_placement`); the legacy
 row-based gather and its `--validate-ramp` correctness gate were removed

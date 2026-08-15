@@ -16,6 +16,12 @@ try:
     print("pyzmq: {}".format(zmq.__version__))
 except ImportError:
     print("pyzmq: NOT INSTALLED")
+try:
+    import stem_stream_protocol
+
+    print("STEM stream protocol: {}".format(stem_stream_protocol.__file__))
+except ImportError:
+    print("STEM stream protocol: NOT INSTALLED")
 
 # DM.CreateImage rejects NumPy views even when they are C-contiguous. Reshape
 # returns a view, so make an explicit owning copy before crossing the DM API.
