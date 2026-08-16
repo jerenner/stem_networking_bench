@@ -712,10 +712,12 @@ python cpp_daqiri/gui/stem_daq_gui.py \
 
 `dm/stem_dm_viewer.py` is a lightweight subscriber for Gatan
 DigitalMicrograph's embedded Python environment. It creates persistent DM image
-windows for each receiver's representative frame and bucket sum while the
-standalone Qt console, preferably in `--controls-only` mode, continues to
-provide DAQ controls. The DM adapter, full Qt viewer, and command-line inspector
-all use `dm/stem_stream_protocol.py`, so
+windows for each receiver's representative frame and bucket sum. Its background
+loop also services `dm/stem_dm_controls.s`, a modeless native DM palette for
+start/stop, visualization settings, phase-one burst controls, and status. The
+Qt `--controls-only` mode remains available as a fallback and for advanced
+restart settings. The DM adapter, full Qt viewer, and command-line inspector all
+use `dm/stem_stream_protocol.py`, so
 multipart validation and array interpretation remain identical.
 
 See [`dm/README.md`](dm/README.md) for the Windows/GMS environment check,
@@ -878,7 +880,9 @@ a live 100 Gb/s stream and therefore is not a receiver keep-up test.
 | `rx/stem_control_server.{cpp,h}` | JSON-over-ZeroMQ REP control transport |
 | `gui/stem_daq_gui.py` | PySide6 live viewer and DAQ controller |
 | `gui/mock_stem_daq.py` | hardware-free synthetic PUB/REP development server |
-| `dm/stem_dm_viewer.py` | embedded-Python DigitalMicrograph live viewer |
+| `dm/stem_dm_viewer.py` | embedded-Python DigitalMicrograph live viewer/control engine |
+| `dm/stem_dm_controls.s` | modeless native DM phase-one control palette |
+| `dm/stem_dm_control.py` | persistent-tag mailbox and ZeroMQ control bridge |
 | `dm/stem_stream_protocol.py` | shared thinned-stream multipart decoder |
 | `scripts/compare_h5_outputs.py` | pixel-level HDF5 parity comparator |
 | `configs/stem_rx_igx_production.yaml` | IGX RX-only production config |

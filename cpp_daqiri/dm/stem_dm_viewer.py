@@ -17,6 +17,13 @@ import numpy as np
 STREAM_ENDPOINT = "tcp://127.0.0.1:15556"
 TOPIC_PREFIX = "stem/"
 
+# Phase-one DAQ control integration. The Python loop owns the REQ socket and
+# services modeless palette commands between image polls.
+ENABLE_CONTROL = True
+CONTROL_ENDPOINT = "tcp://127.0.0.1:15557"
+CONTROL_STATE_POLL_SECONDS = 1.0
+AUTO_LAUNCH_CONTROL_PALETTE = True
+
 # DM updates can be more expensive than receipt. The socket is always drained
 # to the newest product so reducing this limit does not backpressure the DAQ.
 MAX_DISPLAY_HZ = 2.0
@@ -40,10 +47,19 @@ def _add_module_directory():
 _add_module_directory()
 try:
     from stem_stream_protocol import decode_product  # noqa: E402
+    from stem_dm_control import (  # noqa: E402
+        DMControlBridge,
+        DMPersistentTagStore,
+        PersistentTagMailbox,
+        ZmqControlClient,
+        initialize_defaults,
+        launch_control_palette,
+    )
 except ImportError as error:
     raise ImportError(
-        "Cannot import stem_stream_protocol. Run install_dm_module_path.py "
-        "with the GMS Python environment, then restart DigitalMicrograph."
+        "Cannot import the STEM stream/control modules. Run "
+        "install_dm_module_path.py with the GMS Python environment, then "
+        "restart DigitalMicrograph."
     ) from error
 
 
@@ -147,6 +163,31 @@ def run(dm_module):
     subscriber.setsockopt(zmq.RCVTIMEO, RECEIVE_TIMEOUT_MS)
     subscriber.connect(STREAM_ENDPOINT)
 
+    control_bridge = None
+    control_mailbox = None
+    if ENABLE_CONTROL:
+        control_tags = DMPersistentTagStore(dm_module)
+        initialize_defaults(control_tags)
+        control_mailbox = PersistentTagMailbox(control_tags)
+        control_client = ZmqControlClient(zmq, CONTROL_ENDPOINT)
+        control_bridge = DMControlBridge(
+            control_mailbox,
+            control_client,
+            state_poll_seconds=CONTROL_STATE_POLL_SECONDS,
+        )
+        control_mailbox.set_engine_online(True)
+        # Fetch initial values before constructing the palette so fields match
+        # the currently effective DAQ configuration where possible.
+        control_bridge.tick()
+        if AUTO_LAUNCH_CONTROL_PALETTE:
+            try:
+                launch_control_palette(dm_module)
+            except Exception as error:
+                print(
+                    "Could not auto-launch STEM DAQ controls: {}. Open and "
+                    "execute stem_dm_controls.s manually.".format(error)
+                )
+
     viewer = DigitalMicrographViewer(dm_module)
     displayed = 0
     last_display = 0.0
@@ -159,6 +200,8 @@ def run(dm_module):
 
     try:
         while MAX_DISPLAYED_PRODUCTS <= 0 or displayed < MAX_DISPLAYED_PRODUCTS:
+            if control_bridge is not None:
+                control_bridge.tick()
             try:
                 parts = _receive_newest(subscriber, zmq)
             except zmq.Again:
@@ -185,6 +228,8 @@ def run(dm_module):
         print("STEM DM viewer interrupted after {} products".format(displayed))
     finally:
         subscriber.close()
+        if control_mailbox is not None:
+            control_mailbox.set_engine_online(False)
         viewer.release()
         print("STEM DM viewer stopped")
 

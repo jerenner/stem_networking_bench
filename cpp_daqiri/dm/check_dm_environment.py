@@ -22,6 +22,18 @@ try:
     print("STEM stream protocol: {}".format(stem_stream_protocol.__file__))
 except ImportError:
     print("STEM stream protocol: NOT INSTALLED")
+try:
+    import stem_dm_control
+
+    print("STEM DM control bridge: {}".format(stem_dm_control.__file__))
+except ImportError:
+    print("STEM DM control bridge: NOT INSTALLED")
+
+if not hasattr(DM, "GetPersistentTagGroup"):
+    raise RuntimeError("DigitalMicrograph persistent-tag API is unavailable")
+if not hasattr(DM, "ExecuteScriptString"):
+    raise RuntimeError("DigitalMicrograph DM-script execution API is unavailable")
+print("DigitalMicrograph persistent tags and hybrid scripting: OK")
 
 # DM.CreateImage rejects NumPy views even when they are C-contiguous. Reshape
 # returns a view, so make an explicit owning copy before crossing the DM API.

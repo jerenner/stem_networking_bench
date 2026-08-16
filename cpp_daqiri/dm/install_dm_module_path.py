@@ -41,9 +41,8 @@ def main():
     print("Python prefix: {}".format(sys.prefix))
     print("Wrote: {}".format(path_file))
     print("STEM DM module directory: {}".format(module_directory))
-    print("Restart DigitalMicrograph before importing stem_stream_protocol.")
+    print("Restart DigitalMicrograph before importing the STEM DM modules.")
 
 
 if __name__ == "__main__":
     main()
-
