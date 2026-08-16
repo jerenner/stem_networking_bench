@@ -224,6 +224,16 @@ class BridgeTest(unittest.TestCase):
         self.assertIn("class STEMDAQControlPalette : UIFrame", dm.source)
         self.assertIn('QueueCommand("start_acquisition")', dm.source)
 
+    def test_palette_does_not_split_dm_expressions_across_lines(self):
+        dm = FakeScriptDM()
+        launch_control_palette(dm)
+        for line_number, line in enumerate(dm.source.splitlines(), 1):
+            stripped = line.rstrip()
+            self.assertFalse(
+                stripped.endswith(("(", ",")),
+                "DM expression continues after line {}".format(line_number),
+            )
+
     def test_control_failure_is_published(self):
         tags = FakeTags()
         initialize_defaults(tags)
