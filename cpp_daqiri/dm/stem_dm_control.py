@@ -20,6 +20,7 @@ STATE_SEQUENCE = TAG_ROOT + ":State:Sequence"
 STATE_JSON = TAG_ROOT + ":State:JSON"
 ENGINE_ONLINE = TAG_ROOT + ":State:EngineOnline"
 ENGINE_HEARTBEAT = TAG_ROOT + ":State:EngineHeartbeat"
+VIEWER_STOP_REQUESTED = TAG_ROOT + ":Viewer:StopRequested"
 
 VISUALIZATION_ROOT = TAG_ROOT + ":Control:Visualization"
 BURST_ROOT = TAG_ROOT + ":Control:Burst"

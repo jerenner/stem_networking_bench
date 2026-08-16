@@ -47,8 +47,12 @@ on Windows, retain the defaults `tcp://127.0.0.1:15556` and
 Open `stem_dm_viewer.py` from DM's Python script editor, ensure **Execute in
 background** is selected, and execute it. DM should open the **STEM DAQ
 Control** palette and create up to four live images when two receivers publish
-both products. Stop the Python engine with `Ctrl+Shift+Q`. For a bounded first
-test, set `MAX_DISPLAYED_PRODUCTS = 10`.
+both products. The palette uses separate **Status**, **Visualization**, and
+**Burst** tabs so it fits on a typical DM workspace. Closing the palette or
+pressing **Stop DM viewer and close** asks the Python loop to release its
+sockets and finish normally; wait for `STEM DM viewer stopped` before executing
+the viewer again. `Ctrl+Shift+Q` remains the emergency stop for a background
+script. For a bounded first test, set `MAX_DISPLAYED_PRODUCTS = 10`.
 
 The viewer drains queued messages and renders only the newest product at up to
 `MAX_DISPLAY_HZ`. Slow DM display updates therefore do not backpressure DAQ
@@ -76,10 +80,9 @@ to copy the newest cached state and accepted settings into the displayed
 fields. Control requests temporarily serialize with image receipt; they do not
 pause acquisition or processing on the IGX.
 
-If automatic palette launch reports an error, open
-`cpp_daqiri\dm\stem_dm_controls.s` in DM's scripting editor and execute it once
-while `stem_dm_viewer.py` remains active. The two components communicate only
-through the `STEM DAQ` persistent-tag subtree.
+The palette is a floating DM-Script `UIFrame`; placing it inside DM's native
+dockable sidebar would require a compiled DM plugin rather than this Python and
+DM-Script proof of concept.
 
 ## Optional Qt fallback
 

@@ -223,6 +223,11 @@ class BridgeTest(unittest.TestCase):
         launch_control_palette(dm)
         self.assertIn("class STEMDAQControlPalette : UIFrame", dm.source)
         self.assertIn('QueueCommand("start_acquisition")', dm.source)
+        self.assertIn('tabs.DLGAddTab("Status")', dm.source)
+        self.assertIn('tabs.DLGAddTab("Visualization")', dm.source)
+        self.assertIn('tabs.DLGAddTab("Burst")', dm.source)
+        self.assertIn(":Viewer:StopRequested", dm.source)
+        self.assertIn("self.Close()", dm.source)
 
     def test_palette_does_not_split_dm_expressions_across_lines(self):
         dm = FakeScriptDM()

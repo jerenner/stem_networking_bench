@@ -69,6 +69,16 @@ taggroup STEMLabeledField(string label, taggroup field)
 
 class STEMDAQControlPalette : UIFrame
 {
+    void RequestViewerStop(object self)
+    {
+        GetPersistentTagGroup().TagGroupSetTagAsBoolean(STEMRoot() + ":Viewer:StopRequested", 1);
+    }
+
+    ~STEMDAQControlPalette(object self)
+    {
+        self.RequestViewerStop();
+    }
+
     void QueueCommand(object self, string command)
     {
         taggroup tags = GetPersistentTagGroup();
@@ -122,6 +132,7 @@ class STEMDAQControlPalette : UIFrame
     void OnStart(object self) { self.QueueCommand("start_acquisition"); }
     void OnStop(object self) { self.QueueCommand("stop_acquisition"); }
     void OnRefresh(object self) { self.ReloadSettings(); }
+    void OnStopViewer(object self) { self.RequestViewerStop(); self.Close(); }
 
     void StoreVisualization(object self)
     {
@@ -184,6 +195,7 @@ class STEMDAQControlPalette : UIFrame
         items.DLGAddElement(STEMLabeledField("Burst", DLGCreateStringField("unknown", 28).DLGIdentifier("status-burst")));
         items.DLGAddElement(STEMLabeledField("Message", DLGCreateStringField("", 28).DLGIdentifier("status-message")));
         items.DLGAddElement(DLGGroupItems(DLGCreatePushButton("Start acquisition", "OnStart"), DLGCreatePushButton("Stop acquisition", "OnStop"), DLGCreatePushButton("Refresh", "OnRefresh")));
+        items.DLGAddElement(DLGCreatePushButton("Stop DM viewer and close", "OnStopViewer"));
         return box;
     }
 
@@ -225,9 +237,16 @@ class STEMDAQControlPalette : UIFrame
     {
         taggroup items;
         taggroup dialog = DLGCreateDialog("STEM DAQ Control", items);
-        items.DLGAddElement(self.CreateStatusBox());
-        items.DLGAddElement(self.CreateVisualizationBox());
-        items.DLGAddElement(self.CreateBurstBox());
+        taggroup tabs = DLGCreateTabList(0);
+        taggroup statusTab = tabs.DLGAddTab("Status");
+        taggroup visualizationTab = tabs.DLGAddTab("Visualization");
+        taggroup burstTab = tabs.DLGAddTab("Burst");
+        statusTab.DLGAddElement(self.CreateStatusBox());
+        visualizationTab.DLGAddElement(self.CreateVisualizationBox());
+        burstTab.DLGAddElement(self.CreateBurstBox());
+        taggroup wrapper = DLGCreateGroup();
+        wrapper.DLGAddElement(tabs);
+        items.DLGAddElement(wrapper);
         return dialog;
     }
 
@@ -238,5 +257,7 @@ class STEMDAQControlPalette : UIFrame
     }
 }
 
-object gSTEMDAQControlPalette = Alloc(STEMDAQControlPalette).Init();
-gSTEMDAQControlPalette.Display("STEM DAQ Control");
+{
+    object palette = Alloc(STEMDAQControlPalette).Init();
+    palette.Display("STEM DAQ Control");
+}

@@ -51,6 +51,7 @@ try:
         DMControlBridge,
         DMPersistentTagStore,
         PersistentTagMailbox,
+        VIEWER_STOP_REQUESTED,
         ZmqControlClient,
         initialize_defaults,
         launch_control_palette,
@@ -165,9 +166,11 @@ def run(dm_module):
 
     control_bridge = None
     control_mailbox = None
+    control_tags = None
     if ENABLE_CONTROL:
         control_tags = DMPersistentTagStore(dm_module)
         initialize_defaults(control_tags)
+        control_tags.set_bool(VIEWER_STOP_REQUESTED, False)
         control_mailbox = PersistentTagMailbox(control_tags)
         control_client = ZmqControlClient(zmq, CONTROL_ENDPOINT)
         control_bridge = DMControlBridge(
@@ -200,6 +203,12 @@ def run(dm_module):
 
     try:
         while MAX_DISPLAYED_PRODUCTS <= 0 or displayed < MAX_DISPLAYED_PRODUCTS:
+            if (
+                control_mailbox is not None
+                and control_tags.get_bool(VIEWER_STOP_REQUESTED, False)
+            ):
+                print("STEM DM viewer stop requested from control palette")
+                break
             if control_bridge is not None:
                 control_bridge.tick()
             try:
@@ -230,6 +239,7 @@ def run(dm_module):
         subscriber.close()
         if control_mailbox is not None:
             control_mailbox.set_engine_online(False)
+            control_tags.set_bool(VIEWER_STOP_REQUESTED, False)
         viewer.release()
         print("STEM DM viewer stopped")
 
