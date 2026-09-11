@@ -1,0 +1,25 @@
+[experiment]
+beam_energy_keV = 300.0
+frame_rate_hz = 87000.0
+beam_current_pA = 30.0
+
+[transport]
+pair_creation_energy_eV = 3.64
+fano_factor = 0.115
+temperature_K = 300.0
+bias_V = 20.0
+electron_mobility_cm2_Vs = 1350.0
+saturation_velocity_cm_s = 1.0e7
+sigma_floor_um = 0.05
+cloud_radius_sigma = 6.0
+
+[readout]
+gain_adu_per_electron = 0.0036
+pedestal_adu = 100.0
+read_noise_adu = 1.0
+common_mode_noise_adu = 0.25
+adc_bits = 16
+
+[framing]
+primaries_per_frame = 10
+random_seed = 12345

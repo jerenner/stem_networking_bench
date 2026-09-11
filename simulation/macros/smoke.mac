@@ -1,0 +1,25 @@
+# Fast, small-geometry validation run.
+/control/verbose 1
+/run/verbose 1
+/event/verbose 0
+/tracking/verbose 0
+
+/eels/detector/rows 64
+/eels/detector/columns 128
+/eels/detector/pixelPitch 10 um
+/eels/detector/thickness 5 um
+/eels/detector/maxStep 0.1 um
+
+/run/initialize
+/random/setSeeds 770353837 70597151
+
+/eels/source/energy 300 keV
+/eels/source/energySigma 0 keV
+/eels/source/sigmaX 2 um
+/eels/source/sigmaY 2 um
+/eels/source/angularSigma 0.1 mrad
+/eels/source/z -5 um
+/eels/output/file output/smoke_deposits
+
+/run/printProgress 20
+/run/beamOn 100

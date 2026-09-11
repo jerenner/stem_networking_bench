@@ -1,0 +1,27 @@
+# Detector-response-library preset for the EELS frame geometry.
+# Source energy and timing follow the microscope in arXiv:2511.03933;
+# detector pitch/thickness remain provisional until the sensor is documented.
+/control/verbose 1
+/run/verbose 1
+/event/verbose 0
+/tracking/verbose 0
+
+/eels/detector/rows 960
+/eels/detector/columns 3840
+/eels/detector/pixelPitch 10 um
+/eels/detector/thickness 5 um
+/eels/detector/maxStep 0.1 um
+
+/run/initialize
+/random/setSeeds 770353837 70597151
+
+/eels/source/energy 300 keV
+/eels/source/energySigma 0 keV
+/eels/source/sigmaX 2 um
+/eels/source/sigmaY 2 um
+/eels/source/angularSigma 0.1 mrad
+/eels/source/z -5 um
+/eels/output/file output/eels_reference_deposits
+
+/run/printProgress 1000
+/run/beamOn 10000

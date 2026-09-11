@@ -1,0 +1,98 @@
+# First abTEM specimen preset: static rocksalt NiO viewed along [001].
+# Detector/readout calibration status is described in eels_reference.toml.
+[experiment]
+beam_energy_keV = 300.0
+frame_rate_hz = 87000.0
+beam_current_pA = 30.0
+
+[transport]
+pair_creation_energy_eV = 3.64
+fano_factor = 0.115
+temperature_K = 300.0
+bias_V = 20.0
+electron_mobility_cm2_Vs = 1350.0
+saturation_velocity_cm_s = 1.0e7
+sigma_floor_um = 0.05
+cloud_radius_sigma = 6.0
+
+[readout]
+# Effective ADU per collected e-h pair from the NiO 15 pA sparse tail.
+gain_adu_per_electron = 0.275
+pedestal_adu = 2024.0
+read_noise_adu = 4.6
+common_mode_noise_adu = 0.1546
+row_common_mode_noise_adu = 0.3725
+column_common_mode_noise_adu = 0.8176
+adc_bits = 12
+calibration_file = "../calibration/eels_15pa_dark_calibration.h5"
+use_calibrated_pedestal = true
+use_calibrated_noise = true
+use_calibrated_correlated_noise = true
+simulate_known_defects = false
+
+[spectrometer]
+reference_energy_eV = 300000.0
+dispersion_eV_per_column = 0.25773195876288657
+dispersion_quadratic_columns_per_eV2 = 0.0
+zero_loss_stitched_column = 52.0
+detector_rows = 960
+detector_columns = 3840
+pixel_pitch_um = 10.0
+detector_source_z_um = -5.0
+zero_y_row = 479.5
+x_magnification = 1.0
+y_magnification = 1.0
+x_angle_to_position_um_per_mrad = 0.0
+y_angle_to_position_um_per_mrad = 100.0
+x_angle_magnification = 1.0
+y_angle_magnification = 1.0
+collection_semiangle_mrad = 50.0
+minimum_energy_loss_eV = -10.0
+maximum_energy_loss_eV = 850.0
+zlp_repeats = 4
+zlp_lane_width_columns = 192
+require_unit_weight = true
+random_seed = 24680
+
+[specimen]
+kernel = "abtem"
+random_seed = 97531
+
+[specimen.parameters]
+structure = "nio_rocksalt"
+lattice_constant_A = 4.17
+repetitions = [2, 2, 4]
+orientation = "[001]"
+potential_sampling_A = 0.12
+slice_thickness_A = 2.0
+potential_parametrization = "kirkland"
+potential_projection = "finite"
+probe_semiangle_mrad = 20.0
+probe_position_fractional = [0.5, 0.5]
+max_scattering_angle_mrad = 60.0
+device = "cpu"
+energy_tolerance_eV = 1.0
+
+[specimen.parameters.core_loss]
+# Requires the native environment created by scripts/setup_gpaw_env.sh.
+# energy_loss_eV is a provisional representative edge energy, not yet an
+# energy-resolved ELNES distribution.
+enabled = true
+atomic_number = 8
+n = 1
+l = 0
+order = 1
+epsilon_eV = 10.0
+energy_loss_eV = 532.0
+xc = "PBE"
+double_channel = false
+probability_scale = 1.0
+
+[materialization]
+mode = "auto"
+random_seed = 86420
+max_electrons = 10000000
+
+[framing]
+primaries_per_frame = 2152
+random_seed = 12345

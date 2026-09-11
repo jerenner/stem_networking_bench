@@ -1,0 +1,21 @@
+build/
+.venv/
+.venv-*/
+.conda-envs/
+.conda-pkgs/
+.gpaw-build/
+output/
+calibration/
+spectral_libraries/
+python/*.egg-info/
+**/__pycache__/
+*.py[cod]
+test.txt
+
+# Deterministic movie assets and rendered media are regenerated from the
+# simulation products by demo/render_demo.sh.
+demo/assets/
+demo/.manim/
+demo/.manim-check/
+demo/renders/
+demo/review_frames*/

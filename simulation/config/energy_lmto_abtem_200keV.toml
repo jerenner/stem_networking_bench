@@ -1,0 +1,135 @@
+# 200 keV version of the abTEM-spatial LMTO demonstrator. Its GOSH,
+# multislice, silicon-response, and detector-calibration products are kept
+# separate from the original 300 keV reference.
+[experiment]
+beam_energy_keV = 200.0
+frame_rate_hz = 87000.0
+beam_current_pA = 30.0
+
+[transport]
+pair_creation_energy_eV = 3.64
+fano_factor = 0.115
+temperature_K = 300.0
+bias_V = 20.0
+electron_mobility_cm2_Vs = 1350.0
+saturation_velocity_cm_s = 1.0e7
+sigma_floor_um = 0.05
+cloud_radius_sigma = 6.0
+
+[readout]
+# Effective fit of the 200 keV Geant4 response to isolated NiO tail events.
+gain_adu_per_electron = 0.245
+pedestal_adu = 2024.0
+read_noise_adu = 4.6
+common_mode_noise_adu = 0.1546
+row_common_mode_noise_adu = 0.3725
+column_common_mode_noise_adu = 0.8176
+adc_bits = 12
+calibration_file = "../calibration/eels_15pa_dark_calibration.h5"
+use_calibrated_pedestal = true
+use_calibrated_noise = true
+use_calibrated_correlated_noise = true
+simulate_known_defects = false
+
+[spectrometer]
+reference_energy_eV = 200000.0
+dispersion_eV_per_column = 0.25773195876288657
+zero_loss_stitched_column = 52.0
+detector_rows = 960
+detector_columns = 3840
+pixel_pitch_um = 10.0
+detector_source_z_um = -5.0
+zero_y_row = 479.5
+y_angle_to_position_um_per_mrad = 100.0
+collection_semiangle_mrad = 50.0
+minimum_energy_loss_eV = -10.0
+maximum_energy_loss_eV = 790.0
+energy_blur_sigma_eV = 0.35
+zlp_repeats = 4
+zlp_lane_width_columns = 192
+require_unit_weight = true
+random_seed = 24680
+
+[specimen]
+kernel = "energy-resolved"
+random_seed = 10842
+
+[specimen.parameters]
+library_file = "../spectral_libraries/lmto_gosh_200keV.h5"
+beam_energy_tolerance_eV = 1.0
+low_loss_scale = 1.0
+core_probability_scale = 1.0
+angular_scale = 1.0
+maximum_plural_order = 20
+
+[materialization]
+mode = "auto"
+random_seed = 86420
+max_electrons = 10000000
+
+[framing]
+primaries_per_frame = 2152
+random_seed = 12345
+
+[scan]
+model = "synthetic_disordered_rocksalt"
+spatial_provider = "abtem_cache"
+spatial_response_file = "../output/lmto_abtem_spatial_200keV_refined.h5"
+scan_pixels = 16
+lateral_cells = 2
+depth_atomic_planes = 8
+depth_sections = 3
+lattice_constant_A = 4.15
+probe_sigma_A = 0.55
+axial_sigma_A = 8.0
+electrons_per_probe = 2000000
+energy_min_eV = -2.0
+energy_max_eV = 790.0
+energy_step_eV = 1.0
+haadf_peak_counts = 5000.0
+reconstruction_sigma_pixels = 0.6
+random_seed = 314159
+
+[scan.element_edges]
+Li = ["Li_K"]
+Mn = ["Mn_L23"]
+Ti = ["Ti_L23"]
+O = ["O_K"]
+
+[scan.abtem]
+potential_sampling_A = 0.12
+slice_thickness_A = 2.075
+potential_parametrization = "kirkland"
+potential_projection = "finite"
+probe_semiangle_mrad = 20.0
+haadf_inner_mrad = 50.0
+haadf_outer_mrad = 80.0
+eels_inner_mrad = 0.0
+eels_outer_mrad = 50.0
+device = "cpu"
+epsilon_eV = 10.0
+transition_order = 1
+double_channel_edges = ["Li_K", "Ti_L23", "O_K", "Mn_L23"]
+frozen_phonon_configs = 1
+thermal_sigma_A = 0.0
+defocus_sign = 1.0
+maximum_batch = 16
+
+[raw_doeels]
+response_kernel_file = "../calibration/monte_carlo_200keV_response_kernel.h5"
+electrons_per_integration = 2152
+integrations_per_position = 1
+depth_indices = [1]
+scan_stride = 1
+detector_row_sigma_pixels = 187.0
+energy_mapping_subsamples = 16
+exact_response_max_electrons = 100000
+response_blur_sigma_pixels = 0.5
+counting_first_raw_column = 768
+counting_min_energy_eV = 36.08247422680412
+counting_detection_efficiency = 0.89622
+counting_dark_events_per_frame = 0.72265625
+counting_dark_first_raw_column = 1986
+compression_level = 1
+keep_hit_counts = true
+random_seed = 424242

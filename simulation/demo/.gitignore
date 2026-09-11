@@ -1,0 +1,6 @@
+.manim/
+.manim-check/
+assets/generated/
+renders/
+review_frames/
+__pycache__/

@@ -1,0 +1,22 @@
+name: eels-sim-gpaw
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - abtem=1.0.10
+  - numpy=2.4
+  - sympy=1.14
+  - h5py=3.16
+  - pandas=3.0
+  - matplotlib-base=3.11
+  - libxc=7.0
+  - "libblas=*=*openblas"
+  - fftw=3.3
+  - c-compiler=1.11
+  - cxx-compiler=1.11
+  - pip
+  - setuptools>=68
+  - wheel
+  - pybind11
+  - pip:
+      - "exspy>=0.3.2,<0.4"

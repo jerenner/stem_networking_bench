@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eels-sim"
+version = "0.1.0"
+description = "Charge transport and readout digitization for the EELS simulation chain"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "h5py>=3.10",
+  "pandas>=2.2",
+  "matplotlib>=3.8",
+  "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+abtem = [
+  "abTEM[core-loss]>=1.0.10,<1.1",
+]
+gos = [
+  "exspy>=0.3.2,<0.4",
+]
+
+[project.scripts]
+eels-sim = "eels_sim.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 103
+
+[tool.ruff.lint.per-file-ignores]
+"demo/test_prepare_demo_assets.py" = ["E402"]

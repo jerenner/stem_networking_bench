@@ -1,0 +1,22 @@
+/control/verbose 0
+/run/verbose 0
+/event/verbose 0
+/tracking/verbose 0
+/eels/detector/rows 64
+/eels/detector/columns 128
+/eels/detector/pixelPitch 10 um
+/eels/detector/thickness 5 um
+/eels/detector/maxStep 0.1 um
+/run/initialize
+/random/setSeeds 710632811 32605961
+/eels/source/energy 300 keV
+/eels/source/energySigma 0 keV
+# x=y=0 is a pixel boundary for this even-sized geometry. Sampling +/-5 um
+# therefore covers one complete pixel phase uniformly after impact alignment.
+/eels/source/uniformHalfX 5 um
+/eels/source/uniformHalfY 5 um
+/eels/source/angularSigma 0 mrad
+/eels/source/z -5 um
+/eels/output/file output/detector_response_300keV
+/run/printProgress 200
+/run/beamOn 1000

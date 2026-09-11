@@ -1,0 +1,5 @@
+h5py==3.16.0
+manim==0.21.0
+matplotlib==3.11.1
+numpy==2.5.2
+pillow==12.3.0

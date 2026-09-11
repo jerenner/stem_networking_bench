@@ -1,0 +1,78 @@
+# Finer real-space confirmation of the middle focal section in
+# energy_lmto_abtem.toml. It retains identical structure, scan grid, detector
+# angles, and channeling choices while changing 0.12 A to 0.09 A sampling.
+[experiment]
+beam_energy_keV = 300.0
+frame_rate_hz = 87000.0
+beam_current_pA = 30.0
+
+[spectrometer]
+reference_energy_eV = 300000.0
+dispersion_eV_per_column = 0.25773195876288657
+zero_loss_stitched_column = 52.0
+detector_rows = 960
+detector_columns = 3840
+pixel_pitch_um = 10.0
+detector_source_z_um = -5.0
+zero_y_row = 479.5
+y_angle_to_position_um_per_mrad = 100.0
+collection_semiangle_mrad = 50.0
+minimum_energy_loss_eV = -10.0
+maximum_energy_loss_eV = 790.0
+energy_blur_sigma_eV = 0.35
+zlp_repeats = 4
+zlp_lane_width_columns = 192
+require_unit_weight = true
+random_seed = 24680
+
+[specimen]
+kernel = "energy-resolved"
+random_seed = 10842
+
+[specimen.parameters]
+library_file = "../spectral_libraries/lmto_gosh_300keV.h5"
+
+[scan]
+model = "synthetic_disordered_rocksalt"
+spatial_provider = "abtem_cache"
+spatial_response_file = "../output/lmto_abtem_spatial_confirmation_0p09A.h5"
+scan_pixels = 16
+lateral_cells = 2
+depth_atomic_planes = 8
+depth_sections = 1
+lattice_constant_A = 4.15
+probe_sigma_A = 0.55
+axial_sigma_A = 8.0
+electrons_per_probe = 2000000
+energy_min_eV = -2.0
+energy_max_eV = 790.0
+energy_step_eV = 1.0
+haadf_peak_counts = 5000.0
+reconstruction_sigma_pixels = 0.6
+random_seed = 314159
+
+[scan.element_edges]
+Li = ["Li_K"]
+Mn = ["Mn_L23"]
+Ti = ["Ti_L23"]
+O = ["O_K"]
+
+[scan.abtem]
+potential_sampling_A = 0.09
+slice_thickness_A = 2.075
+potential_parametrization = "kirkland"
+potential_projection = "finite"
+probe_semiangle_mrad = 20.0
+haadf_inner_mrad = 50.0
+haadf_outer_mrad = 80.0
+eels_inner_mrad = 0.0
+eels_outer_mrad = 50.0
+device = "cpu"
+epsilon_eV = 10.0
+transition_order = 1
+double_channel_edges = ["Li_K", "Ti_L23", "O_K", "Mn_L23"]
+frozen_phonon_configs = 1
+thermal_sigma_A = 0.0
+focal_depths_A = [8.3]
+defocus_sign = 1.0
+maximum_batch = 16

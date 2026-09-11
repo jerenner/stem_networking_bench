@@ -1,0 +1,72 @@
+# Reproduce detector structure and known defects from the DOEELS 15 pA dark
+# acquisition. This is a validation preset, not the detector-generic default.
+[experiment]
+beam_energy_keV = 300.0
+frame_rate_hz = 87000.0
+beam_current_pA = 30.0
+
+[transport]
+pair_creation_energy_eV = 3.64
+fano_factor = 0.115
+temperature_K = 300.0
+bias_V = 20.0
+electron_mobility_cm2_Vs = 1350.0
+saturation_velocity_cm_s = 1.0e7
+sigma_floor_um = 0.05
+cloud_radius_sigma = 6.0
+
+[readout]
+# Effective ADU per collected e-h pair from the NiO 15 pA sparse tail.
+gain_adu_per_electron = 0.275
+pedestal_adu = 2024.0
+read_noise_adu = 4.6
+common_mode_noise_adu = 0.1546
+row_common_mode_noise_adu = 0.3725
+column_common_mode_noise_adu = 0.8176
+adc_bits = 12
+calibration_file = "../calibration/eels_15pa_dark_calibration.h5"
+use_calibrated_pedestal = true
+use_calibrated_noise = true
+use_calibrated_correlated_noise = true
+simulate_known_defects = true
+
+[spectrometer]
+dispersion_eV_per_column = 0.25773195876288657
+dispersion_quadratic_columns_per_eV2 = 0.0
+zero_loss_stitched_column = 52.0
+detector_rows = 960
+detector_columns = 3840
+pixel_pitch_um = 10.0
+detector_source_z_um = -5.0
+zero_y_row = 479.5
+x_magnification = 1.0
+y_magnification = 1.0
+x_angle_to_position_um_per_mrad = 0.0
+y_angle_to_position_um_per_mrad = 100.0
+x_angle_magnification = 1.0
+y_angle_magnification = 1.0
+collection_semiangle_mrad = 50.0
+minimum_energy_loss_eV = -10.0
+maximum_energy_loss_eV = 850.0
+energy_blur_sigma_eV = 0.0
+point_spread_sigma_x_um = 0.0
+point_spread_sigma_y_um = 0.0
+zlp_repeats = 4
+zlp_lane_width_columns = 192
+require_unit_weight = true
+random_seed = 24680
+
+[specimen]
+kernel = "identity"
+random_seed = 97531
+
+[specimen.parameters]
+
+[materialization]
+mode = "auto"
+random_seed = 86420
+max_electrons = 10000000
+
+[framing]
+primaries_per_frame = 2152
+random_seed = 12345

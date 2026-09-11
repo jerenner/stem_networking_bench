@@ -1,0 +1,19 @@
+# End-to-end source-file smoke test. Generate output/spectrometer_smoke_source.csv
+# with the commands documented in README.md before running this macro.
+/control/verbose 1
+/run/verbose 1
+/event/verbose 0
+/tracking/verbose 0
+
+/eels/detector/rows 960
+/eels/detector/columns 3840
+/eels/detector/pixelPitch 10 um
+/eels/detector/thickness 5 um
+/eels/detector/maxStep 0.1 um
+
+/run/initialize
+/random/setSeeds 370353837 30597151
+/eels/source/inputFile output/spectrometer_smoke_source.csv
+/eels/output/file output/spectrometer_smoke_deposits
+/run/printProgress 20
+/run/beamOn 100

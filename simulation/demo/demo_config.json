@@ -1,0 +1,16 @@
+{
+  "title": "DOEELS: from a fast detector stream to elemental maps",
+  "output_directory": "demo/assets/generated_200keV",
+  "simulation_config": "config/energy_lmto_abtem_200keV.toml",
+  "spatial_response": "output/lmto_abtem_spatial_200keV_refined.h5",
+  "spectrum_image": "output/lmto_abtem_200keV_spectrum_image.h5",
+  "spectral_library": "spectral_libraries/lmto_gosh_200keV.h5",
+  "physical_raw_scan": "output/lmto_raw_doeels_200keV_87khz_nio_calibrated_stride4.h5",
+  "exposure_sweep": "output/lmto_raw_doeels_200keV_exposure_sweep_16x16.h5",
+  "detector_response": "calibration/monte_carlo_200keV_response_kernel.h5",
+  "dark_calibration": "calibration/eels_15pa_dark_calibration.h5",
+  "sparse_calibration": "calibration/nio_15pa_sparse_detector_calibration_200keV.h5",
+  "exposure_integrations": 3000,
+  "display_smoothing_pixels": 0.6,
+  "final_elements": ["Mn", "O", "Ti"]
+}

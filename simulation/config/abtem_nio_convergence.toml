@@ -1,0 +1,68 @@
+# One-at-a-time convergence study for the first static-lattice NiO model.
+# The baseline matches specimen.parameters in abtem_nio.toml. Every axis must
+# include that baseline value so the calculation is performed only once.
+
+[study]
+beam_energy_eV = 300000.0
+radial_bins = 120
+histogram_max_angle_mrad = 100.0
+# Matches spectrometer.collection_semiangle_mrad in abtem_nio.toml. Metrics
+# with this suffix compare electrons that can reach the detector.
+comparison_collection_angle_mrad = 50.0
+
+[baseline]
+structure = "nio_rocksalt"
+lattice_constant_A = 4.17
+repetitions = [2, 2, 4]
+orientation = "[001]"
+potential_sampling_A = 0.12
+slice_thickness_A = 2.0
+potential_parametrization = "kirkland"
+potential_projection = "finite"
+probe_semiangle_mrad = 20.0
+probe_position_fractional = [0.5, 0.5]
+max_scattering_angle_mrad = 60.0
+device = "cpu"
+energy_tolerance_eV = 1.0
+
+[baseline.core_loss]
+enabled = true
+atomic_number = 8
+n = 1
+l = 0
+order = 1
+epsilon_eV = 10.0
+energy_loss_eV = 532.0
+xc = "PBE"
+double_channel = false
+probability_scale = 1.0
+
+[axes]
+# Numerical/model convergence axes. The reference is, respectively, the
+# largest lateral cell, finest sampling, largest cutoff, and double channeling.
+lateral_repetitions = [[1, 1], [2, 2], [3, 3]]
+potential_sampling_A = [0.18, 0.15, 0.12, 0.09]
+max_scattering_angle_mrad = [40.0, 60.0, 80.0]
+double_channel = [false, true]
+
+# This is a physical thickness trend rather than a numerical convergence axis;
+# its comparison reference remains the 4-cell baseline.
+thickness_repetitions = [1, 2, 4, 8]
+
+# Direct multi-parameter confirmation at the same four-cell physical thickness.
+# The reference combines the best settings from the one-at-a-time matrix. The
+# confirmation simultaneously enlarges the cell, refines the potential grid,
+# and extends angular coverage while retaining double channeling.
+[combined_check.reference]
+case_id = "combined_reference"
+lateral_repetitions = [3, 3]
+potential_sampling_A = 0.09
+max_scattering_angle_mrad = 80.0
+double_channel = true
+
+[combined_check.confirmation]
+case_id = "larger_finer_confirmation"
+lateral_repetitions = [4, 4]
+potential_sampling_A = 0.075
+max_scattering_angle_mrad = 100.0
+double_channel = true

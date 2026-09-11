@@ -1,0 +1,65 @@
+# Atomic DFT-GOS Li1.2Mn0.4Ti0.4O2 sample-data baseline. Core cross sections
+# are aperture-integrated and absolute; material-specific ELNES is not included.
+[experiment]
+beam_energy_keV = 300.0
+frame_rate_hz = 87000.0
+beam_current_pA = 30.0
+
+[spectrometer]
+reference_energy_eV = 300000.0
+dispersion_eV_per_column = 0.25773195876288657
+zero_loss_stitched_column = 52.0
+detector_rows = 960
+detector_columns = 3840
+pixel_pitch_um = 10.0
+detector_source_z_um = -5.0
+zero_y_row = 479.5
+y_angle_to_position_um_per_mrad = 100.0
+collection_semiangle_mrad = 50.0
+minimum_energy_loss_eV = -10.0
+maximum_energy_loss_eV = 790.0
+energy_blur_sigma_eV = 0.35
+zlp_repeats = 4
+zlp_lane_width_columns = 192
+require_unit_weight = true
+random_seed = 24680
+
+[specimen]
+kernel = "energy-resolved"
+random_seed = 10842
+
+[specimen.parameters]
+library_file = "../spectral_libraries/lmto_gosh_300keV.h5"
+beam_energy_tolerance_eV = 1.0
+low_loss_scale = 1.0
+core_probability_scale = 1.0
+angular_scale = 1.0
+maximum_plural_order = 20
+
+[materialization]
+mode = "auto"
+random_seed = 86420
+max_electrons = 10000000
+
+[framing]
+primaries_per_frame = 2152
+random_seed = 12345
+
+[scan]
+model = "synthetic_disordered_rocksalt"
+scan_pixels = 64
+lateral_cells = 8
+depth_atomic_planes = 32
+depth_sections = 8
+lattice_constant_A = 4.15
+probe_sigma_A = 0.55
+# Synthetic focal-section response. This is not direct depth recovery from a
+# single conventional 2D scan.
+axial_sigma_A = 8.0
+electrons_per_probe = 200000
+energy_min_eV = -2.0
+energy_max_eV = 790.0
+energy_step_eV = 1.0
+haadf_peak_counts = 5000.0
+reconstruction_sigma_pixels = 0.6
+random_seed = 314159
