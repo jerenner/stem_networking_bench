@@ -636,6 +636,54 @@ omit it for acquisition that runs until Stop. Running `stem_daqiri_rx` directly
 remains valid for noninteractive tests, but GUI Start/Stop requires the
 supervisor.
 
+#### Mock instrument control
+
+The dual-FPGA configuration enables the phase-one mock instrument service:
+
+```yaml
+instrument:
+  enabled: true
+  mode: "mock"
+  endpoint: "ipc:///tmp/stem_daqiri_instrument.ipc"
+  launch_service: true
+  service_binary: "/opt/stem_daqiri/bin/stem_daqiri_instrument_mock"
+  mock:
+    step_duration_ms: 150
+    audit_log_path: "/tmp/stem_instrument_mock_audit.jsonl"
+    fail_operation: ""
+    fail_step: 0
+    fail_once: true
+```
+
+The supervisor starts this separate process before launching RX and merges its
+state into every normal `get_state` response. Camera power, insertion,
+detector resynchronization/alignment, and scan start/stop are serialized
+asynchronous operations; requests return promptly while progress appears under
+`instrument.operation`. The mock changes no camera-head or FPGA hardware.
+
+Only namespaced intent commands are routed: `camera.*`, `detector.*`, `scan.*`,
+`instrument.*`, and `operation.*`. `mock.set_failure` is additionally available
+in mock mode for deterministic failure-path tests. No raw shell, `dsh`, SSH, or
+register-write endpoint is exposed.
+
+After rebuilding the container, validate the process boundary through the
+supervisor while acquisition is stopped:
+
+```bash
+python /opt/stem_daqiri/bin/validate_mock_instrument.py \
+  --endpoint tcp://127.0.0.1:5557
+```
+
+The client requires `pyzmq`; it can instead be run from the host checkout at
+`cpp_daqiri/scripts/validate_mock_instrument.py` if the runtime image does not
+provide the Python binding.
+
+The validation powers up the simulated camera, resynchronizes links, configures
+and starts a mock scan, and verifies an injected resync failure. The JSONL audit
+log records operation acceptance and final status. See
+[`../docs/CAMERA_HEAD_CONTROL_PLAN.md`](../docs/CAMERA_HEAD_CONTROL_PLAN.md) for
+the boundary between this mock and future reviewed hardware adapters.
+
 The PySide6 console combines the SUB viewer with the REP controls:
 
 ```bash

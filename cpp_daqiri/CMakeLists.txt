@@ -197,6 +197,23 @@ if(STEM_DAQIRI_BUILD_RX)
       ${STEM_DAQIRI_ZMQ_LIBRARY}
       Threads::Threads
     )
+
+    add_executable(stem_daqiri_instrument_mock
+      instrument/stem_instrument_mock_main.cpp
+      rx/stem_control_server.cpp
+    )
+    target_compile_definitions(stem_daqiri_instrument_mock PRIVATE
+      STEM_DAQIRI_HAVE_ZMQ=1
+    )
+    target_include_directories(stem_daqiri_instrument_mock PRIVATE
+      ${STEM_DAQIRI_ZMQ_INCLUDE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/rx
+    )
+    target_link_libraries(stem_daqiri_instrument_mock PRIVATE
+      ${STEM_DAQIRI_YAML_TARGET}
+      ${STEM_DAQIRI_ZMQ_LIBRARY}
+      Threads::Threads
+    )
   endif()
 endif()
 
@@ -244,11 +261,17 @@ if(STEM_DAQIRI_BUILD_RX)
   if(TARGET stem_daqiri_supervisor)
     list(APPEND STEM_DAQIRI_INSTALL_TARGETS stem_daqiri_supervisor)
   endif()
+  if(TARGET stem_daqiri_instrument_mock)
+    list(APPEND STEM_DAQIRI_INSTALL_TARGETS stem_daqiri_instrument_mock)
+  endif()
 endif()
 
 install(TARGETS ${STEM_DAQIRI_INSTALL_TARGETS}
   RUNTIME DESTINATION bin
 )
+if(TARGET stem_daqiri_instrument_mock)
+  install(PROGRAMS scripts/validate_mock_instrument.py DESTINATION bin)
+endif()
 foreach(cfg IN LISTS STEM_DAQIRI_CONFIGS)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${cfg})
     install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/${cfg} DESTINATION bin/configs)

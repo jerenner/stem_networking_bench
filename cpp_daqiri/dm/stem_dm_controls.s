@@ -101,6 +101,7 @@ class STEMDAQControlPalette : UIFrame
         self.DLGValue("status-acquisition", STEMReadString(base + "Acquisition", "unknown"));
         self.DLGValue("status-visualization", STEMReadString(base + "Visualization", "unknown"));
         self.DLGValue("status-burst", STEMReadString(base + "Burst", "unknown"));
+        self.DLGValue("status-instrument", STEMReadString(base + "Instrument", "unknown"));
         self.DLGValue("status-message", STEMReadString(base + "Message", ""));
     }
 
@@ -108,6 +109,14 @@ class STEMDAQControlPalette : UIFrame
     {
         string visual = STEMRoot() + ":Control:Visualization:";
         string burst = STEMRoot() + ":Control:Burst:";
+        string camera = STEMRoot() + ":Control:Camera:";
+        string scan = STEMRoot() + ":Control:Scan:";
+        string cameraService = "offline";
+        string detectorSync = "no";
+        string detectorAligned = "no";
+        if (STEMReadBoolean(camera + "ServiceOnline", 0)) cameraService = "online";
+        if (STEMReadBoolean(camera + "DetectorSynchronized", 0)) detectorSync = "yes";
+        if (STEMReadBoolean(camera + "DetectorAligned", 0)) detectorAligned = "yes";
         self.DLGValue("viz-publishing", STEMReadBoolean(visual + "Publishing", 1));
         self.DLGValue("viz-stage", STEMStageIndex(STEMReadString(visual + "ProcessingStage", "corrected")));
         self.DLGValue("viz-rate", STEMReadNumber(visual + "RefreshHz", 1.0));
@@ -126,6 +135,33 @@ class STEMDAQControlPalette : UIFrame
         self.DLGValue("burst-strict", STEMReadBoolean(burst + "StrictComplete", 0));
         self.DLGValue("burst-zlp", STEMReadNumber(burst + "ZLPThreshold", 0));
         self.DLGValue("burst-core", STEMReadNumber(burst + "CoreLossThreshold", 0));
+
+        self.DLGValue("camera-service", cameraService);
+        self.DLGValue("camera-mode", STEMReadString(camera + "Mode", "unknown"));
+        self.DLGValue("camera-power", STEMReadString(camera + "PowerState", "unknown"));
+        self.DLGValue("camera-insertion", STEMReadString(camera + "InsertionState", "unknown"));
+        self.DLGValue("camera-temperature", STEMReadNumber(camera + "TemperatureC", 0));
+        self.DLGValue("camera-target", STEMReadNumber(camera + "TargetTemperatureC", 0));
+        self.DLGValue("detector-links", STEMReadString(camera + "DetectorLinks", "unknown"));
+        self.DLGValue("detector-sync", detectorSync);
+        self.DLGValue("detector-aligned", detectorAligned);
+        self.DLGValue("operation-name", STEMReadString(camera + "OperationName", ""));
+        self.DLGValue("operation-state", STEMReadString(camera + "OperationState", "idle"));
+        self.DLGValue("operation-step", STEMReadString(camera + "OperationStep", ""));
+        self.DLGValue("operation-completed", STEMReadNumber(camera + "OperationCompletedSteps", 0));
+        self.DLGValue("operation-total", STEMReadNumber(camera + "OperationTotalSteps", 0));
+        self.DLGValue("operation-error", STEMReadString(camera + "OperationError", ""));
+
+        self.DLGValue("scan-state", STEMReadString(scan + "State", "idle"));
+        self.DLGValue("scan-number", STEMReadNumber(scan + "ScanNumber", 0));
+        self.DLGValue("scan-expected", STEMReadNumber(scan + "ExpectedFrames", 0));
+        self.DLGValue("scan-received", STEMReadNumber(scan + "ReceivedFrames", 0));
+        self.DLGValue("scan-pause", STEMReadNumber(scan + "PauseCount", 200));
+        self.DLGValue("scan-read", STEMReadNumber(scan + "ReadCount", 1));
+        self.DLGValue("scan-x", STEMReadNumber(scan + "PositionsX", 1));
+        self.DLGValue("scan-rows", STEMReadNumber(scan + "Rows", 1));
+        self.DLGValue("scan-flyback", STEMReadNumber(scan + "Flyback", 100));
+        self.DLGValue("scan-flush", STEMReadBoolean(scan + "FlushMemory", 1));
         self.RefreshStatus();
     }
 
@@ -183,6 +219,33 @@ class STEMDAQControlPalette : UIFrame
 
     void OnDisarmBurst(object self) { self.QueueCommand("disarm_burst"); }
     void OnAbortBurst(object self) { self.QueueCommand("abort_burst"); }
+    void OnInstrumentRefresh(object self) { self.QueueCommand("refresh_instrument"); }
+    void OnCameraTemperature(object self) { self.QueueCommand("camera_read_temperature"); }
+    void OnCameraBiases(object self) { self.QueueCommand("camera_read_biases"); }
+    void OnCameraPowerUp(object self) { self.QueueCommand("camera_power_up"); }
+    void OnCameraPowerDown(object self) { self.QueueCommand("camera_power_down"); }
+    void OnCameraInsert(object self) { self.QueueCommand("camera_insert"); }
+    void OnCameraRetract(object self) { self.QueueCommand("camera_retract"); }
+    void OnDetectorLinks(object self) { self.QueueCommand("detector_read_links"); }
+    void OnDetectorResync(object self) { self.QueueCommand("detector_resync"); }
+    void OnDetectorAutoAlign(object self) { self.QueueCommand("detector_auto_align"); }
+
+    void StoreScan(object self)
+    {
+        taggroup tags = GetPersistentTagGroup();
+        string root = STEMRoot() + ":Control:Scan:";
+        tags.TagGroupSetTagAsLong(root + "PauseCount", self.LookupElement("scan-pause").DLGGetValue());
+        tags.TagGroupSetTagAsLong(root + "ReadCount", self.LookupElement("scan-read").DLGGetValue());
+        tags.TagGroupSetTagAsLong(root + "PositionsX", self.LookupElement("scan-x").DLGGetValue());
+        tags.TagGroupSetTagAsLong(root + "Rows", self.LookupElement("scan-rows").DLGGetValue());
+        tags.TagGroupSetTagAsLong(root + "Flyback", self.LookupElement("scan-flyback").DLGGetValue());
+        tags.TagGroupSetTagAsBoolean(root + "FlushMemory", self.LookupElement("scan-flush").DLGGetValue());
+    }
+
+    void OnConfigureScan(object self) { self.StoreScan(); self.QueueCommand("configure_scan"); }
+    void OnStartScan(object self) { self.QueueCommand("start_scan"); }
+    void OnStopScan(object self) { self.QueueCommand("stop_scan"); }
+    void OnAbortScan(object self) { self.QueueCommand("abort_scan"); }
 
     taggroup CreateStatusBox(object self)
     {
@@ -193,6 +256,7 @@ class STEMDAQControlPalette : UIFrame
         items.DLGAddElement(STEMLabeledField("Acquisition", DLGCreateStringField("unknown", 28).DLGIdentifier("status-acquisition")));
         items.DLGAddElement(STEMLabeledField("Visualization", DLGCreateStringField("unknown", 28).DLGIdentifier("status-visualization")));
         items.DLGAddElement(STEMLabeledField("Burst", DLGCreateStringField("unknown", 28).DLGIdentifier("status-burst")));
+        items.DLGAddElement(STEMLabeledField("Instrument", DLGCreateStringField("unknown", 28).DLGIdentifier("status-instrument")));
         items.DLGAddElement(STEMLabeledField("Message", DLGCreateStringField("", 28).DLGIdentifier("status-message")));
         items.DLGAddElement(DLGGroupItems(DLGCreatePushButton("Start acquisition", "OnStart"), DLGCreatePushButton("Stop acquisition", "OnStop"), DLGCreatePushButton("Refresh", "OnRefresh")));
         items.DLGAddElement(DLGCreatePushButton("Stop DM viewer and close", "OnStopViewer"));
@@ -233,6 +297,53 @@ class STEMDAQControlPalette : UIFrame
         return box;
     }
 
+    taggroup CreateCameraBox(object self)
+    {
+        taggroup items;
+        taggroup box = DLGCreateBox("Camera head and detector links", items);
+        items.DLGAddElement(STEMLabeledField("Service", DLGCreateStringField("offline", 28).DLGIdentifier("camera-service")));
+        items.DLGAddElement(STEMLabeledField("Mode", DLGCreateStringField("unknown", 28).DLGIdentifier("camera-mode")));
+        items.DLGAddElement(STEMLabeledField("Power", DLGCreateStringField("unknown", 28).DLGIdentifier("camera-power")));
+        items.DLGAddElement(STEMLabeledField("Insertion", DLGCreateStringField("unknown", 28).DLGIdentifier("camera-insertion")));
+        items.DLGAddElement(STEMLabeledField("Temperature C", DLGCreateRealField(0, 12, 2).DLGIdentifier("camera-temperature")));
+        items.DLGAddElement(STEMLabeledField("Target C", DLGCreateRealField(0, 12, 2).DLGIdentifier("camera-target")));
+        items.DLGAddElement(DLGGroupItems(DLGCreatePushButton("Power up", "OnCameraPowerUp"), DLGCreatePushButton("Power down", "OnCameraPowerDown")));
+        items.DLGAddElement(DLGGroupItems(DLGCreatePushButton("Insert", "OnCameraInsert"), DLGCreatePushButton("Retract", "OnCameraRetract")));
+        items.DLGAddElement(DLGGroupItems(DLGCreatePushButton("Read temperature", "OnCameraTemperature"), DLGCreatePushButton("Read biases", "OnCameraBiases")));
+        items.DLGAddElement(STEMLabeledField("Detector links", DLGCreateStringField("unknown", 28).DLGIdentifier("detector-links")));
+        items.DLGAddElement(STEMLabeledField("Synchronized", DLGCreateStringField("no", 28).DLGIdentifier("detector-sync")));
+        items.DLGAddElement(STEMLabeledField("Aligned", DLGCreateStringField("no", 28).DLGIdentifier("detector-aligned")));
+        items.DLGAddElement(DLGGroupItems(DLGCreatePushButton("Read links", "OnDetectorLinks"), DLGCreatePushButton("Resync", "OnDetectorResync"), DLGCreatePushButton("Auto-align", "OnDetectorAutoAlign")));
+        items.DLGAddElement(STEMLabeledField("Operation", DLGCreateStringField("", 28).DLGIdentifier("operation-name")));
+        items.DLGAddElement(STEMLabeledField("State", DLGCreateStringField("idle", 28).DLGIdentifier("operation-state")));
+        items.DLGAddElement(STEMLabeledField("Current step", DLGCreateStringField("", 28).DLGIdentifier("operation-step")));
+        items.DLGAddElement(STEMLabeledField("Steps complete", DLGCreateIntegerField(0, 8).DLGIdentifier("operation-completed")));
+        items.DLGAddElement(STEMLabeledField("Total steps", DLGCreateIntegerField(0, 8).DLGIdentifier("operation-total")));
+        items.DLGAddElement(STEMLabeledField("Error", DLGCreateStringField("", 28).DLGIdentifier("operation-error")));
+        items.DLGAddElement(DLGCreatePushButton("Refresh instrument state", "OnInstrumentRefresh"));
+        return box;
+    }
+
+    taggroup CreateScanBox(object self)
+    {
+        string root = STEMRoot() + ":Control:Scan:";
+        taggroup items;
+        taggroup box = DLGCreateBox("Mock scan configuration and control", items);
+        items.DLGAddElement(STEMLabeledField("State", DLGCreateStringField("idle", 28).DLGIdentifier("scan-state")));
+        items.DLGAddElement(STEMLabeledField("Scan number", DLGCreateIntegerField(0, 10).DLGIdentifier("scan-number")));
+        items.DLGAddElement(STEMLabeledField("Expected frames", DLGCreateIntegerField(0, 12).DLGIdentifier("scan-expected")));
+        items.DLGAddElement(STEMLabeledField("Received frames", DLGCreateIntegerField(0, 12).DLGIdentifier("scan-received")));
+        items.DLGAddElement(STEMLabeledField("Pause count", DLGCreateIntegerField(STEMReadNumber(root + "PauseCount", 200), 10).DLGIdentifier("scan-pause")));
+        items.DLGAddElement(STEMLabeledField("Read count", DLGCreateIntegerField(STEMReadNumber(root + "ReadCount", 1), 10).DLGIdentifier("scan-read")));
+        items.DLGAddElement(STEMLabeledField("X positions", DLGCreateIntegerField(STEMReadNumber(root + "PositionsX", 1), 10).DLGIdentifier("scan-x")));
+        items.DLGAddElement(STEMLabeledField("Rows", DLGCreateIntegerField(STEMReadNumber(root + "Rows", 1), 10).DLGIdentifier("scan-rows")));
+        items.DLGAddElement(STEMLabeledField("Flyback", DLGCreateIntegerField(STEMReadNumber(root + "Flyback", 100), 10).DLGIdentifier("scan-flyback")));
+        items.DLGAddElement(DLGCreateCheckBox("Flush detector memory", STEMReadBoolean(root + "FlushMemory", 1)).DLGIdentifier("scan-flush"));
+        items.DLGAddElement(DLGCreatePushButton("Apply scan configuration", "OnConfigureScan"));
+        items.DLGAddElement(DLGGroupItems(DLGCreatePushButton("Start scan", "OnStartScan"), DLGCreatePushButton("Stop scan", "OnStopScan"), DLGCreatePushButton("Abort scan", "OnAbortScan")));
+        return box;
+    }
+
     taggroup CreateDialog(object self)
     {
         taggroup items;
@@ -241,9 +352,13 @@ class STEMDAQControlPalette : UIFrame
         taggroup statusTab = tabs.DLGAddTab("Status");
         taggroup visualizationTab = tabs.DLGAddTab("Visualization");
         taggroup burstTab = tabs.DLGAddTab("Burst");
+        taggroup cameraTab = tabs.DLGAddTab("Camera");
+        taggroup scanTab = tabs.DLGAddTab("Scan");
         statusTab.DLGAddElement(self.CreateStatusBox());
         visualizationTab.DLGAddElement(self.CreateVisualizationBox());
         burstTab.DLGAddElement(self.CreateBurstBox());
+        cameraTab.DLGAddElement(self.CreateCameraBox());
+        scanTab.DLGAddElement(self.CreateScanBox());
         taggroup wrapper = DLGCreateGroup();
         wrapper.DLGAddElement(tabs);
         items.DLGAddElement(wrapper);

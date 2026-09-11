@@ -24,6 +24,8 @@ VIEWER_STOP_REQUESTED = TAG_ROOT + ":Viewer:StopRequested"
 
 VISUALIZATION_ROOT = TAG_ROOT + ":Control:Visualization"
 BURST_ROOT = TAG_ROOT + ":Control:Burst"
+CAMERA_ROOT = TAG_ROOT + ":Control:Camera"
+SCAN_ROOT = TAG_ROOT + ":Control:Scan"
 
 STAGES = (
     "raw",
@@ -89,6 +91,43 @@ def build_request(command, tags):
 
     if command in ("start_acquisition", "stop_acquisition", "get_state"):
         return {"command": command}
+
+    instrument_actions = {
+        "refresh_instrument": "instrument.get_state",
+        "camera_read_temperature": "camera.read_temperature",
+        "camera_read_biases": "camera.read_biases",
+        "camera_power_up": "camera.power_up",
+        "camera_power_down": "camera.power_down",
+        "camera_insert": "camera.insert",
+        "camera_retract": "camera.retract",
+        "detector_read_links": "detector.read_link_status",
+        "detector_resync": "detector.resync",
+        "detector_auto_align": "detector.auto_align",
+        "start_scan": "scan.start",
+        "stop_scan": "scan.stop",
+        "abort_scan": "scan.abort",
+    }
+    if command in instrument_actions:
+        return {"command": instrument_actions[command]}
+
+    if command == "configure_scan":
+        return {
+            "command": "scan.configure",
+            "scan": {
+                "pause_count": tags.get_long(
+                    _field(SCAN_ROOT, "PauseCount"), 200
+                ),
+                "read_count": tags.get_long(_field(SCAN_ROOT, "ReadCount"), 1),
+                "positions_x": tags.get_long(
+                    _field(SCAN_ROOT, "PositionsX"), 1
+                ),
+                "rows": tags.get_long(_field(SCAN_ROOT, "Rows"), 1),
+                "flyback": tags.get_long(_field(SCAN_ROOT, "Flyback"), 100),
+                "flush_memory": tags.get_bool(
+                    _field(SCAN_ROOT, "FlushMemory"), True
+                ),
+            },
+        }
 
     if command == "apply_visualization":
         return {
@@ -204,6 +243,12 @@ def initialize_defaults(tags):
         ("bool", _field(BURST_ROOT, "StrictComplete"), False),
         ("float", _field(BURST_ROOT, "ZLPThreshold"), 0.0),
         ("float", _field(BURST_ROOT, "CoreLossThreshold"), 0.0),
+        ("long", _field(SCAN_ROOT, "PauseCount"), 200),
+        ("long", _field(SCAN_ROOT, "ReadCount"), 1),
+        ("long", _field(SCAN_ROOT, "PositionsX"), 1),
+        ("long", _field(SCAN_ROOT, "Rows"), 1),
+        ("long", _field(SCAN_ROOT, "Flyback"), 100),
+        ("bool", _field(SCAN_ROOT, "FlushMemory"), True),
     )
     getters = {
         "bool": tags.get_bool,
@@ -261,12 +306,34 @@ def compact_status(state):
     else:
         burst_status = "idle"
 
+    instrument = state.get("instrument", {})
+    if not instrument.get("enabled", False):
+        instrument_status = "disabled"
+    elif not instrument.get("service_online", False):
+        instrument_status = "offline"
+    else:
+        operation = instrument.get("operation", {})
+        if operation.get("state") == "running":
+            instrument_status = "{}: {}".format(
+                operation.get("name", "operation"),
+                operation.get("step", "running"),
+            )
+        else:
+            camera = instrument.get("camera", {})
+            instrument_status = "{} / {}".format(
+                camera.get("power_state", "unknown"),
+                camera.get("insertion_state", "unknown"),
+            )
+
     return {
         "control": "online" if state.get("ok", False) else "error",
         "acquisition": str(lifecycle),
         "visualization": visualization,
         "burst": burst_status,
-        "message": str(state.get("message", "")),
+        "instrument": instrument_status,
+        "message": str(
+            state.get("supervisor_message", state.get("message", ""))
+        ),
     }
 
 
@@ -292,6 +359,11 @@ class PersistentTagMailbox(object):
         status = compact_status(state)
         thinned = state.get("thinned_stream", {})
         burst = state.get("burst_writer", {})
+        instrument = state.get("instrument", {})
+        camera = instrument.get("camera", {})
+        detector = instrument.get("detector", {})
+        operation = instrument.get("operation", {})
+        scan = instrument.get("scan", {})
         visualization_fields = (
             ("bool", "Publishing", thinned.get("publishing")),
             ("string", "ProcessingStage", thinned.get("processing_stage")),
@@ -335,6 +407,66 @@ class PersistentTagMailbox(object):
                 self.tags.set_float(
                     _field(root, "CoreLossThreshold"), threshold["core_loss"]
                 )
+        instrument_fields = (
+            ("bool", CAMERA_ROOT, "ServiceOnline", instrument.get("service_online")),
+            ("string", CAMERA_ROOT, "Mode", instrument.get("mode")),
+            ("string", CAMERA_ROOT, "PowerState", camera.get("power_state")),
+            (
+                "string",
+                CAMERA_ROOT,
+                "InsertionState",
+                camera.get("insertion_state"),
+            ),
+            ("float", CAMERA_ROOT, "TemperatureC", camera.get("temperature_c")),
+            (
+                "float",
+                CAMERA_ROOT,
+                "TargetTemperatureC",
+                camera.get("target_temperature_c"),
+            ),
+            (
+                "bool",
+                CAMERA_ROOT,
+                "DetectorSynchronized",
+                detector.get("synchronized"),
+            ),
+            ("bool", CAMERA_ROOT, "DetectorAligned", detector.get("aligned")),
+            (
+                "string",
+                CAMERA_ROOT,
+                "DetectorLinks",
+                ", ".join(str(item) for item in detector.get("links", [])),
+            ),
+            ("string", CAMERA_ROOT, "OperationName", operation.get("name")),
+            ("string", CAMERA_ROOT, "OperationState", operation.get("state")),
+            ("string", CAMERA_ROOT, "OperationStep", operation.get("step")),
+            ("string", CAMERA_ROOT, "OperationError", operation.get("error")),
+            (
+                "long",
+                CAMERA_ROOT,
+                "OperationCompletedSteps",
+                operation.get("completed_steps"),
+            ),
+            (
+                "long",
+                CAMERA_ROOT,
+                "OperationTotalSteps",
+                operation.get("total_steps"),
+            ),
+            ("string", SCAN_ROOT, "State", scan.get("state")),
+            ("long", SCAN_ROOT, "ScanNumber", scan.get("scan_number")),
+            ("long", SCAN_ROOT, "ExpectedFrames", scan.get("expected_frames")),
+            ("long", SCAN_ROOT, "ReceivedFrames", scan.get("received_frames")),
+            ("long", SCAN_ROOT, "PauseCount", scan.get("pause_count")),
+            ("long", SCAN_ROOT, "ReadCount", scan.get("read_count")),
+            ("long", SCAN_ROOT, "PositionsX", scan.get("positions_x")),
+            ("long", SCAN_ROOT, "Rows", scan.get("rows")),
+            ("long", SCAN_ROOT, "Flyback", scan.get("flyback")),
+            ("bool", SCAN_ROOT, "FlushMemory", scan.get("flush_memory")),
+        )
+        for value_type, root, name, value in instrument_fields:
+            if value is not None:
+                setters[value_type](_field(root, name), value)
         self.state_sequence += 1
         self.tags.set_string(STATE_JSON, json.dumps(state, sort_keys=True))
         for name, value in status.items():

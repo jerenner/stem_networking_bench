@@ -195,16 +195,38 @@ class PersistentSupervisor {
             "/tmp/stem_daqiri_runtime.yaml"));
     start_acquisition_on_launch_ =
         original_root["control"]["start_acquisition"].as<bool>(true);
+    instrument_config_ = initial_config;
+    const YAML::Node instrument = original_root["instrument"];
+    instrument_enabled_ = yaml_map_value(instrument, "enabled", false);
+    instrument_mode_ = yaml_map_value<std::string>(instrument, "mode", "mock");
+    instrument_endpoint_ = yaml_map_value<std::string>(
+        instrument, "endpoint", "ipc:///tmp/stem_daqiri_instrument.ipc");
+    launch_instrument_service_ =
+        yaml_map_value(instrument, "launch_service", instrument_mode_ == "mock");
+    instrument_binary_ = getenv_or(
+        "STEM_DAQIRI_INSTRUMENT_BIN",
+        yaml_map_value<std::string>(
+            instrument, "service_binary",
+            "/opt/stem_daqiri/bin/stem_daqiri_instrument_mock"));
+    cached_instrument_state_ = instrument_enabled_
+        ? "{\"enabled\":true,\"service_online\":false,\"mode\":\"" +
+              json_escape(instrument_mode_) +
+              "\",\"error\":\"instrument service has not started\"}"
+        : "{\"enabled\":false,\"service_online\":false,\"mode\":\"disabled\"}";
     prepare_child_config(initial_config, child_config_);
     current_child_config_ = child_config_;
     cached_state_ = initial_state(original_root);
   }
 
-  ~PersistentSupervisor() { stop_child(true); }
+  ~PersistentSupervisor() {
+    stop_child(true);
+    stop_instrument_service();
+  }
 
   const std::string& public_endpoint() const { return public_endpoint_; }
 
   void start_initial() {
+    start_instrument_service();
     if (start_acquisition_on_launch_ &&
         !getenv_bool("STEM_DAQIRI_START_STOPPED", false)) {
       start_child(current_child_config_);
@@ -213,6 +235,22 @@ class PersistentSupervisor {
 
   void poll() {
     std::lock_guard<std::mutex> lock(mu_);
+    if (instrument_pid_ > 0) {
+      int instrument_status = 0;
+      const pid_t instrument_result =
+          waitpid(instrument_pid_, &instrument_status, WNOHANG);
+      if (instrument_result == instrument_pid_) {
+        instrument_pid_ = -1;
+        const int exit_code = WIFEXITED(instrument_status)
+                                  ? WEXITSTATUS(instrument_status)
+                                  : 128 + WTERMSIG(instrument_status);
+        cached_instrument_state_ =
+            "{\"enabled\":true,\"service_online\":false,\"mode\":\"" +
+            json_escape(instrument_mode_) +
+            "\",\"error\":\"instrument service exited with status " +
+            std::to_string(exit_code) + "\"}";
+      }
+    }
     if (child_pid_ <= 0 || manual_reap_) { return; }
     int status = 0;
     const pid_t result = waitpid(child_pid_, &status, WNOHANG);
@@ -314,7 +352,36 @@ class PersistentSupervisor {
       if (command == "shutdown_supervisor") {
         g_stop = 1;
         stop_child(true);
+        stop_instrument_service();
         return state("supervisor shutdown requested");
+      }
+
+      if (is_instrument_command(command)) {
+        if (!instrument_enabled_) {
+          throw std::runtime_error("instrument control is disabled");
+        }
+        if (command.rfind("mock.", 0) == 0 && instrument_mode_ != "mock") {
+          throw std::runtime_error("mock commands require instrument.mode=mock");
+        }
+        const std::string instrument_response =
+            forward_to_instrument(request_text, 1500);
+        const YAML::Node parsed = YAML::Load(instrument_response);
+        if (!parsed["ok"].as<bool>(false)) { return instrument_response; }
+        cache_instrument_response(parsed);
+        std::string message = parsed["message"].as<std::string>("");
+        if (parsed["operation_id"]) {
+          if (!message.empty()) { message += ": "; }
+          message += parsed["operation_id"].as<std::string>();
+        }
+        std::string response = state(message);
+        if (parsed["accepted"].as<bool>(false) && parsed["operation_id"] &&
+            !response.empty() && response.back() == '}') {
+          response.pop_back();
+          response += ",\"accepted\":true,\"operation_id\":\"" +
+                      json_escape(parsed["operation_id"].as<std::string>()) +
+                      "\"}";
+        }
+        return response;
       }
 
       std::string child_request = request_text;
@@ -383,7 +450,129 @@ class PersistentSupervisor {
     manual_reap_ = false;
   }
 
+  void stop_instrument_service() {
+    pid_t pid = -1;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      pid = instrument_pid_;
+    }
+    if (pid <= 0) { return; }
+    try {
+      forward_to_endpoint(instrument_endpoint_, "{\"command\":\"shutdown\"}",
+                          500);
+    } catch (...) {
+      kill(pid, SIGINT);
+    }
+    for (int attempt = 0; attempt < 30; ++attempt) {
+      int status = 0;
+      const pid_t result = waitpid(pid, &status, WNOHANG);
+      if (result == pid || (result < 0 && errno == ECHILD)) {
+        std::lock_guard<std::mutex> lock(mu_);
+        instrument_pid_ = -1;
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    kill(pid, SIGTERM);
+    waitpid(pid, nullptr, 0);
+    std::lock_guard<std::mutex> lock(mu_);
+    instrument_pid_ = -1;
+  }
+
  private:
+  static bool is_instrument_command(const std::string& command) {
+    return command.rfind("instrument.", 0) == 0 ||
+           command.rfind("camera.", 0) == 0 ||
+           command.rfind("detector.", 0) == 0 ||
+           command.rfind("scan.", 0) == 0 ||
+           command.rfind("operation.", 0) == 0 ||
+           command.rfind("mock.", 0) == 0;
+  }
+
+  void remove_stale_instrument_socket() const {
+    constexpr const char* prefix = "ipc://";
+    if (instrument_endpoint_.rfind(prefix, 0) == 0) {
+      std::error_code error;
+      std::filesystem::remove(
+          instrument_endpoint_.substr(std::strlen(prefix)), error);
+    }
+  }
+
+  void start_instrument_service() {
+    if (!instrument_enabled_) { return; }
+    if (launch_instrument_service_) {
+      if (instrument_mode_ != "mock") {
+        throw std::runtime_error(
+            "automatic instrument launch is currently limited to mock mode");
+      }
+      remove_stale_instrument_socket();
+      std::vector<std::string> arguments = {
+          instrument_binary_, instrument_config_};
+      std::vector<char*> argv;
+      for (auto& argument : arguments) { argv.push_back(argument.data()); }
+      argv.push_back(nullptr);
+      pid_t pid = -1;
+      const int result = posix_spawn(&pid, instrument_binary_.c_str(), nullptr,
+                                     nullptr, argv.data(), environ);
+      if (result != 0) {
+        throw std::runtime_error(
+            std::string("instrument service posix_spawn failed: ") +
+            std::strerror(result));
+      }
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        instrument_pid_ = pid;
+      }
+      std::cerr << "DAQ supervisor started mock instrument pid " << pid
+                << " using " << instrument_config_ << "\n";
+    }
+
+    std::string last_error = "instrument service did not become ready";
+    for (int attempt = 0; attempt < 50; ++attempt) {
+      try {
+        refresh_instrument_state();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (cached_instrument_state_.find("\"service_online\":true") !=
+            std::string::npos) {
+          return;
+        }
+      } catch (const std::exception& error) {
+        last_error = error.what();
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    stop_instrument_service();
+    throw std::runtime_error("instrument service startup failed: " + last_error);
+  }
+
+  void cache_instrument_response(const YAML::Node& response) {
+    if (!response || !response["instrument"]) { return; }
+    const std::string serialized = yaml_to_json(response["instrument"]);
+    std::lock_guard<std::mutex> lock(mu_);
+    cached_instrument_state_ = serialized;
+  }
+
+  void refresh_instrument_state() {
+    if (!instrument_enabled_) { return; }
+    try {
+      const std::string response = forward_to_instrument(
+          "{\"command\":\"instrument.get_state\"}", 800);
+      const YAML::Node parsed = YAML::Load(response);
+      if (!parsed["ok"].as<bool>(false) || !parsed["instrument"]) {
+        throw std::runtime_error(parsed["error"].as<std::string>(
+            "invalid instrument service response"));
+      }
+      cache_instrument_response(parsed);
+    } catch (const std::exception& error) {
+      std::lock_guard<std::mutex> lock(mu_);
+      cached_instrument_state_ =
+          "{\"enabled\":true,\"service_online\":false,\"mode\":\"" +
+          json_escape(instrument_mode_) + "\",\"error\":\"" +
+          json_escape(error.what()) + "\"}";
+      throw;
+    }
+  }
+
   std::string initial_state(const YAML::Node& root) const {
     const YAML::Node burst = root["burst_writer"];
     const YAML::Node thinned = root["thinned_stream"];
@@ -530,23 +719,34 @@ class PersistentSupervisor {
         throw std::runtime_error("acquisition is stopped");
       }
     }
+    return forward_to_endpoint(child_endpoint_, request, timeout_ms);
+  }
+
+  std::string forward_to_instrument(const std::string& request,
+                                    int timeout_ms) const {
+    return forward_to_endpoint(instrument_endpoint_, request, timeout_ms);
+  }
+
+  static std::string forward_to_endpoint(const std::string& endpoint,
+                                         const std::string& request,
+                                         int timeout_ms) {
     void* context = zmq_ctx_new();
-    if (!context) { throw std::runtime_error("child control context creation failed"); }
+    if (!context) { throw std::runtime_error("control context creation failed"); }
     void* socket = zmq_socket(context, ZMQ_REQ);
     if (!socket) {
       zmq_ctx_term(context);
-      throw std::runtime_error("child control socket creation failed");
+      throw std::runtime_error("control socket creation failed");
     }
     const int linger = 0;
     zmq_setsockopt(socket, ZMQ_LINGER, &linger, sizeof(linger));
     zmq_setsockopt(socket, ZMQ_SNDTIMEO, &timeout_ms, sizeof(timeout_ms));
     zmq_setsockopt(socket, ZMQ_RCVTIMEO, &timeout_ms, sizeof(timeout_ms));
-    if (zmq_connect(socket, child_endpoint_.c_str()) != 0 ||
+    if (zmq_connect(socket, endpoint.c_str()) != 0 ||
         zmq_send(socket, request.data(), request.size(), 0) < 0) {
       const std::string error = zmq_strerror(zmq_errno());
       zmq_close(socket);
       zmq_ctx_term(context);
-      throw std::runtime_error("child control send failed: " + error);
+      throw std::runtime_error("control send failed for " + endpoint + ": " + error);
     }
     std::vector<char> buffer(4 * 1024 * 1024);
     const int received = zmq_recv(socket, buffer.data(), buffer.size(), 0);
@@ -554,12 +754,12 @@ class PersistentSupervisor {
       const std::string error = zmq_strerror(zmq_errno());
       zmq_close(socket);
       zmq_ctx_term(context);
-      throw std::runtime_error("child control response failed: " + error);
+      throw std::runtime_error("control response failed for " + endpoint + ": " + error);
     }
     if (static_cast<size_t>(received) >= buffer.size()) {
       zmq_close(socket);
       zmq_ctx_term(context);
-      throw std::runtime_error("child control response exceeds 4 MiB");
+      throw std::runtime_error("control response exceeds 4 MiB");
     }
     std::string response(buffer.data(), static_cast<size_t>(received));
     zmq_close(socket);
@@ -568,6 +768,13 @@ class PersistentSupervisor {
   }
 
   std::string state(const std::string& message = {}) {
+    if (instrument_enabled_) {
+      try {
+        refresh_instrument_state();
+      } catch (...) {
+        // The cached offline state is included while acquisition remains usable.
+      }
+    }
     try {
       const std::string response = forward_to_child(
           "{\"command\":\"get_state\"}", 1200);
@@ -621,6 +828,7 @@ class PersistentSupervisor {
                 json_escape(public_endpoint_) + "\",\"last_exit_code\":" +
                 std::to_string(last_exit_code_) + ",\"last_error\":\"" +
                 json_escape(last_error_) + "\"}";
+    response += ",\"instrument\":" + cached_instrument_state_;
     if (!message.empty()) {
       response += ",\"supervisor_message\":\"" + json_escape(message) + "\"";
     }
@@ -648,9 +856,15 @@ class PersistentSupervisor {
   std::string child_endpoint_;
   std::string child_config_;
   std::string runtime_config_;
+  std::string instrument_config_;
+  std::string instrument_binary_;
+  std::string instrument_endpoint_;
+  std::string instrument_mode_ = "disabled";
+  std::string cached_instrument_state_;
   double restart_delay_seconds_ = 1.0;
   mutable std::mutex mu_;
   pid_t child_pid_ = -1;
+  pid_t instrument_pid_ = -1;
   std::string lifecycle_ = "stopped";
   std::string current_child_config_;
   std::string cached_state_;
@@ -661,6 +875,8 @@ class PersistentSupervisor {
   bool restart_scheduled_ = false;
   bool start_acquisition_on_launch_ = true;
   bool operator_stop_requested_ = false;
+  bool instrument_enabled_ = false;
+  bool launch_instrument_service_ = false;
   std::chrono::steady_clock::time_point restart_due_{};
 };
 

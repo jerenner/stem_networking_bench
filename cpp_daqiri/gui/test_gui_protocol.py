@@ -63,6 +63,22 @@ class ControlProtocolTest(unittest.TestCase):
         self.assertTrue(response["acquisition"]["running"])
         self.assertEqual(response["supervisor"]["state"], "running")
 
+    def test_mock_instrument_controls_and_scan_configuration(self) -> None:
+        response = handle(self.state, {"command": "camera.power_up"})
+        self.assertEqual(response["instrument"]["camera"]["power_state"], "ready")
+        response = handle(self.state, {"command": "detector.resync"})
+        self.assertTrue(response["instrument"]["detector"]["synchronized"])
+        response = handle(
+            self.state,
+            {
+                "command": "scan.configure",
+                "scan": {"read_count": 2, "positions_x": 4, "rows": 8},
+            },
+        )
+        self.assertEqual(response["instrument"]["scan"]["expected_frames"], 64)
+        response = handle(self.state, {"command": "scan.start"})
+        self.assertTrue(response["instrument"]["scan"]["running"])
+
 
 class StreamProtocolTest(unittest.TestCase):
     def test_optional_payload_decoding(self) -> None:

@@ -47,8 +47,9 @@ on Windows, retain the defaults `tcp://127.0.0.1:15556` and
 Open `stem_dm_viewer.py` from DM's Python script editor, ensure **Execute in
 background** is selected, and execute it. DM should open the **STEM DAQ
 Control** palette and create up to four live images when two receivers publish
-both products. The palette uses separate **Status**, **Visualization**, and
-**Burst** tabs so it fits on a typical DM workspace. Closing the palette or
+both products. The palette uses separate **Status**, **Visualization**,
+**Burst**, **Camera**, and **Scan** tabs so it fits on a typical DM workspace.
+Closing the palette or
 pressing **Stop DM viewer and close** asks the Python loop to release its
 sockets and finish normally; wait for `STEM DM viewer stopped` before executing
 the viewer again. `Ctrl+Shift+Q` remains the emergency stop for a background
@@ -73,7 +74,19 @@ Phase one provides:
   frame, product selection, and thresholds;
 - burst stage, destination, bucket/capture counts, completeness policy,
   thresholds, configure, arm, disarm, and abort; and
-- cached control, acquisition, visualization, burst, and response status.
+- mock camera power, insertion/retraction, temperature and bias reads;
+- mock detector link status, resynchronization, and automatic alignment;
+- mock scan timing/dimensions, configure, start, stop, and abort; and
+- cached control, acquisition, visualization, burst, instrument operation, and
+  scan status.
+
+Instrument operations are asynchronous on the IGX. A DM button queues an
+intent-level request and returns immediately; normal state polling updates the
+operation name, current step, step count, and error. The initial service is
+strictly a mock and sends no camera-head SSH/`dsh` or FPGA control traffic.
+Camera and detector actions may enforce preconditions, for example camera
+insertion requires a completed mock power-up and auto-alignment requires a
+completed mock resync.
 
 The Python loop polls DAQ state automatically. Press **Refresh** in the palette
 to copy the newest cached state and accepted settings into the displayed

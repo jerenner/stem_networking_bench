@@ -176,3 +176,23 @@ control:
   start_acquisition: false
   endpoint: "tcp://*:5557"
   runtime_config_path: "/tmp/stem_daqiri_runtime.yaml"
+
+# Phase-one hardware-control development uses a separate mock service. The
+# supervisor launches it on private IPC and exposes only intent-level commands
+# through the public control endpoint. No camera-head or FPGA control traffic
+# is generated in mock mode.
+instrument:
+  enabled: true
+  mode: "mock"
+  endpoint: "ipc:///tmp/stem_daqiri_instrument.ipc"
+  launch_service: true
+  service_binary: "/opt/stem_daqiri/bin/stem_daqiri_instrument_mock"
+  mock:
+    step_duration_ms: 150
+    initial_temperature_c: 22.0
+    target_temperature_c: -20.0
+    audit_log_path: "/tmp/stem_instrument_mock_audit.jsonl"
+    # Set both fields to inject a deterministic one-shot failure while testing.
+    fail_operation: ""
+    fail_step: 0
+    fail_once: true

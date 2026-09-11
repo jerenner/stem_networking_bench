@@ -9,10 +9,12 @@ import unittest
 sys.path.insert(0, os.path.dirname(__file__))
 from stem_dm_control import (  # noqa: E402
     BURST_ROOT,
+    CAMERA_ROOT,
     REQUEST_COMMAND,
     REQUEST_SEQUENCE,
     RESPONSE_SEQUENCE,
     STATE_SEQUENCE,
+    SCAN_ROOT,
     VISUALIZATION_ROOT,
     DMControlBridge,
     PersistentTagMailbox,
@@ -105,6 +107,43 @@ def state():
             "strict_complete": True,
             "threshold": {"zlp": 56.0, "core_loss": 78.0},
         },
+        "instrument": {
+            "enabled": True,
+            "service_online": True,
+            "mode": "mock",
+            "camera": {
+                "power_state": "ready",
+                "insertion_state": "inserted",
+                "temperature_c": -20.0,
+                "target_temperature_c": -20.0,
+            },
+            "detector": {
+                "synchronized": True,
+                "aligned": True,
+                "links": ["ready"] * 4,
+            },
+            "operation": {
+                "id": "op-00001",
+                "name": "detector.resync",
+                "state": "running",
+                "step": "reset JESD links",
+                "completed_steps": 3,
+                "total_steps": 6,
+                "error": "",
+            },
+            "scan": {
+                "state": "configured",
+                "scan_number": 4,
+                "expected_frames": 1024,
+                "received_frames": 0,
+                "pause_count": 200,
+                "read_count": 2,
+                "positions_x": 16,
+                "rows": 32,
+                "flyback": 100,
+                "flush_memory": True,
+            },
+        },
     }
 
 
@@ -154,6 +193,24 @@ class RequestBuilderTest(unittest.TestCase):
             build_request("start_acquisition", self.tags),
             {"command": "start_acquisition"},
         )
+
+    def test_instrument_and_scan_requests(self):
+        self.assertEqual(
+            build_request("camera_power_up", self.tags),
+            {"command": "camera.power_up"},
+        )
+        self.assertEqual(
+            build_request("detector_resync", self.tags),
+            {"command": "detector.resync"},
+        )
+        self.tags.set_long(path(SCAN_ROOT, "ReadCount"), 3)
+        self.tags.set_long(path(SCAN_ROOT, "PositionsX"), 8)
+        self.tags.set_long(path(SCAN_ROOT, "Rows"), 12)
+        request = build_request("configure_scan", self.tags)
+        self.assertEqual(request["command"], "scan.configure")
+        self.assertEqual(request["scan"]["read_count"], 3)
+        self.assertEqual(request["scan"]["positions_x"], 8)
+        self.assertEqual(request["scan"]["rows"], 12)
         self.assertEqual(
             build_request("disarm_burst", self.tags),
             {
@@ -193,12 +250,19 @@ class MailboxTest(unittest.TestCase):
             "dark_blr",
         )
         self.assertEqual(self.tags.get_long(path(BURST_ROOT, "BucketsPerCapture")), 3)
+        self.assertEqual(self.tags.get_string(path(CAMERA_ROOT, "PowerState")), "ready")
+        self.assertEqual(
+            self.tags.get_string(path(CAMERA_ROOT, "OperationStep")),
+            "reset JESD links",
+        )
+        self.assertEqual(self.tags.get_long(path(SCAN_ROOT, "Rows")), 32)
 
     def test_compact_status(self):
         status = compact_status(state())
         self.assertEqual(status["control"], "online")
         self.assertEqual(status["visualization"], "dark_blr at 2.5 Hz")
         self.assertEqual(status["burst"], "armed / waiting")
+        self.assertIn("detector.resync", status["instrument"])
 
 
 class BridgeTest(unittest.TestCase):
@@ -226,6 +290,10 @@ class BridgeTest(unittest.TestCase):
         self.assertIn('tabs.DLGAddTab("Status")', dm.source)
         self.assertIn('tabs.DLGAddTab("Visualization")', dm.source)
         self.assertIn('tabs.DLGAddTab("Burst")', dm.source)
+        self.assertIn('tabs.DLGAddTab("Camera")', dm.source)
+        self.assertIn('tabs.DLGAddTab("Scan")', dm.source)
+        self.assertIn('QueueCommand("detector_resync")', dm.source)
+        self.assertIn('QueueCommand("configure_scan")', dm.source)
         self.assertIn(":Viewer:StopRequested", dm.source)
         self.assertIn("self.Close()", dm.source)
 

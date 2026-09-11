@@ -11,7 +11,6 @@ import signal
 import time
 
 import numpy as np
-import zmq
 
 
 def initial_state(pub_endpoint: str, control_endpoint: str) -> dict:
@@ -103,6 +102,45 @@ def initial_state(pub_endpoint: str, control_endpoint: str) -> dict:
             "last_exit_code": 0,
             "last_error": "",
         },
+        "instrument": {
+            "enabled": True,
+            "service_online": True,
+            "mode": "mock",
+            "camera": {
+                "power_state": "off",
+                "insertion_state": "retracted",
+                "temperature_c": 22.0,
+                "target_temperature_c": -20.0,
+                "biases": {"reset_v": 0.72, "substrate_v": 1.8, "guard_v": 0.45},
+            },
+            "detector": {
+                "synchronized": False,
+                "aligned": False,
+                "links": ["unknown"] * 4,
+            },
+            "scan": {
+                "state": "idle",
+                "running": False,
+                "scan_number": 0,
+                "expected_frames": 1,
+                "received_frames": 0,
+                "pause_count": 200,
+                "read_count": 1,
+                "positions_x": 1,
+                "rows": 1,
+                "flyback": 100,
+                "flush_memory": True,
+            },
+            "operation": {
+                "id": "",
+                "name": "",
+                "state": "idle",
+                "step": "",
+                "completed_steps": 0,
+                "total_steps": 0,
+                "error": "",
+            },
+        },
         "burst_writer": {
             "capability_enabled": True,
             "armed": False,
@@ -162,6 +200,84 @@ def merge(target: dict, update: dict) -> None:
 
 def handle(state: dict, request: dict) -> dict:
     command = request.get("command", "get_state")
+    instrument = state["instrument"]
+    camera = instrument["camera"]
+    detector = instrument["detector"]
+    scan = instrument["scan"]
+    operation = instrument["operation"]
+    immediate_operations = {
+        "camera.power_up": ("camera ready", 5),
+        "camera.power_down": ("camera off", 2),
+        "camera.insert": ("camera inserted", 2),
+        "camera.retract": ("camera retracted", 2),
+        "detector.resync": ("detector synchronized", 6),
+        "detector.auto_align": ("detector aligned", 4),
+        "scan.start": ("scan started", 3),
+        "scan.stop": ("scan stopped", 2),
+    }
+    if command in {
+        "instrument.get_state",
+        "operation.get",
+        "camera.read_temperature",
+        "camera.read_biases",
+        "detector.read_link_status",
+    }:
+        return state
+    if command == "scan.configure":
+        scan.update(request.get("scan", {}))
+        scan["expected_frames"] = (
+            int(scan["read_count"]) * int(scan["positions_x"]) * int(scan["rows"])
+        )
+        scan["state"] = "configured"
+        return state
+    if command == "scan.abort":
+        scan.update({"state": "aborted", "running": False})
+        operation.update({"state": "cancelled", "step": "aborted"})
+        return state
+    if command in immediate_operations:
+        message, steps = immediate_operations[command]
+        operation.update(
+            {
+                "id": "mock-{}".format(int(time.monotonic() * 1000)),
+                "name": command,
+                "state": "completed",
+                "step": message,
+                "completed_steps": steps,
+                "total_steps": steps,
+                "error": "",
+            }
+        )
+        if command == "camera.power_up":
+            camera.update({"power_state": "ready", "temperature_c": -20.0})
+        elif command == "camera.power_down":
+            camera.update(
+                {
+                    "power_state": "off",
+                    "insertion_state": "retracted",
+                    "temperature_c": 22.0,
+                }
+            )
+        elif command == "camera.insert":
+            camera["insertion_state"] = "inserted"
+        elif command == "camera.retract":
+            camera["insertion_state"] = "retracted"
+        elif command == "detector.resync":
+            detector.update({"synchronized": True, "links": ["ready"] * 4})
+        elif command == "detector.auto_align":
+            detector["aligned"] = True
+        elif command == "scan.start":
+            scan.update(
+                {
+                    "state": "running",
+                    "running": True,
+                    "scan_number": scan["scan_number"] + 1,
+                    "received_frames": 0,
+                }
+            )
+        elif command == "scan.stop":
+            scan.update({"state": "stopped", "running": False})
+        state["message"] = message
+        return state
     if command == "set_runtime":
         if "thinned_stream" in request:
             update = request["thinned_stream"]
@@ -220,6 +336,8 @@ def synthetic_frame(receiver: int, batch: int, height: int, width: int) -> np.nd
 
 
 def main() -> None:
+    import zmq
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pub-endpoint", default="tcp://127.0.0.1:5556")
     parser.add_argument("--control-endpoint", default="tcp://127.0.0.1:5557")
