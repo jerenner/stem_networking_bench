@@ -1,0 +1,70 @@
+%YAML 1.2
+---
+# No NIC, hugepages, FPGA, or HDF5 input required. Increase num_receivers to 8
+# for the 8x100-Gbps test on one GPU. No receiverN blocks are required.
+source: "synthetic"
+num_receivers: 1
+
+synthetic:
+  mode: "packet"
+  gpu_device: 0
+  rate_mode: "limited"  # "maximum" measures unconstrained processing capacity
+  target_gbps_per_receiver: 100.0  # packet bytes, excluding FCS/preamble/IFG
+  duration_seconds: 30.0          # --seconds overrides; -1 runs until stopped
+  buckets_per_receiver: 0         # optional finite limit; 0 means no count limit
+  packets_per_burst: 16384
+  payload_pattern: "ramp"         # "ramp" or "walking_dot", repeats every 128 frames
+  validate_output: false         # full assembled-plane check; adds GPU work
+  report_interval_seconds: 1.0
+
+stem_rx:
+  frames_per_tensor: 128
+  expected_source_mask: 255       # all eight source IDs per independent receiver
+  header_size: 42
+  payload_size: 8192              # native 4096-sample tiles, 960 packets/frame
+  gpu_header_extract: true
+  tile_duplicate_prefix_to_simulate_payload: false
+  batch_close_slack_packets: 512
+
+# Optional per-receiver overrides, inherited from stem_rx/synthetic otherwise:
+# receiver0:
+#   target_gbps: 90.0
+# receiver1:
+#   target_gbps: 110.0
+
+processor:
+  # Defaults exercise assembly only. Enable the usual correction flags and
+  # supply a 1024x3840 calibration file for the full processing benchmark.
+  noop: true
+  subtract_dark_frame: false
+  dark_frame_path: "/calibration/dark.h5"
+  dark_frame_dataset: "/processed"
+  apply_valid_pixel_mask: false
+  valid_pixel_mask_dataset: "/valid_pixel_mask"
+  apply_blr_correction: false
+  blr_rows: 30
+  blr_zlp_width: 768
+  blr_zlp_group_columns: 4
+  blr_core_group_columns: 16
+  apply_dynamic_half_column_mask: false
+  dynamic_mask_median_window_pixels: 31
+  dynamic_mask_threshold_ratio: 1.0
+  dynamic_mask_threshold_offset: 500.0
+  dynamic_mask_excluded_edge_rows: 32
+  dynamic_mask_two_sided: true
+
+writer:
+  noop: true
+  filepath: "/data/stem_synthetic.h5"
+  dataset_name: "/frames"
+  num_concurrent: 3
+
+burst_writer:
+  enabled: false
+thinned_stream:
+  enabled: false
+control:
+  enabled: false
+  start_acquisition: false
+  endpoint: "tcp://*:5557"
+  runtime_config_path: "/tmp/stem_synthetic_runtime.yaml"

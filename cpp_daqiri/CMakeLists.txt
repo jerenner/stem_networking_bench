@@ -13,10 +13,10 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# CUDA architectures: GB10 (Spark) is sm_121 (compute capability 12.1).
+# CUDA architectures: B200 is sm_100; GB10 (Spark) is sm_121.
 # Include common lab archs so binaries are portable across host machines.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES "80;86;87;89;90;120;121")
+  set(CMAKE_CUDA_ARCHITECTURES "80;86;87;89;90;100;120;121")
 endif()
 
 find_package(CUDAToolkit REQUIRED)
@@ -160,6 +160,7 @@ endif()
 if(STEM_DAQIRI_BUILD_RX)
   add_executable(stem_daqiri_rx
     rx/stem_rx_main.cpp
+    rx/stem_synthetic_source.cu
     rx/stem_aux_output.cpp
     rx/stem_control_server.cpp
   )
@@ -238,6 +239,7 @@ if(STEM_DAQIRI_BUILD_RX)
     configs/stem_rx_igx_loopback.yaml
     configs/stem_rx_igx_loopback_hds.yaml
     configs/stem_replay_hdf5.yaml
+    configs/stem_rx_synthetic.yaml
   )
 endif()
 
@@ -271,6 +273,9 @@ install(TARGETS ${STEM_DAQIRI_INSTALL_TARGETS}
 )
 if(TARGET stem_daqiri_instrument_mock)
   install(PROGRAMS scripts/validate_mock_instrument.py DESTINATION bin)
+endif()
+if(STEM_DAQIRI_BUILD_RX)
+  install(PROGRAMS scripts/validate_synthetic_rx.py DESTINATION bin)
 endif()
 foreach(cfg IN LISTS STEM_DAQIRI_CONFIGS)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${cfg})

@@ -71,4 +71,16 @@ constexpr uint32_t FRAMES_PER_WRAP   = ROW_NUMBER_WRAP / ROWS_PER_SOURCE;  // 12
 // One frame = NUM_SOURCES_MAX sources * ROWS_PER_SOURCE rows = 1024 packets.
 constexpr uint32_t PACKETS_PER_FRAME_FULL = NUM_SOURCES_MAX * ROWS_PER_SOURCE;
 
+// Native tile geometry. The legacy header still reserves 128 row offsets per
+// source, but native packets use only offsets 0..119 with 4096 samples each.
+constexpr uint32_t TILE_ZLP_COLUMNS = 192u * 4u;
+constexpr uint32_t TILE_ZLP_TILE_WIDTH = 32u;
+constexpr uint32_t TILE_ZLP_TILE_HEIGHT = 128u;
+constexpr uint32_t TILE_CORE_TILE_WIDTH = 128u;
+constexpr uint32_t TILE_CORE_TILE_HEIGHT = 32u;
+constexpr uint32_t TILE_SAMPLES = 4096u;
+constexpr uint32_t TILE_PAYLOAD_BYTES = TILE_SAMPLES * sizeof(uint16_t);
+constexpr uint32_t FULL_FRAME_TILE_PACKETS = 960u;
+constexpr uint32_t TILE_PACKETS_PER_SOURCE = FULL_FRAME_TILE_PACKETS / 8u;
+
 }  // namespace stem

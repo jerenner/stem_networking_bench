@@ -2,15 +2,18 @@
 
 daqiri-based STEM networking pipeline for `stem_networking_bench`.
 
-The code supports three topologies from one TX/RX implementation:
+The code supports four topologies from one TX/RX implementation:
 
 1. RX-only production integration on IGX Orin + RTX 6000 Ada, fed by an FPGA.
 2. Single-box IGX hardware loopback, TX port cabled to RX port.
 3. Two DGX Spark nodes connected back-to-back.
+4. One through eight GPU-resident synthetic packet sources for processor
+   capacity tests without NIC hardware.
 
-The STEM wire format is shared with the Holoscan implementation in `../cpp/`:
-one 7786 B UDP packet carries one 1024-frame row payload:
-42 B Ethernet/IPv4/UDP + 64 B STEM header + 7680 B row data.
+The legacy STEM wire format is shared with the Holoscan implementation in
+`../cpp/`: one 7786 B packet carries one 3840-sample row payload. The tiled
+path also supports the proposed native 8298 B packet with 4096 samples and 960
+tiles per frame.
 
 ## Build
 
@@ -71,6 +74,24 @@ path for both network `uint16` and HDF5 replay `float32` input: optional
 dark-aware grouped BLR estimation, fused conversion/dark/BLR correction and
 batch mean, combined valid-pixel and two-sided dynamic masking with excluded
 edge rows, then optional frame reduction.
+
+## Synthetic packet benchmark
+
+Config: `configs/stem_rx_synthetic.yaml`
+
+Set `source: synthetic` and select `num_receivers: 1` through `8` to bypass
+DAQIRI/NIC initialization and feed independent, GPU-resident packet cycles into
+the production header extraction, frame assembly, processing, and output path.
+Use `rate_mode: limited` to test a requested per-receiver rate without hiding
+accumulated schedule lag, or `rate_mode: maximum` to measure capacity. The
+default config uses native 8192-byte tile payloads and all eight source IDs per
+receiver.
+
+This mode tests application/GPU throughput only. It does not test DPDK, RX CPU
+polling, GPUDirect, PCIe ingress, or NIC/GPU topology. See
+[`docs/SYNTHETIC_PACKET_BENCHMARK.md`](../docs/SYNTHETIC_PACKET_BENCHMARK.md)
+for configuration, metric interpretation, Docker commands, memory behavior,
+and host/GPU validation procedures.
 
 ## RX-Only Production
 
@@ -921,9 +942,11 @@ a live 100 Gb/s stream and therefore is not a receiver keep-up test.
 | --- | --- |
 | `CMakeLists.txt` | Build options for hello/link-check, TX, RX, and optional HDF5 linkage |
 | `common/stem_packet.h` | STEM wire layout and frame geometry |
+| `common/stem_synthetic.h` | host/device synthetic packet layout, patterns, and pacing model |
 | `common/stem_kernels.{cu,h}` | TX header update, RX header extract, gather, processor kernels |
 | `tx/stem_tx_main.cpp` | paced STEM TX |
 | `rx/stem_rx_main.cpp` | daqiri RX, frame assembly, output sink |
+| `rx/stem_synthetic_source.{cu,h}` | GPU packet-pool generation and assembled-frame validation |
 | `rx/stem_aux_output.{cpp,h}` | controlled burst and latest-only PUB outputs |
 | `rx/stem_control_server.{cpp,h}` | JSON-over-ZeroMQ REP control transport |
 | `gui/stem_daq_gui.py` | PySide6 live viewer and DAQ controller |
@@ -938,6 +961,8 @@ a live 100 Gb/s stream and therefore is not a receiver keep-up test.
 | `configs/stem_rx_igx_loopback.yaml` | IGX hardware-loopback RX config |
 | `configs/stem_rx_igx_loopback_hds.yaml` | IGX hardware-loopback RX config with HDS |
 | `configs/stem_replay_hdf5.yaml` | finite uint16/float32 HDF5 replay config for processor parity |
+| `configs/stem_rx_synthetic.yaml` | one-to-eight-receiver GPU processing-capacity benchmark |
+| `scripts/validate_synthetic_rx.py` | no-NIC GPU/HDF5 correctness and wrap validation |
 | `scripts/run_daqiri_hdf5_replay.sh` | one-shot Docker wrapper for finite HDF5 processing |
 | `scripts/run_daqiri_validation.sh` | repeatable HDF5, config, live, writer, and HDS validation gates |
 | `configs/stem_tx_igx_loopback.yaml` | IGX hardware-loopback TX config |

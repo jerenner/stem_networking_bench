@@ -31,6 +31,8 @@
 
 #include <cstdint>
 
+#include "stem_packet.h"
+
 namespace stem {
 
 // ---------------------------------------------------------------------------
@@ -61,18 +63,7 @@ struct PacketPlacement {
 // uint16 samples (= TILE_PAYLOAD_BYTES = 8192 B). 8 sources contribute 120
 // tile packets each => 960 tile packets per frame.
 // ---------------------------------------------------------------------------
-constexpr uint32_t TILE_ZLP_COLUMNS = 192u * 4u;  // 768
-constexpr uint32_t TILE_ZLP_TILE_WIDTH = 32u;
-constexpr uint32_t TILE_ZLP_TILE_HEIGHT = 128u;
-constexpr uint32_t TILE_CORE_TILE_WIDTH = 128u;
-constexpr uint32_t TILE_CORE_TILE_HEIGHT = 32u;
-constexpr uint32_t TILE_SAMPLES =
-    TILE_ZLP_TILE_WIDTH * TILE_ZLP_TILE_HEIGHT;  // 4096
-constexpr uint32_t TILE_PAYLOAD_BYTES =
-    TILE_SAMPLES * sizeof(uint16_t);  // 8192
-constexpr uint32_t FULL_FRAME_TILE_PACKETS = 960u;
-constexpr uint32_t TILE_PACKETS_PER_SOURCE =
-    FULL_FRAME_TILE_PACKETS / 8u;  // 120
+// Constants live in stem_packet.h so CPU-only packet tests use this geometry.
 
 // ---------------------------------------------------------------------------
 // Host TX helpers

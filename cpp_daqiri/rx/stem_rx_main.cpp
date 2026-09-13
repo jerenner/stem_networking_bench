@@ -34,6 +34,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdint>
@@ -64,6 +65,7 @@
 #include "stem_control_server.h"
 #include "stem_kernels.h"
 #include "stem_packet.h"
+#include "stem_synthetic_source.h"
 
 namespace {
 
@@ -182,6 +184,9 @@ struct StemRxConfig {
   // of the tile. Matches Holoscan's tile_duplicate_prefix_to_simulate_payload
   // knob. Set to false when the source is the real FPGA (full tile payloads).
   bool tile_duplicate_prefix_to_simulate_payload = true;
+
+  bool synthetic_source = false;
+  stem::SyntheticConfig synthetic;
 
   ProcessorConfig processor;
   WriterConfig writer;
@@ -429,6 +434,17 @@ void validate_stem_rx_cfg(const StemRxConfig& cfg) {
         "stem_rx.hds=true and stem_rx.gpu_header_extract=true are mutually "
         "exclusive; HDS already keeps headers CPU-readable");
   }
+  if (cfg.synthetic_source) {
+    cfg.synthetic.validate();
+    if (cfg.hds || !cfg.gpu_header_extract || cfg.capture_latency ||
+        cfg.header_size != stem::L4_HEADER_SIZE ||
+        cfg.payload_size != cfg.synthetic.layout.payload_bytes()) {
+      throw std::runtime_error(
+          "synthetic packets require hds=false, gpu_header_extract=true, "
+          "capture_latency=false, header_size=42, and payload_size matching "
+          "tile_duplicate_prefix_to_simulate_payload (7680 or 8192)");
+    }
+  }
 #ifndef STEM_DAQIRI_HAVE_HDF5
   if (!cfg.writer.noop) {
     throw std::runtime_error(
@@ -466,9 +482,69 @@ std::vector<StemRxConfig> parse_stem_rx_cfgs(const YAML::Node& root) {
   }
 
   StemRxConfig base;
+  base.synthetic_source = root["source"].as<std::string>("network") == "synthetic";
+  if (base.synthetic_source) {
+    if (num_receivers > 8) {
+      throw std::runtime_error("synthetic num_receivers must be in [1, 8]");
+    }
+    base.gpu_header_extract = true;
+    base.tile_duplicate_prefix_to_simulate_payload = false;
+    const auto node = root["synthetic"];
+    if (node) {
+      if (node["mode"].as<std::string>("packet") != "packet") {
+        throw std::runtime_error("synthetic.mode currently supports only 'packet'");
+      }
+      const auto rate_mode = node["rate_mode"].as<std::string>("limited");
+      if (rate_mode != "limited" && rate_mode != "maximum") {
+        throw std::runtime_error("synthetic.rate_mode must be limited or maximum");
+      }
+      base.synthetic.maximum_rate = rate_mode == "maximum";
+      base.synthetic.target_gbps = node["target_gbps_per_receiver"].as<double>(100.0);
+      base.synthetic.duration_seconds = node["duration_seconds"].as<double>(30.0);
+      base.synthetic.packets_per_burst = node["packets_per_burst"].as<uint32_t>(16384);
+      base.synthetic.buckets_per_receiver = node["buckets_per_receiver"].as<uint64_t>(0);
+      base.synthetic.gpu_device = node["gpu_device"].as<uint32_t>(0);
+      base.synthetic.validate_output = node["validate_output"].as<bool>(false);
+      base.synthetic.report_interval_seconds = node["report_interval_seconds"].as<double>(1.0);
+      const auto pattern = node["payload_pattern"].as<std::string>("ramp");
+      if (pattern == "ramp") {
+        base.synthetic.layout.pattern = stem::SyntheticPattern::kRamp;
+      } else if (pattern == "walking_dot") {
+        base.synthetic.layout.pattern = stem::SyntheticPattern::kWalkingDot;
+      } else {
+        throw std::runtime_error("synthetic.payload_pattern must be ramp or walking_dot");
+      }
+    }
+  }
   base.writer = parse_writer_cfg(root);
   base.processor = parse_processor_cfg(root, stem_rx);
   apply_stem_rx_node(base, stem_rx);
+
+  if (base.synthetic_source) {
+    std::vector<StemRxConfig> synthetic_cfgs;
+    for (int i = 0; i < num_receivers; ++i) {
+      StemRxConfig cfg = base;
+      cfg.receiver_id = static_cast<uint32_t>(i);
+      cfg.interface_name = "synthetic_rx" + std::to_string(i);
+      const auto overrides = receiver_override_node(
+          root, stem_rx, "receiver" + std::to_string(i));
+      apply_stem_rx_node(cfg, overrides);
+      if (overrides) {
+        cfg.synthetic.target_gbps = overrides["target_gbps"].as<double>(cfg.synthetic.target_gbps);
+      }
+      cfg.synthetic.frames_per_tensor = cfg.frames_per_tensor;
+      cfg.synthetic.layout.source_mask = cfg.expected_source_mask;
+      cfg.synthetic.layout.legacy_payload = cfg.tile_duplicate_prefix_to_simulate_payload;
+      cfg.synthetic.layout.receiver = cfg.receiver_id;
+      if (!stem_rx["payload_size"] && (!overrides || !overrides["payload_size"])) {
+        cfg.payload_size = cfg.synthetic.layout.payload_bytes();
+      }
+      cfg.total_time_to_recv_s = cfg.synthetic.duration_seconds;
+      validate_stem_rx_cfg(cfg);
+      synthetic_cfgs.push_back(std::move(cfg));
+    }
+    return synthetic_cfgs;
+  }
 
   std::vector<StemRxConfig> cfgs;
   cfgs.reserve(static_cast<size_t>(num_receivers));
@@ -562,7 +638,7 @@ struct PacketEntry {
   uint16_t tile_index = 0;
   uint16_t row_number = 0;
   uint16_t source_id = 0xFFFF;
-  std::shared_ptr<BurstHolder> holder;
+  std::shared_ptr<void> holder;  // DAQIRI burst or immutable synthetic pool.
 };
 
 struct OutputSlot {
@@ -1473,9 +1549,9 @@ class RuntimeController {
   void write_restart_config() {
     const std::string source = pending_root_["source"].as<std::string>(
         std::string("network"));
-    if (source != "network") {
+    if (source != "network" && source != "synthetic") {
       throw std::runtime_error(
-          "live control restart currently supports source=network");
+          "live control restart supports source=network or synthetic");
     }
     const auto receiver_configs = parse_stem_rx_cfgs(pending_root_);
     const auto burst = parse_burst_writer_cfg(pending_root_);
@@ -1667,9 +1743,17 @@ class FrameAssembler {
                              cfg.batch_close_slack_packets + 4096);
     current_batch_occupied_.assign(total_cells, 0);
     emit_cell_generation_.assign(total_cells, 0);
+    if (cfg.synthetic_source) {
+      ensure_header_scratch(cfg.synthetic.packets_per_burst);
+      if (cfg.synthetic.validate_output) {
+        STEM_CUDA_TRY(cudaMalloc(&validation_mismatches_, sizeof(unsigned long long)));
+        STEM_CUDA_TRY(cudaMemset(validation_mismatches_, 0, sizeof(unsigned long long)));
+      }
+    }
   }
 
   ~FrameAssembler() {
+    if (stream_) { cudaStreamSynchronize(stream_); }
     bool slots_busy = true;
     while (slots_busy) {
       slots_busy = false;
@@ -1700,6 +1784,7 @@ class FrameAssembler {
     if (d_burst_ptrs_) { cudaFree(d_burst_ptrs_); }
     if (h_burst_headers_) { cudaFreeHost(h_burst_headers_); }
     if (d_burst_headers_) { cudaFree(d_burst_headers_); }
+    if (validation_mismatches_) { cudaFree(validation_mismatches_); }
     if (stream_) { cudaStreamDestroy(stream_); }
   }
 
@@ -1714,6 +1799,39 @@ class FrameAssembler {
   uint64_t sink_queued() const { return pipeline_ ? pipeline_->queued() : 0; }
   uint64_t sink_written() const { return pipeline_ ? pipeline_->written() : 0; }
   uint64_t sink_errors() const { return pipeline_ ? pipeline_->errors() : 0; }
+
+  void synchronize() { STEM_CUDA_TRY(cudaStreamSynchronize(stream_)); }
+  uint64_t validation_mismatches() {
+    unsigned long long mismatches = 0;
+    if (validation_mismatches_) {
+      synchronize();
+      STEM_CUDA_TRY(cudaMemcpy(&mismatches, validation_mismatches_, sizeof(mismatches),
+                               cudaMemcpyDeviceToHost));
+    }
+    return mismatches;
+  }
+
+  // Both device-memory sources enter here with packet-base pointers. Keep
+  // parsing, metadata transfers, admission and batch closure identical.
+  void process_gpu_packet_batch(uint8_t* const* packets, uint32_t n,
+                                const std::shared_ptr<void>& owner,
+                                uint64_t* unexpected, uint64_t* frames) {
+    ensure_header_scratch(n);
+    for (uint32_t i = 0; i < n; ++i) {
+      h_burst_ptrs_[i] = packets[i] ? packets[i] + cfg_.header_size : nullptr;
+    }
+    STEM_CUDA_TRY(cudaMemcpyAsync(d_burst_ptrs_, h_burst_ptrs_, sizeof(uint8_t*) * n,
+                                  cudaMemcpyHostToDevice, stream_));
+    stem::stem_extract_packet_headers(d_burst_ptrs_, d_burst_headers_, n, stream_);
+    STEM_CUDA_TRY(cudaMemcpyAsync(h_burst_headers_, d_burst_headers_,
+                                  sizeof(stem::PacketHeaderInfo) * n,
+                                  cudaMemcpyDeviceToHost, stream_));
+    synchronize();
+    for (uint32_t i = 0; i < n; ++i) {
+      if (packets[i]) { admit_packet(packets[i], h_burst_headers_[i], owner, unexpected); }
+    }
+    try_close_batches(frames);
+  }
 
   // Parse all packets in `burst` and feed them into pending_packets_.
   // The burst's lifetime is now governed by the shared_ptr inside each
@@ -1755,30 +1873,16 @@ class FrameAssembler {
         admit_packet(payload_ptr, header, holder, drops_unexpected_source);
       }
     } else if (cfg_.gpu_header_extract) {
-      ensure_header_scratch(static_cast<uint32_t>(n));
       burst_packet_ptrs_.resize(static_cast<size_t>(n));
       for (int i = 0; i < n; ++i) {
         auto* ptr =
             static_cast<uint8_t*>(daqiri::get_segment_packet_ptr(burst, 0, i));
         burst_packet_ptrs_[static_cast<size_t>(i)] = ptr;
-        h_burst_ptrs_[i] = (ptr == nullptr) ? nullptr : ptr + cfg_.header_size;
       }
 
-      STEM_CUDA_TRY(cudaMemcpyAsync(d_burst_ptrs_, h_burst_ptrs_,
-                                    sizeof(uint8_t*) * n,
-                                    cudaMemcpyHostToDevice, stream_));
-      stem::stem_extract_packet_headers(d_burst_ptrs_, d_burst_headers_,
-                                        static_cast<uint32_t>(n), stream_);
-      STEM_CUDA_TRY(cudaMemcpyAsync(h_burst_headers_, d_burst_headers_,
-                                    sizeof(stem::PacketHeaderInfo) * n,
-                                    cudaMemcpyDeviceToHost, stream_));
-      STEM_CUDA_TRY(cudaStreamSynchronize(stream_));
-
-      for (int i = 0; i < n; ++i) {
-        auto* ptr = burst_packet_ptrs_[static_cast<size_t>(i)];
-        if (ptr == nullptr) { continue; }
-        admit_packet(ptr, h_burst_headers_[i], holder, drops_unexpected_source);
-      }
+      process_gpu_packet_batch(burst_packet_ptrs_.data(), static_cast<uint32_t>(n),
+                               holder, drops_unexpected_source, frames_assembled);
+      return;
     } else {
       for (int i = 0; i < n; ++i) {
         auto* ptr =
@@ -2018,7 +2122,7 @@ class FrameAssembler {
   }
 
   void admit_packet(uint8_t* packet_ptr, const stem::PacketHeaderInfo& header,
-                    const std::shared_ptr<BurstHolder>& holder,
+                    const std::shared_ptr<void>& holder,
                     uint64_t* drops_unexpected_source) {
     if ((header.source_id >= 8) ||
         !((cfg_.expected_source_mask >> header.source_id) & 0x1u) ||
@@ -2198,6 +2302,13 @@ class FrameAssembler {
           cfg_.frames_per_tensor, stem::FRAME_HEIGHT, stem::FRAME_WIDTH,
           cfg_.tile_duplicate_prefix_to_simulate_payload, stream_);
 
+      if (validation_mismatches_) {
+        stem::validate_synthetic_frames(
+            reinterpret_cast<const uint16_t*>(output_slot->gpu_u16),
+            current_batch_start_abs_frame_, cfg_.frames_per_tensor,
+            cfg_.synthetic.layout, validation_mismatches_, stream_);
+      }
+
       stem::BatchMetadata metadata;
       metadata.receiver_id = cfg_.receiver_id;
       metadata.interface_name = cfg_.interface_name;
@@ -2305,6 +2416,7 @@ class FrameAssembler {
   uint8_t** d_burst_ptrs_ = nullptr;
   stem::PacketHeaderInfo* h_burst_headers_ = nullptr;
   stem::PacketHeaderInfo* d_burst_headers_ = nullptr;
+  unsigned long long* validation_mismatches_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -2315,6 +2427,195 @@ struct RxRunStats {
   std::atomic<uint64_t> output_pool_drops{0};
   std::atomic<uint64_t> frames_assembled{0};
 };
+
+struct SyntheticResult {
+  uint64_t packets = 0;
+  uint64_t frames = 0;
+  uint64_t mismatches = 0;
+  uint64_t incomplete = 0;
+  uint64_t pool_drops = 0;
+  uint64_t ignored = 0;
+  uint64_t unexpected = 0;
+  double seconds = 0;
+  double max_lag_seconds = 0;
+  double final_lag_seconds = 0;
+};
+
+// All GPU pools/assemblers must exist before any receiver starts its clock.
+// Failure during initialization wakes peers instead of stranding a barrier.
+struct SyntheticRun {
+  explicit SyntheticRun(size_t receivers) : results(receivers) {}
+  std::mutex mutex;
+  std::condition_variable cv;
+  size_t ready = 0;
+  bool started = false;
+  std::chrono::steady_clock::time_point start;
+  std::vector<SyntheticResult> results;
+
+  std::chrono::steady_clock::time_point arrive(std::atomic<bool>& stop) {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (++ready == results.size()) {
+      start = std::chrono::steady_clock::now();
+      started = true;
+      cv.notify_all();
+    }
+    while (!started && !stop.load() && !g_stop_requested) {
+      cv.wait_for(lock, std::chrono::milliseconds(50));
+    }
+    return start;
+  }
+};
+
+void synthetic_worker(const StemRxConfig& cfg, std::shared_ptr<FramePipeline> pipeline,
+                      std::atomic<bool>& stop, RxRunStats& stats, SyntheticRun& run) {
+  try {
+    const auto& synthetic = cfg.synthetic;
+    STEM_CUDA_TRY(cudaSetDevice(static_cast<int>(synthetic.gpu_device)));
+    auto pool = std::make_shared<stem::SyntheticPacketPool>(synthetic.layout);
+    FrameAssembler assembler(cfg, pipeline);
+    {
+      std::lock_guard<std::mutex> lock(run.mutex);
+      std::cout << "synthetic rx=" << cfg.receiver_id << " ready: packet_pool_bytes="
+                << pool->bytes() << " packet_bytes=" << synthetic.layout.packet_bytes()
+                << " packets_per_cycle=" << pool->size() << "\n";
+    }
+    const auto start = run.arrive(stop);
+    if (stop.load() || g_stop_requested) { return; }
+    auto& result = run.results[cfg.receiver_id];
+    const auto elapsed = [&] {
+      return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+    const uint64_t packets_per_bucket =
+        static_cast<uint64_t>(cfg.frames_per_tensor) * synthetic.layout.packets_per_frame();
+    const uint64_t packet_limit = synthetic.buckets_per_receiver * packets_per_bucket;
+    double next_report = synthetic.report_interval_seconds;
+
+    while (!stop.load() && !g_stop_requested) {
+      double seconds = elapsed();
+      if ((cfg.total_time_to_recv_s >= 0 && seconds >= cfg.total_time_to_recv_s) ||
+          (packet_limit && result.packets >= packet_limit)) {
+        break;
+      }
+      const uint32_t offset = static_cast<uint32_t>(result.packets % pool->size());
+      uint32_t n = std::min(synthetic.packets_per_burst, pool->size() - offset);
+      // Never close several buckets in one call using the assembler's shared
+      // placement staging buffers. Smaller test buckets need smaller bursts.
+      n = static_cast<uint32_t>(std::min<uint64_t>(
+          n, packets_per_bucket - result.packets % packets_per_bucket));
+      if (packet_limit) { n = static_cast<uint32_t>(std::min<uint64_t>(n, packet_limit - result.packets)); }
+
+      if (!synthetic.maximum_rate) {
+        const double due = synthetic.scheduled_seconds(result.packets + n);
+        while (!stop.load() && !g_stop_requested && (seconds = elapsed()) < due &&
+               (cfg.total_time_to_recv_s < 0 || seconds < cfg.total_time_to_recv_s)) {
+          double delay = std::min(0.01, due - seconds);
+          if (cfg.total_time_to_recv_s >= 0) {
+            delay = std::min(delay, cfg.total_time_to_recv_s - seconds);
+          }
+          std::this_thread::sleep_for(std::chrono::duration<double>(delay));
+        }
+        if (stop.load() || g_stop_requested ||
+            (cfg.total_time_to_recv_s >= 0 && elapsed() >= cfg.total_time_to_recv_s)) {
+          break;
+        }
+      }
+
+      const uint64_t previous_frames = result.frames;
+      assembler.process_gpu_packet_batch(pool->packets() + offset, n, pool,
+                                          &result.unexpected, &result.frames);
+      result.packets += n;
+      // Count completed CUDA work rather than just host-side submissions.
+      // This also bounds synthetic in-flight work to the production batch size.
+      if (result.frames != previous_frames) { assembler.synchronize(); }
+      seconds = elapsed();
+      const double lag = synthetic.lag_seconds(result.packets, seconds);
+      result.max_lag_seconds = std::max(result.max_lag_seconds, lag);
+      if (seconds >= next_report) {
+        std::lock_guard<std::mutex> lock(run.mutex);
+        std::printf("synthetic progress rx=%u elapsed=%.3f packets=%llu completed_frames=%llu "
+                    "packet_Gbps=%.3f lag_ms=%.3f\n",
+                    cfg.receiver_id, seconds,
+                    static_cast<unsigned long long>(result.packets),
+                    static_cast<unsigned long long>(result.frames),
+                    result.packets * synthetic.layout.packet_bytes() * 8.0 / (seconds * 1e9),
+                    lag * 1000.0);
+        next_report = seconds + synthetic.report_interval_seconds;
+      }
+    }
+
+    // Do not flush an incomplete final window into a padded tensor: it would
+    // inflate completed throughput and make validation fail on expected zeros.
+    assembler.synchronize();
+    result.seconds = elapsed();
+    result.final_lag_seconds = synthetic.lag_seconds(result.packets, result.seconds);
+    result.mismatches = assembler.validation_mismatches();
+    result.incomplete = assembler.incomplete_batches();
+    result.pool_drops = assembler.output_pool_drops();
+    result.ignored = assembler.tile_packets_ignored();
+    stats.frames_assembled.fetch_add(result.frames);
+    stats.output_pool_drops.fetch_add(result.pool_drops);
+    if (result.mismatches || result.incomplete || result.unexpected) {
+      stats.worker_errors.fetch_add(1);
+    }
+    {
+      std::lock_guard<std::mutex> lock(run.mutex);
+      std::printf("synthetic complete rx=%u elapsed=%.6f packets=%llu frames=%llu "
+                  "buckets=%llu trailing_packets=%llu validation_mismatches=%llu "
+                  "incomplete=%llu pool_drops=%llu ignored=%llu unexpected=%llu "
+                  "max_lag_ms=%.3f final_lag_ms=%.3f\n",
+                  cfg.receiver_id, result.seconds,
+                  static_cast<unsigned long long>(result.packets),
+                  static_cast<unsigned long long>(result.frames),
+                  static_cast<unsigned long long>(result.frames / cfg.frames_per_tensor),
+                  static_cast<unsigned long long>(result.packets % packets_per_bucket),
+                  static_cast<unsigned long long>(result.mismatches),
+                  static_cast<unsigned long long>(result.incomplete),
+                  static_cast<unsigned long long>(result.pool_drops),
+                  static_cast<unsigned long long>(result.ignored),
+                  static_cast<unsigned long long>(result.unexpected),
+                  result.max_lag_seconds * 1000.0, result.final_lag_seconds * 1000.0);
+    }
+  } catch (const std::exception& error) {
+    {
+      std::lock_guard<std::mutex> lock(run.mutex);
+      std::cerr << "synthetic receiver " << cfg.receiver_id << " failed: " << error.what() << "\n";
+    }
+    stats.worker_errors.fetch_add(1);
+    stop.store(true);
+    run.cv.notify_all();
+  } catch (...) {
+    stats.worker_errors.fetch_add(1);
+    stop.store(true);
+    run.cv.notify_all();
+    std::cerr << "synthetic receiver failed with unknown exception\n";
+  }
+}
+
+void print_synthetic_summary(const std::vector<StemRxConfig>& cfgs,
+                             const SyntheticRun& run) {
+  uint64_t packets = 0, frames = 0, buckets = 0, completed_packet_bytes = 0, input_bytes = 0;
+  double seconds = 0, target = 0;
+  for (size_t i = 0; i < cfgs.size(); ++i) {
+    const auto& result = run.results[i];
+    const auto& synthetic = cfgs[i].synthetic;
+    seconds = std::max(seconds, result.seconds);
+    packets += result.packets;
+    frames += result.frames;
+    buckets += result.frames / cfgs[i].frames_per_tensor;
+    input_bytes += result.packets * synthetic.layout.packet_bytes();
+    completed_packet_bytes += result.frames * synthetic.layout.packets_per_frame() *
+                              synthetic.layout.packet_bytes();
+    if (!synthetic.maximum_rate) { target += synthetic.target_gbps; }
+  }
+  const double packet_gbps = seconds > 0 ? input_bytes * 8.0 / (seconds * 1e9) : 0;
+  const double completed_gbps = seconds > 0 ? completed_packet_bytes * 8.0 / (seconds * 1e9) : 0;
+  std::printf("synthetic aggregate receivers=%zu elapsed=%.6f packets=%llu "
+              "completed_frames=%llu completed_buckets=%llu packet_Gbps=%.3f "
+              "completed_Gbps=%.3f completed_buckets_per_second=%.3f target_Gbps=%.3f\n",
+              cfgs.size(), seconds, static_cast<unsigned long long>(packets),
+              static_cast<unsigned long long>(frames), static_cast<unsigned long long>(buckets),
+              packet_gbps, completed_gbps, seconds > 0 ? buckets / seconds : 0, target);
+}
 
 void rx_worker(const StemRxConfig& cfg, std::shared_ptr<FramePipeline> pipeline,
                std::atomic<bool>& stop, RxRunStats& run_stats) {
@@ -2708,8 +3009,8 @@ int main(int argc, char** argv) {
     const std::string source =
         root["source"].as<std::string>(std::string("network"));
     if (source == "hdf5") { return run_hdf5_replay(root); }
-    if (source != "network") {
-      throw std::runtime_error("source must be 'network' or 'hdf5'");
+    if (source != "network" && source != "synthetic") {
+      throw std::runtime_error("source must be 'network', 'hdf5', or 'synthetic'");
     }
 
     std::vector<StemRxConfig> cfgs = parse_stem_rx_cfgs(root);
@@ -2730,7 +3031,18 @@ int main(int argc, char** argv) {
     }
     for (auto& cfg : cfgs) {
       if (cli_seconds > -1.5) { cfg.total_time_to_recv_s = cli_seconds; }
+      if (cfg.synthetic_source) {
+        cfg.synthetic.duration_seconds = cfg.total_time_to_recv_s;
+        cfg.synthetic.validate();
+      }
       print_rx_start(cfg);
+    }
+    if (source == "synthetic") {
+      STEM_CUDA_TRY(cudaSetDevice(static_cast<int>(cfgs.front().synthetic.gpu_device)));
+      std::cout << "Synthetic packet benchmark: NIC initialization skipped; rates include "
+                   "Ethernet/IP/UDP and STEM bytes, exclude FCS/preamble/IFG. "
+                   "Payloads repeat every 128 frames. validate_output="
+                << (cfgs.front().synthetic.validate_output ? "true" : "false") << "\n";
     }
 
     if (burst_writer.enabled) {
@@ -2762,7 +3074,7 @@ int main(int argc, char** argv) {
         cfgs.front().frames_per_tensor, static_cast<uint32_t>(cfgs.size()));
     if (pipeline->errors() > 0) { return 1; }
 
-    if (daqiri::daqiri_init(argv[1]) != daqiri::Status::SUCCESS) {
+    if (source == "network" && daqiri::daqiri_init(argv[1]) != daqiri::Status::SUCCESS) {
       std::cerr << "daqiri_init failed for " << argv[1] << "\n";
       return 1;
     }
@@ -2776,13 +3088,28 @@ int main(int argc, char** argv) {
           return runtime_controller->handle(request);
         });
     RxRunStats run_stats;
+    SyntheticRun synthetic_run(cfgs.size());
     std::vector<std::thread> threads;
     threads.reserve(cfgs.size());
-    for (const auto& cfg : cfgs) {
-      threads.emplace_back(rx_worker, cfg, pipeline, std::ref(stop),
-                           std::ref(run_stats));
+    try {
+      for (const auto& cfg : cfgs) {
+        if (source == "synthetic") {
+          threads.emplace_back(synthetic_worker, cfg, pipeline, std::ref(stop),
+                               std::ref(run_stats), std::ref(synthetic_run));
+        } else {
+          threads.emplace_back(rx_worker, cfg, pipeline, std::ref(stop),
+                               std::ref(run_stats));
+        }
+      }
+    } catch (...) {
+      stop.store(true);
+      synthetic_run.cv.notify_all();
+      for (auto& thread : threads) { thread.join(); }
+      if (source == "network") { daqiri::shutdown(); }
+      throw;
     }
     for (auto& t : threads) { t.join(); }
+    if (source == "synthetic") { print_synthetic_summary(cfgs, synthetic_run); }
 
     pipeline->drain_auxiliary();
     const auto burst_stats = pipeline->burst_stats();
@@ -2809,8 +3136,10 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long>(thinned_stats.products_coalesced),
                 static_cast<unsigned long>(thinned_stats.send_errors));
 
-    daqiri::print_stats();
-    daqiri::shutdown();
+    if (source == "network") {
+      daqiri::print_stats();
+      daqiri::shutdown();
+    }
     control_server.stop();
     if (restart_requested.load()) {
       std::cout << "Restart requested from " << control.runtime_config_path
