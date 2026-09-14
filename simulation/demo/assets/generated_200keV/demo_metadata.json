@@ -1,0 +1,471 @@
+{
+  "abtem": {
+    "abtem_version": "1.0.10",
+    "double_channel_edges": [
+      "Li_K",
+      "Mn_L23",
+      "O_K",
+      "Ti_L23"
+    ],
+    "edge_names": [
+      "Ti_M23",
+      "Mn_M23",
+      "Li_K",
+      "Ti_L23",
+      "O_K",
+      "Mn_L23"
+    ],
+    "eels_detector_mrad": [
+      0.0,
+      50.0
+    ],
+    "haadf_detector_mrad": [
+      50.0,
+      80.0
+    ],
+    "haadf_sampling_A": [
+      0.08924731182795699,
+      0.08924731182795699
+    ],
+    "potential_sampling_A": [
+      0.11857142857142858,
+      0.11857142857142858
+    ],
+    "probe_semiangle_mrad": 20.0
+  },
+  "assets": [
+    "abtem_spatial_channels.png",
+    "analog_vs_counted_processing.png",
+    "application_workflows.png",
+    "eels_15pa_dark_calibration.png",
+    "exposure_sweep_correlations.png",
+    "final_haadf.png",
+    "final_mn.png",
+    "final_o.png",
+    "final_ti.png",
+    "geant4_detector_response.png",
+    "gosh_edge_components.png",
+    "haadf_model.png",
+    "nio_calibration_summary.png",
+    "nio_sparse_detector_calibration.png",
+    "probe_point_coreloss_spectra.png",
+    "probe_raster.png",
+    "raw_column_layout.png",
+    "raw_detector_frame.png",
+    "structure_3d.png",
+    "structure_planes.png",
+    "theoretical_spectrum_components.png"
+  ],
+  "calibration": {
+    "dark": {
+      "calibration_frames": 256,
+      "column_common_mode_rms_adu": 0.8175981640815735,
+      "dataset": "frames",
+      "effective_adc_bits_from_observed_max": 12,
+      "frame_shape": [
+        960,
+        3840
+      ],
+      "global_common_mode_rms_adu": 0.15456028282642365,
+      "input": "nio_15pa_dark_frames_float32_uncompressed.h5",
+      "invalid_pixels": 28877,
+      "known_defect_pixels": 7680,
+      "known_defect_regions": [
+        [
+          0,
+          480,
+          2272,
+          2288
+        ]
+      ],
+      "max_valid_noise_adu": 7.8125,
+      "max_valid_noise_raw": 500.0,
+      "pedestal_adu": {
+        "median": 2021.91015625,
+        "p10": 920.4375,
+        "p90": 2286.51171875,
+        "p99": 2561.604609374999
+      },
+      "read_noise_adu": {
+        "median": 4.566232204437256,
+        "p10": 2.5291316509246826,
+        "p90": 5.428800296783454,
+        "p99": 6.820432853698717
+      },
+      "row_common_mode_rms_adu": 0.37245285511016846,
+      "schema": "eels-sim-readout-calibration-v2",
+      "storage_lsb_raw_units_per_adu": 64,
+      "valid_fraction": 0.9921666124131945,
+      "validation_bias_median_adu": -0.0625,
+      "validation_bias_rms_adu": 0.8831213116645813,
+      "validation_frames": 256,
+      "validation_noise_adu": {
+        "median": 4.5670857429504395,
+        "p10": 2.5234196186065674,
+        "p90": 5.424610137939455,
+        "p99": 6.839619159698486
+      }
+    },
+    "sparse": {
+      "caveats": [
+        "The sparse tail is used only for detector response, not NiO spectral physics.",
+        "The DM4 files lack authoritative exposure-time and energy calibration metadata.",
+        "Threshold truncation makes the inferred detection efficiency model-dependent.",
+        "The fitted extra blur absorbs diffusion, interpixel coupling, and model mismatch."
+      ],
+      "dark_frames": 256,
+      "dark_isolated_events": 1414,
+      "estimated_dark_fraction": 0.0631221820454444,
+      "fit": {
+        "additional_blur_sigma_pixels": 0.49999999999999994,
+        "detection_efficiency_above_threshold": 0.89622,
+        "gain_adu_per_pair": 0.245,
+        "objective": 0.009022816836385797,
+        "patch_sum_quantiles_adu": [
+          75.88432385988041,
+          96.07872779972354,
+          125.83125389463419,
+          178.33872368718585,
+          281.55741398211165
+        ],
+        "peak_quantiles_adu": [
+          45.34037802690221,
+          55.72018485257904,
+          72.98058439242111,
+          104.8789248755863,
+          165.76479832489855
+        ],
+        "sensitivity_range": {
+          "additional_blur_sigma_pixels": [
+            0.49999999999999994,
+            0.49999999999999994
+          ],
+          "criterion": "objective <= best + 0.01; diagnostic, not a confidence interval",
+          "gain_adu_per_pair": [
+            0.21999999999999997,
+            0.26749999999999996
+          ]
+        }
+      },
+      "interpretation": "effective fit conditional on the provisional bare-5-um-silicon Geant4 charge distribution; sensor thickness and ADC gain remain degenerate",
+      "measured_signal_3x3_sum_quantiles_adu": [
+        69.97600723266602,
+        89.360524478024,
+        122.0057263807817,
+        186.35062453326057,
+        328.3570081438337
+      ],
+      "measured_signal_peak_quantiles_adu": [
+        44.17840430967269,
+        52.818503083853884,
+        70.59999067887016,
+        103.69245414733886,
+        173.34150848388668
+      ],
+      "quantile_probabilities": [
+        0.1,
+        0.25,
+        0.5,
+        0.75,
+        0.9
+      ],
+      "recommended_simulation_parameters": {
+        "gain_adu_per_electron": 0.245,
+        "raw_doeels.response_blur_sigma_pixels": 0.49999999999999994
+      },
+      "region": {
+        "interpretation": "sparse high-loss CoreLoss tail",
+        "raw_columns": [
+          1986,
+          3840
+        ],
+        "rows": [
+          32,
+          928
+        ]
+      },
+      "spectrum_frames": 256,
+      "spectrum_isolated_events": 22401,
+      "threshold": {
+        "global_floor_adu": 37.80070114135742,
+        "global_noise_adu": 4.725087642669678,
+        "sigma_multiplier": 8.0,
+        "xray_threshold_adu": 823.0
+      }
+    }
+  },
+  "detector": {
+    "approximation": "aligned per-electron Monte Carlo charge templates; renderers may use the stored ensemble mean only for explicitly bounded high-dose runs",
+    "event_count": 1000,
+    "geometry": {
+      "columns": 128,
+      "pixel_pitch_um": 10.0,
+      "rows": 64,
+      "sensor_thickness_um": 5.0
+    },
+    "kernel_capture_fraction": 1.0,
+    "mean_pairs": 663.273,
+    "median_pairs": 485.0,
+    "p10_pairs": 283.9,
+    "p90_pairs": 1110.1,
+    "radius_pixels": 3,
+    "std_pairs": 675.6982852158525,
+    "subpixel_phase_histogram_bins": 10,
+    "subpixel_phase_histogram_x": [
+      98,
+      97,
+      103,
+      104,
+      90,
+      108,
+      93,
+      113,
+      94,
+      100
+    ],
+    "subpixel_phase_histogram_y": [
+      90,
+      98,
+      83,
+      103,
+      107,
+      111,
+      100,
+      103,
+      96,
+      109
+    ],
+    "transport_summary": {
+      "collected_pairs": 663273,
+      "frame_count": 1000,
+      "generated_pairs": 663273,
+      "lost_pairs": 0
+    }
+  },
+  "exposure_metrics": {
+    "Li": [
+      -0.06776660766654202,
+      -0.00565201362616737,
+      -0.04023438956841891,
+      -0.13208760507402628,
+      -0.04206141565684075,
+      0.06306244312319809,
+      0.22111347287207947,
+      0.40824389370672837,
+      0.5366697441749504,
+      0.7661855889385052
+    ],
+    "Mn": [
+      0.05707904531526995,
+      0.19307492774326485,
+      0.31974350886332015,
+      0.3659934789107894,
+      0.5628308242275631,
+      0.7905431413137649,
+      0.9096442132497436,
+      0.9624903648404874,
+      0.9898186069338242,
+      0.9967628101923034
+    ],
+    "O": [
+      0.053192369779018485,
+      0.00607123712519535,
+      0.04878240787018723,
+      0.2033441371931569,
+      0.3952689036233972,
+      0.6234679479320975,
+      0.8084051125278496,
+      0.9339990073146587,
+      0.9800337030093306,
+      0.9935026444818982
+    ],
+    "Ti": [
+      0.009068221243704695,
+      0.10142379628327522,
+      0.33652413307580353,
+      0.4504173590898185,
+      0.5894131774966772,
+      0.7988723371945793,
+      0.9040590536346225,
+      0.9683246090248339,
+      0.9891619722647145,
+      0.9971699848130716
+    ]
+  },
+  "final_correlations": {
+    "Mn": 0.9096442132497436,
+    "O": 0.8084051125278496,
+    "Ti": 0.9040590536346225
+  },
+  "haadf": {
+    "expected_sampled_correlation": 0.9999812034954954
+  },
+  "limitations": [
+    "The LMTO cell is synthetic, periodic, unrelaxed, and only 0.83 nm wide by 1.66 nm thick.",
+    "GOSH supplies independent-atom cross sections, not LMTO-specific ELNES, oxidation state, or bonding fine structure.",
+    "The spectrometer is a provisional first-order transfer with provisional dispersion and row-angle mapping.",
+    "The 5 um silicon thickness and effective gain remain partly degenerate in the NiO fit.",
+    "The 35 ms streaming product retains sufficient statistics and spectra, not all 768,000 raw frames.",
+    "Focal sections are separate through-focus simulations, not depth recovered from one conventional scan.",
+    "Li K is not used in the final slider because shallow-edge overlap, delocalization, and low spatial modulation make it poorly resolved at this dwell."
+  ],
+  "raw_frame": {
+    "frame_index": 3,
+    "probe": [
+      0,
+      12
+    ],
+    "residual_display_scale_adu": 201.21095703124956
+  },
+  "scan": {
+    "beam_current_pA": 30.0,
+    "beam_energy_keV": 200.0,
+    "dwell_ms": 34.48275862068966,
+    "electrons_per_integration": 2152,
+    "electrons_per_position": 6456000,
+    "field_of_view_A": 8.3,
+    "focal_depth_A": 8.3,
+    "frame_rate_hz": 87000.0,
+    "ideal_scan_time_s": 8.827586206896553,
+    "integrations_per_position": 3000,
+    "raw_frames_if_retained": 768000,
+    "shape": [
+      16,
+      16
+    ],
+    "step_A": 0.51875
+  },
+  "schema": "eels-sim-lmto-demo-v1",
+  "selected_probes": {
+    "Mn": {
+      "column": 12,
+      "expected_element_counts": {
+        "Mn": 478.51800537109375,
+        "O": 533.107666015625,
+        "Ti": 48.88056182861328
+      },
+      "row": 0,
+      "x_A": 6.2250000000000005,
+      "y_A": 0.0
+    },
+    "O": {
+      "column": 8,
+      "expected_element_counts": {
+        "Mn": 28.08848762512207,
+        "O": 530.6578369140625,
+        "Ti": 45.18531036376953
+      },
+      "row": 0,
+      "x_A": 4.15,
+      "y_A": 0.0
+    },
+    "Ti": {
+      "column": 0,
+      "expected_element_counts": {
+        "Mn": 259.2767333984375,
+        "O": 525.244873046875,
+        "Ti": 989.0828857421875
+      },
+      "row": 12,
+      "x_A": 0.0,
+      "y_A": 6.2250000000000005
+    }
+  },
+  "source_files": {
+    "dark_calibration": "calibration/eels_15pa_dark_calibration.h5",
+    "detector_response": "calibration/monte_carlo_200keV_response_kernel.h5",
+    "exposure_sweep": "output/lmto_raw_doeels_200keV_exposure_sweep_16x16.h5",
+    "physical_raw_scan": "output/lmto_raw_doeels_200keV_87khz_nio_calibrated_stride4.h5",
+    "simulation_config": "config/energy_lmto_abtem_200keV.toml",
+    "sparse_calibration": "calibration/nio_15pa_sparse_detector_calibration_200keV.h5",
+    "spatial_response": "output/lmto_abtem_spatial_200keV_refined.h5",
+    "spectral_library": "spectral_libraries/lmto_gosh_200keV.h5",
+    "spectrum_image": "output/lmto_abtem_200keV_spectrum_image.h5"
+  },
+  "specimen": {
+    "atom_count": 128,
+    "element_counts": {
+      "Li": 40,
+      "Mn": 16,
+      "O": 64,
+      "Ti": 8
+    },
+    "extent_A": 8.3,
+    "formula": "Li1.2Mn0.4Ti0.4O2",
+    "model": "synthetic unrelaxed random-cation disordered rocksalt",
+    "thickness_A": 16.6
+  },
+  "spectral_model": {
+    "component_labels": [
+      "zero_loss",
+      "low_loss",
+      "Ti_M23",
+      "Mn_M23",
+      "Li_K",
+      "Ti_L23",
+      "O_K",
+      "Mn_L23"
+    ],
+    "core_loss_physics": "absolute atomic DFT-GOS cross sections; no LMTO-specific ELNES",
+    "edges": {
+      "Li_K": {
+        "element": "Li",
+        "integrated_cross_section_barn_per_atom": 97808.76248016093,
+        "material_specific_fine_structure": false,
+        "onset_energy_eV": 55.0
+      },
+      "Mn_L23": {
+        "element": "Mn",
+        "integrated_cross_section_barn_per_atom": 6656.62552759524,
+        "material_specific_fine_structure": false,
+        "onset_energy_eV": 640.0
+      },
+      "Mn_M23": {
+        "element": "Mn",
+        "integrated_cross_section_barn_per_atom": 110969.1631763228,
+        "material_specific_fine_structure": false,
+        "onset_energy_eV": 51.0
+      },
+      "O_K": {
+        "element": "O",
+        "integrated_cross_section_barn_per_atom": 3958.8489452444833,
+        "material_specific_fine_structure": false,
+        "onset_energy_eV": 532.0
+      },
+      "Ti_L23": {
+        "element": "Ti",
+        "integrated_cross_section_barn_per_atom": 19584.32533502402,
+        "material_specific_fine_structure": false,
+        "onset_energy_eV": 456.0
+      },
+      "Ti_M23": {
+        "element": "Ti",
+        "integrated_cross_section_barn_per_atom": 173864.22694123143,
+        "material_specific_fine_structure": false,
+        "onset_energy_eV": 35.0
+      }
+    },
+    "gosh_doi": "10.5281/zenodo.7645765",
+    "low_loss_physics": "analytic provisional mixture"
+  },
+  "spectrometer": {
+    "collection_semiangle_mrad": 50.0,
+    "dispersion_eV_per_column": 0.25773195876288657,
+    "energy_blur_sigma_eV": 0.35,
+    "model": "first-order paraxial transfer, not a field solve",
+    "zlp_lane_width_columns": 192,
+    "zlp_lanes": 4,
+    "zlp_stitched_column": 52.0
+  },
+  "spectrum_example": {
+    "column": 12,
+    "fitted_edge_counts": {
+      "Mn L\u2082,\u2083": 514.7780151367188,
+      "O K": 443.3965148925781,
+      "Ti L\u2082,\u2083": 8.162797927856445
+    },
+    "probe": "Mn",
+    "row": 0
+  },
+  "title": "DOEELS: from a fast detector stream to elemental maps"
+}

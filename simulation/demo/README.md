@@ -71,25 +71,32 @@ Detailed abTEM/GOSH derivations, phase-space transfer coefficients, and the
 detector calibration plots remain generated assets and source HDF5 products,
 but are intentionally not part of the main general-audience narrative.
 
-## Quick start
+## Quick start: edit or render the committed result
 
-The project uses two local environments created under `simulation/`:
-
-- `.conda-envs/eels-sim-gpaw` for NumPy, HDF5, Matplotlib, abTEM, and GPAW;
-- `.venv-demo` for Manim and rendering.
-
-From `simulation/`:
+The compact `assets/generated_200keV/` presentation pack is committed. It
+contains derived images and scientific metadata, not the bulk HDF5 simulation
+products. A fresh clone only needs the Manim environment to edit or render the
+existing movie:
 
 ```bash
-demo/render_demo.sh assets
+scripts/setup_demo_env.sh
 demo/render_demo.sh preview
 demo/render_demo.sh full
 ```
 
-The main output is:
+Run these commands from `simulation/`. The main output is:
 
 ```text
 demo/renders/lmto_doeels_workflow_200keV_FullDemo.mp4
+```
+
+To regenerate the assets or change the physics, create both local environments
+and follow the full workflow in [`../README.md`](../README.md):
+
+```bash
+scripts/setup_gpaw_env.sh
+scripts/setup_demo_env.sh
+scripts/reproduce_200kev_demo.sh
 ```
 
 Render an individual low-resolution section while editing:
@@ -112,11 +119,11 @@ All presentation labels use one explicit font and avoid mixed Unicode fallback
 for arrows and subscripts; this removes the irregular character spacing seen in
 the earlier cut.
 
-## Inputs and generated assets
+## Inputs and versioned presentation assets
 
 [`demo_config.json`](demo_config.json) is the single presentation input. It
-points at the 200 keV HDF5 products and writes deterministic graphics to
-`assets/generated_200keV/`. The generated
+points at the external/generated 200 keV HDF5 products and writes deterministic
+graphics to `assets/generated_200keV/`. The versioned
 `assets/generated_200keV/demo_metadata.json` records the exact input paths,
 scan parameters, fitted detector values, selected probe positions, element
 counts, correlations, and scientific limitations used by the scenes.

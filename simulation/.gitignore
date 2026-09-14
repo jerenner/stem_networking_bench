@@ -12,9 +12,11 @@ python/*.egg-info/
 *.py[cod]
 test.txt
 
-# Deterministic movie assets and rendered media are regenerated from the
-# simulation products by demo/render_demo.sh.
-demo/assets/
+# Keep the compact, derived 200 keV presentation asset pack. Bulk simulation
+# products remain excluded above and can regenerate this pack when required.
+demo/assets/*
+!demo/assets/generated_200keV/
+!demo/assets/generated_200keV/**
 demo/.manim/
 demo/.manim-check/
 demo/renders/

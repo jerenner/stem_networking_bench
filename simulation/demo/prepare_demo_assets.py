@@ -600,6 +600,8 @@ def _detector_response_asset(response, output_dir: Path, plt, np, beam_energy_ke
 
 def _calibration_assets(dark, sparse, config: dict, output_dir: Path, plt, np) -> dict:
     dark_summary = json.loads(dark.attrs["summary_json"])
+    if "input" in dark_summary:
+        dark_summary["input"] = Path(str(dark_summary["input"])).name
     sparse_summary = json.loads(sparse.attrs["summary_json"])
     pedestal = dark["maps/pedestal_adu"][:]
     noise = dark["maps/read_noise_adu"][:]
@@ -1031,7 +1033,7 @@ def generate_assets(config_path: Path, force: bool = False) -> Path:
         metadata = {
             "schema": "eels-sim-lmto-demo-v1",
             "title": config.get("title"),
-            "source_files": {name: str(path) for name, path in paths.items()},
+            "source_files": {name: str(config[name]) for name in paths},
             "specimen": {
                 "formula": "Li1.2Mn0.4Ti0.4O2",
                 "model": "synthetic unrelaxed random-cation disordered rocksalt",

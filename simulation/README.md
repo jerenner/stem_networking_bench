@@ -99,10 +99,13 @@ PYTHONPATH=python python3 -m eels_sim --help
 
 ## Reproduce the 200 keV movie
 
-Generated simulation products, measured microscope data, GOSH tables, render
-caches, and movies are intentionally excluded from Git. The repository contains
-the complete code, deterministic seeds, configurations, Geant4 macro, scene
-definitions, and an orchestration script.
+Bulk simulation products, measured microscope data, generated GOSH tables,
+render caches, and movies are intentionally excluded from Git. The repository
+does include the compact derived presentation assets under
+`demo/assets/generated_200keV/`, so the existing LMTO and combined movies can
+be edited or rendered without the physics dependencies. It also contains the
+complete code, deterministic seeds, configurations, Geant4 macro, scene
+definitions, and an orchestration script for a full regeneration.
 
 Two measured NiO inputs must be supplied separately:
 

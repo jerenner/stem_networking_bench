@@ -89,6 +89,9 @@ PYTHONPATH=python "$physics_python" -m eels_sim simulate-raw-doeels-exposure-swe
 
 LMTO_ASSET_PYTHON="$physics_python" \
 LMTO_MANIM_PYTHON="$manim_python" \
+    demo/render_demo.sh assets
+LMTO_ASSET_PYTHON="$physics_python" \
+LMTO_MANIM_PYTHON="$manim_python" \
     demo/render_demo.sh full
 
 echo "Wrote demo/renders/lmto_doeels_workflow_200keV_FullDemo.mp4"

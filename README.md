@@ -20,6 +20,18 @@ Both implementations use the same STEM packet geometry:
 See [`docs/CURRENT_PACKET_FORMAT.md`](docs/CURRENT_PACKET_FORMAT.md) for the
 concise sender-facing packet and custom-header specification.
 
+## Video demonstrations
+
+Three reproducible Manim demonstrations cover the recorded NiO acquisition
+path, the simulated LMTO element-identification workflow, and a combined
+electrons-to-live-maps story. A fresh clone includes compact derived assets, so
+the movies can be edited and rendered without installing Geant4 or rerunning
+the physics simulation.
+
+Start with [`DEMOS.md`](DEMOS.md). It is the handoff entry point for people and
+coding agents, with render-only commands, source locations, claim boundaries,
+and the optional full-simulation route.
+
 ## Architecture & Strategy
 
 ```mermaid

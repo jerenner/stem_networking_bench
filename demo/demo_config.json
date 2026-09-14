@@ -1,0 +1,43 @@
+{
+  "title": "From detector packets to a live NiO EELS spectrum",
+  "raw_file": "../../../doeels/nio_15pa_spectrum_frames_float32_uncompressed.h5",
+  "raw_dataset": "/frames",
+  "dark_file": "../../../doeels/nio_15pa_dark_frame_all512_float32.h5",
+  "dark_dataset": "/processed",
+  "valid_mask_dataset": "/valid_pixel_mask",
+  "output_directory": "demo/assets/generated",
+  "start_frame": 0,
+  "bucket_size": 128,
+  "representative_frame_index": 64,
+  "chunk_size": 8,
+  "detector": {
+    "edge_rows": 32,
+    "zlp_width": 768,
+    "zlp_period": 192,
+    "apply_stitch": false,
+    "stitch_gain": null
+  },
+  "processor": {
+    "subtract_dark_frame": true,
+    "apply_valid_pixel_mask": true,
+    "apply_blr_correction": true,
+    "blr_rows": 30,
+    "blr_zlp_width": 768,
+    "blr_zlp_group_columns": 4,
+    "blr_core_group_columns": 16,
+    "apply_dynamic_half_column_mask": true,
+    "dynamic_mask_median_window_pixels": 31,
+    "dynamic_mask_threshold_ratio": 1.0,
+    "dynamic_mask_threshold_offset": 500.0,
+    "dynamic_mask_excluded_edge_rows": 32,
+    "dynamic_mask_two_sided": true
+  },
+  "performance": {
+    "interfaces": 8,
+    "interface_line_rate_gbps": 100,
+    "measured_input_gbps": 70.38,
+    "measured_packet_rate_mpps": 1.13,
+    "measured_assembled_fps": 2984.42,
+    "thinned_refresh_hz": 10
+  }
+}

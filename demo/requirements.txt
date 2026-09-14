@@ -1,0 +1,4 @@
+h5py>=3.10
+manim>=0.19
+matplotlib>=3.8
+numpy>=1.26

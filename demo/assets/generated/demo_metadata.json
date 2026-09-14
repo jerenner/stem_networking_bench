@@ -1,0 +1,67 @@
+{
+  "assets": [
+    "raw_frame.png",
+    "dark_subtracted_frame.png",
+    "blr_corrected_frame.png",
+    "mask_overlay.png",
+    "corrected_frame.png",
+    "bucket_sum.png",
+    "spectrum_linear.png",
+    "spectrum_log.png",
+    "spectrum_data.npz"
+  ],
+  "detector_shape": [
+    960,
+    3840
+  ],
+  "mask": {
+    "dynamic_pixels": 684,
+    "fraction": 0.008579644097222222,
+    "static_pixels": 30944,
+    "total_pixels": 31628
+  },
+  "performance": {
+    "interface_line_rate_gbps": 100,
+    "interfaces": 8,
+    "measured_assembled_fps": 2984.42,
+    "measured_input_gbps": 70.38,
+    "measured_packet_rate_mpps": 1.13,
+    "thinned_refresh_hz": 10
+  },
+  "processor": {
+    "apply_blr_correction": true,
+    "apply_dynamic_half_column_mask": true,
+    "apply_valid_pixel_mask": true,
+    "blr_core_group_columns": 16,
+    "blr_rows": 30,
+    "blr_zlp_group_columns": 4,
+    "blr_zlp_width": 768,
+    "dynamic_mask_excluded_edge_rows": 32,
+    "dynamic_mask_median_window_pixels": 31,
+    "dynamic_mask_threshold_offset": 500.0,
+    "dynamic_mask_threshold_ratio": 1.0,
+    "dynamic_mask_two_sided": true,
+    "noop": true,
+    "subtract_dark_frame": true
+  },
+  "schema": "stem.daqiri.demo.v1",
+  "source": {
+    "bucket_size": 128,
+    "dark_file": "../../../doeels/nio_15pa_dark_frame_all512_float32.h5",
+    "label": "recorded NiO data replayed through the offline processor mirror",
+    "raw_dataset": "/frames",
+    "raw_file": "../../../doeels/nio_15pa_spectrum_frames_float32_uncompressed.h5",
+    "representative_frame": 64,
+    "start_frame": 0
+  },
+  "spectrum": {
+    "channels": 3264,
+    "coreloss_channels": 3072,
+    "stitch": {
+      "applied": false,
+      "reason": "disabled; a valid gain should be calibrated from no-BLR data"
+    },
+    "zlp_channels": 192
+  },
+  "title": "From detector packets to a live NiO EELS spectrum"
+}

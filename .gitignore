@@ -19,6 +19,14 @@ __pycache__/
 dark_subtraction_analysis/
 test_data/
 daqiri_profiles/
+demo/.manim/
+demo/renders/
+demo/__pycache__/
+
+# Keep the compact, derived presentation asset pack so a fresh clone can
+# render/edit the DAQIRI movie without access to the measured HDF5 stacks.
+!demo/assets/generated/
+!demo/assets/generated/**
 
 # Scratch diagnostics
 frame0_dump.txt
