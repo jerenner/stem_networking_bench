@@ -181,11 +181,13 @@ The predefined sequence is:
    streams with validation disabled.
 6. `b200_maximum.yaml`: five unconstrained minutes measuring capacity margin.
 
-All six configurations run `stem_daqiri_rx` directly, preserve individual
-corrected frames (`processor.noop: true`), execute dark subtraction, grouped
-BLR, valid-pixel masking, and two-sided dynamic masking, and disable every
-writer and external stream. Synthetic operation does not require a supervisor,
-privileged Docker mode, host networking, hugepages, or FPGA/NIC configuration.
+All six configurations run `stem_daqiri_rx` directly, execute dark subtraction,
+grouped BLR, valid-pixel masking, and two-sided dynamic masking, and disable
+every writer and external stream. The local profiles preserve individual
+corrected frames (`processor.noop: true`); the three B200 profiles additionally
+sum each corrected 128-frame bucket (`processor.noop: false`). Synthetic
+operation does not require a supervisor, privileged Docker mode, host
+networking, hugepages, or FPGA/NIC configuration.
 
 On a conventional Docker host, run all three qualification stages with one
 command:

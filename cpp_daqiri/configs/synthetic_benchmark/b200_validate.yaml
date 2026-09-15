@@ -25,7 +25,7 @@ stem_rx:
   batch_close_slack_packets: 512
 
 processor:
-  noop: true
+  noop: false
   subtract_dark_frame: true
   dark_frame_path: "/calibration/dark.h5"
   dark_frame_dataset: "/processed"
