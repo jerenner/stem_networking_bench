@@ -2,6 +2,14 @@
 # All rights reserved. SPDX-License-Identifier: Apache-2.0
 
 cmake_minimum_required(VERSION 3.20)
+
+# Set the portable default before enabling CUDA. project(... CUDA) otherwise
+# initializes this variable to the compiler default (sm_75 in the NGC image),
+# making the later fallback ineffective.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES "80;86;87;89;90;100;120;121")
+endif()
+
 project(stem_daqiri LANGUAGES C CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -11,12 +19,6 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
-endif()
-
-# CUDA architectures: B200 is sm_100; GB10 (Spark) is sm_121.
-# Include common lab archs so binaries are portable across host machines.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES "80;86;87;89;90;100;120;121")
 endif()
 
 find_package(CUDAToolkit REQUIRED)

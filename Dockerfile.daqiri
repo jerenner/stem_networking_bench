@@ -38,6 +38,7 @@
 #   DAQIRI_BASE              Base image (default daqiri-torch:local).
 #   DAQIRI_ENGINE            daqiri engine backends to compile in (default dpdk).
 #   STEM_BUILD_TYPE          CMake build type (default Release).
+#   STEM_CUDA_ARCHITECTURES  Semicolon-separated CMake CUDA targets.
 #   STEM_DAQIRI_BUILD_TX     ON to build the TX binary.
 #   STEM_DAQIRI_BUILD_RX     ON to build the RX binary.
 #   STEM_DAQIRI_ENABLE_HDF5  ON to build the optional RX smoke/debug HDF5 writer.
@@ -51,6 +52,7 @@ FROM ${DAQIRI_BASE} AS stem-daqiri-build
 
 ARG DAQIRI_ENGINE="dpdk"
 ARG STEM_BUILD_TYPE=Release
+ARG STEM_CUDA_ARCHITECTURES="80;86;87;89;90;100;120;121"
 ARG STEM_DAQIRI_BUILD_TX=OFF
 ARG STEM_DAQIRI_BUILD_RX=OFF
 ARG STEM_DAQIRI_ENABLE_HDF5=ON
@@ -74,6 +76,7 @@ RUN rm -rf /workspace/stem/cpp_daqiri/build \
              -B /workspace/stem/cpp_daqiri/build \
              -G Ninja \
              -DCMAKE_BUILD_TYPE=${STEM_BUILD_TYPE} \
+             -DCMAKE_CUDA_ARCHITECTURES="${STEM_CUDA_ARCHITECTURES}" \
              -DDAQIRI_ENGINE="${DAQIRI_ENGINE}" \
              -DSTEM_DAQIRI_BUILD_TX=${STEM_DAQIRI_BUILD_TX} \
              -DSTEM_DAQIRI_BUILD_RX=${STEM_DAQIRI_BUILD_RX} \

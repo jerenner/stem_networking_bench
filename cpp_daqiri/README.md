@@ -963,6 +963,11 @@ a live 100 Gb/s stream and therefore is not a receiver keep-up test.
 | `configs/stem_replay_hdf5.yaml` | finite uint16/float32 HDF5 replay config for processor parity |
 | `configs/stem_rx_synthetic.yaml` | one-to-eight-receiver GPU processing-capacity benchmark |
 | `scripts/validate_synthetic_rx.py` | no-NIC GPU/HDF5 correctness and wrap validation |
+| `configs/synthetic_benchmark/*.yaml` | reproducible local smoke/profile, B200 validation, paced 800-Gbit/s, and maximum-rate runs |
+| `scripts/build_synthetic_benchmark_image.sh` | portable x86_64 DAQIRI/STEM benchmark image build |
+| `scripts/run_synthetic_benchmark.sh` | direct synthetic run with configuration, identity, logs, and GPU telemetry |
+| `scripts/run_synthetic_benchmark_native.sh` | no-Docker synthetic runner for an already-running Runpod container |
+| `scripts/run_b200_benchmark_suite.sh` | one-command Docker or `--native` validation, 800-Gbit/s, and maximum-rate B200 qualification |
 | `scripts/run_daqiri_hdf5_replay.sh` | one-shot Docker wrapper for finite HDF5 processing |
 | `scripts/run_daqiri_validation.sh` | repeatable HDF5, config, live, writer, and HDS validation gates |
 | `configs/stem_tx_igx_loopback.yaml` | IGX hardware-loopback TX config |

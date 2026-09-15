@@ -131,6 +131,99 @@ corrections are enabled. Mount `/data` when either HDF5 writer is enabled. Add
 `--network host` only when exposing the control or thinned-stream ZeroMQ
 endpoints.
 
+### Reproducible x86 and B200 workflow
+
+The portable build wrapper initializes the pinned DAQIRI submodule, builds its
+PyTorch/DPDK base when needed, and builds the RX image with HDF5 and ZeroMQ
+support:
+
+```bash
+cpp_daqiri/scripts/build_synthetic_benchmark_image.sh
+```
+
+The default final tag is `stem_daqiri:synthetic-amd64`, built on NVIDIA's
+CUDA 13.0 PyTorch 25.11 image so it runs with the 580-series driver on the local
+RTX smoke-test host. The script deliberately requires a native x86_64 Linux
+host so an image prepared on an ARM IGX is not mistaken for an image that can
+run on an x86 B200 cloud node. Native CUDA targets for both B200 (`sm_100`) and
+the local RTX 50-series host (`sm_120`) are compiled into the binary.
+
+The helper disables DAQIRI's optional standalone examples while building the
+base image. They are not installed into the runtime image, and one DPDK example
+currently requires an x86 SSSE3 compile flag that is not inherited from DPDK.
+The helper applies this as a build-only patch to a temporary submodule copy, so
+the pinned `third_party/daqiri` checkout remains unchanged.
+
+Use the generic runner to execute one configuration and retain its application
+log, exact YAML, image and Git identity, calibration checksum, initial/final GPU
+state, and one-second `nvidia-smi` samples:
+
+```bash
+cpp_daqiri/scripts/run_synthetic_benchmark.sh \
+    --config cpp_daqiri/configs/synthetic_benchmark/cisneros_smoke.yaml \
+    --dark walking_dot_dark_frame.h5
+```
+
+The predefined sequence is:
+
+1. `cisneros_smoke.yaml`: one receiver, two complete buckets, full corrections,
+   and assembly validation on a 16-GiB RTX GPU.
+2. `cisneros_200gbps.yaml`: a 30-second, two-receiver local profile paced at
+   100 Gbit/s per receiver. This validates the sustained-run machinery but is
+   not a substitute for the B200 capacity result.
+3. `cisneros_maximum.yaml`: two unconstrained logical receivers for measuring
+   the local RTX GPU's processing ceiling; validation remains disabled so the
+   checker does not become part of the measured workload.
+4. `b200_validate.yaml`: two complete buckets on all eight logical receivers
+   with assembly validation enabled. This is a correctness check, not a speed
+   result.
+5. `b200_800gbps.yaml`: five minutes at eight independently paced 100-Gbit/s
+   streams with validation disabled.
+6. `b200_maximum.yaml`: five unconstrained minutes measuring capacity margin.
+
+All six configurations run `stem_daqiri_rx` directly, preserve individual
+corrected frames (`processor.noop: true`), execute dark subtraction, grouped
+BLR, valid-pixel masking, and two-sided dynamic masking, and disable every
+writer and external stream. Synthetic operation does not require a supervisor,
+privileged Docker mode, host networking, hugepages, or FPGA/NIC configuration.
+
+On a conventional Docker host, run all three qualification stages with one
+command:
+
+```bash
+cpp_daqiri/scripts/run_b200_benchmark_suite.sh \
+    --dark walking_dot_dark_frame.h5 \
+    --seconds 300
+```
+
+Runpod already runs the benchmark image as the Pod container and does not
+provide nested Docker. Clone this repository under `/workspace`, upload the
+dark frame there, and select the native runner:
+
+```bash
+cd /workspace/stem_networking_bench
+cpp_daqiri/scripts/run_b200_benchmark_suite.sh \
+    --native \
+    --dark /workspace/walking_dot_dark_frame.h5 \
+    --output-root /workspace/synthetic_benchmark_runs \
+    --seconds 300
+```
+
+The native runner invokes `/opt/stem_daqiri/bin/stem_daqiri_rx` directly. It
+creates a per-run YAML copy whose `dark_frame_path` points to the uploaded file,
+without modifying the checked-in configuration or requiring a `/calibration`
+bind mount. It retains the same source/runtime configuration checksums,
+calibration and binary checksums, DAQIRI log, Pod identity, and one-second GPU
+telemetry as the Docker runner.
+
+The suite first performs finite eight-receiver output validation, then runs the
+paced 800-Gbit/s gate, followed by the unconstrained capacity test. Use
+`--skip-maximum` for an initial lower-cost check. Build the image before the
+suite with `build_synthetic_benchmark_image.sh`; rebuilding is unnecessary when
+an identical prebuilt image has been loaded from a registry or `docker save`
+archive. On Runpod, select that prebuilt registry image as the Pod template
+image rather than trying to pull or run it from inside the Pod.
+
 For an 800-Gbit/s processing test, set `num_receivers: 8`, enable the exact
 production processor operations, leave all writers/streams disabled initially,
 and run for at least 300 seconds. Run once at `limited` 100 Gbit/s per receiver
