@@ -198,9 +198,29 @@ cpp_daqiri/scripts/run_b200_benchmark_suite.sh \
     --seconds 300
 ```
 
-Runpod already runs the benchmark image as the Pod container and does not
-provide nested Docker. Clone this repository under `/workspace`, upload the
-dark frame there, and select the native runner:
+Build the SSH-enabled Pod image on the x86 build host after building the
+benchmark image, then push the new tag to a registry Runpod can access:
+
+```bash
+docker build -f Dockerfile.runpod \
+    --build-arg STEM_BENCHMARK_IMAGE=stem_daqiri:synthetic-amd64 \
+    -t ghcr.io/jerenner/stem-daqiri:cuda13-b200-runpod .
+docker push ghcr.io/jerenner/stem-daqiri:cuda13-b200-runpod
+```
+
+Use that new tag as the Pod container image and expose `22/tcp`. If the GHCR
+package is private, configure Runpod registry credentials before updating the
+Pod. The image reads Runpod's `PUBLIC_KEY` environment variable on startup,
+allows key-only SSH, and remains running for interactive benchmark launches.
+It refuses to start without a public key rather than opening password access.
+The inherited NVIDIA entrypoint still initializes the CUDA environment.
+Changing a Pod's image resets its container disk, so keep the checkout, dark
+frame, and benchmark results in `/workspace` if a persistent volume is
+configured. Runpod runs the benchmark image as the Pod container, so no nested
+Docker is needed. Clone this repository under `/workspace`, upload the dark
+frame there, and select the native runner.
+
+Once connected to the Pod:
 
 ```bash
 cd /workspace/stem_networking_bench

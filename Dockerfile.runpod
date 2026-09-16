@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1
+
+# Add interactive Pod access without changing the benchmark image or its CUDA build.
+ARG STEM_BENCHMARK_IMAGE=stem_daqiri:synthetic-amd64
+FROM ${STEM_BENCHMARK_IMAGE}
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server \
+    && rm -f /etc/ssh/ssh_host_* \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY cpp_daqiri/runpod/start-ssh.sh /usr/local/bin/stem-runpod-start
+RUN chmod 755 /usr/local/bin/stem-runpod-start
+
+EXPOSE 22/tcp
+CMD ["/usr/local/bin/stem-runpod-start"]
