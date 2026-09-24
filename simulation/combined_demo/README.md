@@ -13,11 +13,13 @@ The combined movie follows one continuous workflow:
 
 1. a focused electron probe crosses the explicit LMTO lattice;
 2. synchronized HAADF and DOEELS branches measure structure and energy loss;
-3. eight detector sources send native equal-payload tiles to DAQIRI;
-4. packet metadata places the 192 ZLP and 768 CoreLoss tiles into their
-   different native geometries in a GPU-resident frame;
-5. GPU correction, electron counting, edge fitting, and accumulation overlap
-   acquisition;
+3. the sketched target schedule groups RX0-3 under FPGA 0 and RX4-7 under
+   FPGA 1;
+4. four readout phases each complete one left-to-right ZLP read while
+   contiguous CoreLoss bands fill inward from the top and bottom, adding one
+   quarter of CoreLoss per phase in a GPU-resident frame;
+5. single frames form processing buckets before GPU correction, electron
+   counting, edge fitting, and accumulation overlap acquisition;
 6. registered HAADF, Mn, O, and Ti maps update in the simulation's
    left-to-right, `x`-fast raster order.
 
@@ -25,14 +27,21 @@ The raw pixels, spectrum, structure, and final maps are the same generated
 200 keV simulation products used by `simulation/demo`. The native target
 layout has 960 tiles per frame: 192 `128 x 32`-pixel ZLP tiles over the first
 768 columns and 768 `32 x 128`-pixel CoreLoss tiles over the remaining 3,072
-columns. Every tile carries 4,096 samples. Packet motion and the rate at which
-maps are revealed are explanatory animation, not a measured timing trace.
+columns. Every tile carries 4,096 samples. Each intended phase completes one
+192-column ZLP read at the same time as four CoreLoss tile rows from each outer
+edge (eight of 32 rows, or one quarter of the CoreLoss area). This sequence and
+the vertical microscope layout follow the collaborator's two sketches. Packet
+motion and the rate at which maps are revealed are explanatory animation, not a
+measured timing trace.
 
 The receiver also has a temporary compatibility mode for the row-shaped
 3,840-sample payloads emitted by the current test transmitter. That mode maps
 the first 120 packet ordinals from each source onto the same native tile
-geometry and fills the missing 256 samples by repeating the payload prefix. It
-is deliberately not presented as the target detector format in the movie.
+geometry and fills the missing 256 samples by repeating the payload prefix. Its
+current compact tile-index mapping is linear, so it does not reproduce the
+sketched two-FPGA interleave shown in the movie. No DAQIRI receiver mapping was
+changed for this presentation update; the actual source/ordinal-to-tile
+assignment still needs confirmation with the detector collaborators.
 
 ## Render
 

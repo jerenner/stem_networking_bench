@@ -749,14 +749,20 @@ def _processing_assets(
     axes[0].set_yscale("symlog", linthresh=10)
     _style_axis(axes[0], "Zero-loss and low-loss: integrated signal")
     core = (energy >= 420) & (energy <= 700)
+    core_energy = energy[core]
+    rebin_channels = 4
+    usable_channels = core_energy.size - core_energy.size % rebin_channels
+    rebinned_energy = core_energy[:usable_channels].reshape(-1, rebin_channels).mean(axis=1)
+    rebinned_counted = counted[core][:usable_channels].reshape(-1, rebin_channels).sum(axis=1)
+    rebin_width_eV = float(np.median(np.diff(energy)) * rebin_channels)
     axes[1].step(
-        energy[core],
-        counted[core],
+        rebinned_energy,
+        rebinned_counted,
         where="mid",
         color=CREAM,
-        lw=1.0,
-        alpha=0.78,
-        label="counted data",
+        lw=1.2,
+        alpha=0.88,
+        label=f"counted data ({rebin_width_eV:.1f} eV bins)",
     )
     component_counts = sweep["reconstruction/counted_component_counts"][
         exposure_index, 0, example_row, example_column
@@ -772,17 +778,21 @@ def _processing_assets(
         index = labels.index(component)
         curve = component_counts[index] * profiles[index]
         fitted_total += curve
-        axes[1].plot(energy[core], curve[core], color=color, lw=1.8, label=f"{label} fit")
+        rebinned_curve = curve[core][:usable_channels].reshape(-1, rebin_channels).sum(axis=1)
+        axes[1].plot(rebinned_energy, rebinned_curve, color=color, lw=1.8, label=f"{label} fit")
+    rebinned_fitted_total = (
+        fitted_total[core][:usable_channels].reshape(-1, rebin_channels).sum(axis=1)
+    )
     axes[1].plot(
-        energy[core],
-        fitted_total[core],
+        rebinned_energy,
+        rebinned_fitted_total,
         color=CYAN,
         lw=1.3,
         ls="--",
         label="combined fit",
     )
-    ymax = max(float(np.max(counted[core])), float(np.max(fitted_total[core])), 1.0)
-    ymin = min(float(np.min(counted[core])), -1.0)
+    ymax = max(float(np.max(rebinned_counted)), float(np.max(rebinned_fitted_total)), 1.0)
+    ymin = min(float(np.min(rebinned_counted)), -1.0)
     axes[1].set_ylim(ymin * 1.12, ymax * 1.25)
     for value, label, color in (
         (456, "Ti begins", RED),
@@ -791,14 +801,15 @@ def _processing_assets(
     ):
         axes[1].axvline(value, color=color, lw=0.9, alpha=0.65)
         axes[1].text(value + 3, ymax * 1.04, label, color=color, fontsize=8)
-    _style_axis(axes[1], "Core-loss: element edges visible on the counted-data scale")
+    _style_axis(axes[1], "Core-loss: count-preserving energy rebin for readability")
     for axis in axes:
         axis.set_xlabel("energy loss ΔE (eV)", color=MUTED)
-        axis.set_ylabel("reconstructed counts", color=MUTED)
         axis.grid(color="#35505d", alpha=0.18)
         axis.legend(fontsize=8, facecolor=PANEL, edgecolor="#35505d", labelcolor=CREAM)
+    axes[0].set_ylabel("reconstructed counts", color=MUTED)
+    axes[1].set_ylabel(f"counts per {rebin_width_eV:.1f} eV bin", color=MUTED)
     figure.suptitle(
-        f"Reconstructed spectrum at one {element}-rich probe after {integrations:,} short readouts",
+        f"Reconstructed spectrum at one {element}-rich probe after {integrations:,} detector frames",
         color=CREAM,
         fontsize=17,
     )
@@ -844,6 +855,8 @@ def _processing_assets(
             label: float(example_component_counts[labels.index(component)])
             for component, label, _ in focus
         },
+        "coreloss_rebin_channels": rebin_channels,
+        "coreloss_rebin_eV": rebin_width_eV,
     }
 
 

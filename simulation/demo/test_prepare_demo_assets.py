@@ -80,6 +80,8 @@ class LMTOAssetTests(unittest.TestCase):
             "final_ti.png",
         }
         self.assertTrue(required_assets.issubset(set(metadata["assets"])))
+        self.assertEqual(metadata["spectrum_example"]["coreloss_rebin_channels"], 4)
+        self.assertGreater(metadata["spectrum_example"]["coreloss_rebin_eV"], 1.0)
 
 
 if __name__ == "__main__":

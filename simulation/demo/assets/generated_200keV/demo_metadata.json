@@ -459,6 +459,8 @@
   },
   "spectrum_example": {
     "column": 12,
+    "coreloss_rebin_channels": 4,
+    "coreloss_rebin_eV": 4.0,
     "fitted_edge_counts": {
       "Mn L\u2082,\u2083": 514.7780151367188,
       "O K": 443.3965148925781,

@@ -19,6 +19,7 @@ from manim import (
     Arrow,
     Circle,
     Create,
+    CubicBezier,
     Dot,
     FadeIn,
     FadeOut,
@@ -60,6 +61,16 @@ def _asset_directory() -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     return Path(__file__).resolve().parents[1] / "demo" / "assets" / "generated_200keV"
+
+
+def phase_tile_rows(source: int, phase: int) -> tuple[int, int]:
+    """Return the ZLP and CoreLoss tile rows for one sketched readout phase."""
+    if not 0 <= source < 8 or not 0 <= phase < 4:
+        raise ValueError("source must be 0..7 and phase must be 0..3")
+    channel = source % 4
+    zlp_row = channel if source < 4 else 7 - channel
+    core_row = phase * 4 + channel if source < 4 else 31 - phase * 4 - channel
+    return zlp_row, core_row
 
 
 class CombinedDemoScene(Scene):
@@ -172,8 +183,8 @@ class CombinedDemoScene(Scene):
         if self.mobjects:
             self.play(FadeOut(Group(*self.mobjects)), run_time=run_time)
 
-    def native_tiled_frame(self, width: float = 6.6) -> tuple[Group, list[VGroup]]:
-        """Overlay the native 192-ZLP + 768-CoreLoss tile geometry on a raw frame."""
+    def native_tiled_frame(self, width: float = 6.6) -> tuple[Group, list[list[VGroup]]]:
+        """Overlay the intended two-FPGA tile schedule on a raw frame."""
         with Image.open(self.assets / "raw_detector_frame.png") as source:
             pixels = np.asarray(source.convert("RGBA"))
         height_px, width_px = pixels.shape[:2]
@@ -190,7 +201,7 @@ class CombinedDemoScene(Scene):
             stroke_color=ORANGE,
             stroke_width=1.5,
         ).move_to(image)
-        source_covers = [VGroup() for _ in range(8)]
+        phase_source_covers = [[VGroup() for _ in range(8)] for _ in range(4)]
         grid = VGroup()
 
         def tile_rectangle(
@@ -198,7 +209,8 @@ class CombinedDemoScene(Scene):
             column: int,
             tile_rows: int,
             tile_columns: int,
-            tile_index: int,
+            source: int,
+            phase: int,
         ) -> Rectangle:
             tile_width = image.width / tile_columns
             tile_height = image.height / tile_rows
@@ -207,32 +219,29 @@ class CombinedDemoScene(Scene):
                 height=tile_height + 0.006,
                 fill_color=BACKGROUND,
                 fill_opacity=0.97,
-                stroke_width=0,
+                stroke_color=CYAN if source < 4 else ORANGE,
+                stroke_width=0.18,
             )
             cover.move_to(
                 image.get_corner(UP + LEFT)
                 + RIGHT * (column + 0.5) * tile_width
                 + DOWN * (row + 0.5) * tile_height
             )
-            source_covers[tile_index // 120].add(cover)
+            phase_source_covers[phase][source].add(cover)
             return cover
 
         covers = VGroup()
-        tile_index = 0
-        # ZLP: first 768 columns, four repeated 192-column lanes. Native
-        # packets are tall, narrow 128-row x 32-column tiles.
-        for row in range(8):
-            for column in range(24):
-                cover = tile_rectangle(row, column, 8, 120, tile_index)
-                covers.add(cover)
-                tile_index += 1
-        # CoreLoss: remaining 3,072 columns. Native packets are short, wide
-        # 32-row x 128-column tiles.
-        for row in range(32):
-            for column in range(24):
-                cover = tile_rectangle(row, column + 6, 32, 30, tile_index)
-                covers.add(cover)
-                tile_index += 1
+        # Match the collaborator's sketch: a complete 192-column ZLP read
+        # appears alongside contiguous CoreLoss bands at the top and bottom.
+        # Each phase adds four CoreLoss tile rows from each edge (8/32 = 25%)
+        # and the next six ZLP tile columns (6/24 = one complete read).
+        for source in range(8):
+            for phase in range(4):
+                zlp_row, core_row = phase_tile_rows(source, phase)
+                for column in range(24):
+                    covers.add(tile_rectangle(core_row, column + 6, 32, 30, source, phase))
+                for column in range(6):
+                    covers.add(tile_rectangle(zlp_row, phase * 6 + column, 8, 120, source, phase))
 
         left = image.get_left()[0]
         right = image.get_right()[0]
@@ -254,7 +263,7 @@ class CombinedDemoScene(Scene):
         for lane in range(5):
             x = left + image.width * 0.05 * lane
             grid.add(Line([x, bottom, 0], [x, top, 0], color=ORANGE, stroke_width=1.0))
-        return Group(image, covers, grid, frame), source_covers
+        return Group(image, covers, grid, frame), phase_source_covers
 
     def map_pixel_covers(
         self, image: ImageMobject, rows: int = 16, columns: int = 16
@@ -337,21 +346,23 @@ class CombinedDemoScene(Scene):
 
     def microscope_segment(self) -> None:
         title = self.title("One probe position produces structure and chemistry", "01 / microscope")
-        column_x = -4.85
+        # The physical column follows the collaborator's setup sketch: probe,
+        # specimen, annular HAADF, entrance aperture, prism, then silicon.
+        column_x = -3.55
         source = Circle(
             radius=0.28,
             fill_color=PANEL_ALT,
             fill_opacity=1,
             stroke_color=CYAN,
             stroke_width=2,
-        ).move_to([column_x, 2.25, 0])
+        ).move_to([column_x, 2.3, 0])
         source_label = Text("e-", color=CYAN, font_size=18, weight="BOLD").move_to(source)
         beam_axis = Line(
-            [column_x, 1.98, 0], [column_x, -1.05, 0], color="#35505d", stroke_width=1.2
+            [column_x, 2.02, 0], [column_x, -0.58, 0], color="#35505d", stroke_width=1.2
         )
         convergence = VGroup(
-            Line([column_x - 0.3, 1.96, 0], [column_x - 0.06, 1.23, 0], color=CYAN),
-            Line([column_x + 0.3, 1.96, 0], [column_x + 0.06, 1.23, 0], color=CYAN),
+            Line([column_x - 0.27, 2.01, 0], [column_x - 0.06, 1.6, 0], color=CYAN),
+            Line([column_x + 0.27, 2.01, 0], [column_x + 0.06, 1.6, 0], color=CYAN),
         )
         scan_coils = VGroup(
             Rectangle(
@@ -360,27 +371,27 @@ class CombinedDemoScene(Scene):
                 fill_color=BLUE,
                 fill_opacity=0.85,
                 stroke_width=0,
-            ).move_to([column_x - 0.38, 1.72, 0]),
+            ).move_to([column_x - 0.36, 1.83, 0]),
             Rectangle(
                 width=0.42,
                 height=0.16,
                 fill_color=BLUE,
                 fill_opacity=0.85,
                 stroke_width=0,
-            ).move_to([column_x + 0.38, 1.72, 0]),
+            ).move_to([column_x + 0.36, 1.83, 0]),
         )
-        probe_label = Text("scan coils + focused probe", color=MUTED, font_size=12).move_to(
-            [column_x + 1.55, 1.82, 0]
+        probe_label = Text("focused probe", color=MUTED, font_size=12).move_to(
+            [column_x + 1.35, 2.08, 0]
         )
         sample_box = RoundedRectangle(
-            width=2.65,
-            height=0.82,
+            width=3.3,
+            height=0.72,
             corner_radius=0.12,
             fill_color=PANEL,
             fill_opacity=0.7,
             stroke_color=YELLOW,
             stroke_width=1.5,
-        ).move_to([column_x, 0.8, 0])
+        ).move_to([column_x, 1.24, 0])
         atoms = VGroup()
         atom_colors = (YELLOW, GREEN, BLUE, RED, BLUE)
         for row in range(2):
@@ -391,26 +402,26 @@ class CombinedDemoScene(Scene):
                 )
                 atom.move_to(
                     sample_box.get_corner(UP + LEFT)
-                    + RIGHT * (0.3 + column * 0.34)
-                    + DOWN * (0.27 + row * 0.3)
+                    + RIGHT * (0.39 + column * 0.42)
+                    + DOWN * (0.22 + row * 0.27)
                 )
                 atoms.add(atom)
         sample_label = Text("LMTO lattice", color=CREAM, font_size=13).next_to(
-            sample_box, DOWN, buff=0.12
+            sample_box, LEFT, buff=0.18
         )
         haadf = Annulus(
-            inner_radius=0.22,
-            outer_radius=0.55,
+            inner_radius=0.2,
+            outer_radius=0.48,
             fill_color=CREAM,
             fill_opacity=0.75,
             stroke_color=CREAM,
             stroke_width=1.0,
-        ).move_to([column_x, -0.35, 0])
+        ).move_to([column_x, 0.17, 0])
         haadf_label = Text("annular HAADF", color=CREAM, font_size=13).next_to(
             haadf, LEFT, buff=0.18
         )
-        haadf_signal = self.stage_box("STRUCTURE", "HAADF intensity", CREAM, 2.25, 0.86).move_to(
-            [-1.75, 0.15, 0]
+        haadf_signal = self.stage_box("STRUCTURE", "HAADF intensity", CREAM, 2.35, 0.86).move_to(
+            [-0.48, 0.17, 0]
         )
         haadf_readout = Arrow(
             haadf.get_right(), haadf_signal.get_left(), buff=0.1, color=CREAM, stroke_width=2.4
@@ -421,28 +432,28 @@ class CombinedDemoScene(Scene):
             fill_opacity=1,
             stroke_color=ORANGE,
             stroke_width=2,
-        ).move_to([column_x, -1.05, 0])
+        ).move_to([column_x, -0.55, 0])
         entrance_label = Text("EELS entrance aperture", color=MUTED, font_size=11).next_to(
             entrance, LEFT, buff=0.16
         )
         spectrometer = self.stage_box(
-            "MAGNETIC PRISM", "disperse by energy", ORANGE, 2.5, 0.86
-        ).move_to([column_x, -1.72, 0])
+            "MAGNETIC PRISM", "disperse by energy", ORANGE, 3.1, 0.76
+        ).move_to([column_x, -1.1, 0])
         silicon_frame = RoundedRectangle(
-            width=1.36,
-            height=1.2,
+            width=3.45,
+            height=0.74,
             corner_radius=0.08,
             fill_color=PANEL,
             fill_opacity=1,
             stroke_color=BLUE,
             stroke_width=2,
-        ).move_to([-1.35, -1.72, 0])
+        ).move_to([-2.12, -2.45, 0])
         silicon_pixels = VGroup()
-        for row in range(5):
-            for column in range(6):
+        for row in range(3):
+            for column in range(12):
                 cell = Rectangle(
-                    width=0.17,
-                    height=0.16,
+                    width=0.25,
+                    height=0.15,
                     fill_color=BLUE if column < 2 else ORANGE,
                     fill_opacity=0.5 + 0.08 * ((row + column) % 3),
                     stroke_color="#35505d",
@@ -450,21 +461,64 @@ class CombinedDemoScene(Scene):
                 )
                 cell.move_to(
                     silicon_frame.get_corner(UP + LEFT)
-                    + RIGHT * (0.22 + column * 0.185)
-                    + DOWN * (0.22 + row * 0.18)
+                    + RIGHT * (0.25 + column * 0.27)
+                    + DOWN * (0.22 + row * 0.17)
                 )
                 silicon_pixels.add(cell)
-        silicon_label = Text("pixelated silicon DOEELS camera", color=BLUE, font_size=12).next_to(
-            silicon_frame, DOWN, buff=0.12
+        silicon_label = Text("silicon camera", color=BLUE, font_size=12).next_to(
+            silicon_frame, LEFT, buff=0.16
         )
-        dispersed_path = ArcBetweenPoints(
-            spectrometer.get_right(), silicon_frame.get_left(), angle=-0.42, color=ORANGE
+        detector_region_labels = VGroup(
+            Text("ZLP", color=BLUE, font_size=11, weight="BOLD").move_to(
+                silicon_frame.get_top() + DOWN * 0.11 + LEFT * 1.35
+            ),
+            Text("CoreLoss", color=ORANGE, font_size=11, weight="BOLD").move_to(
+                silicon_frame.get_top() + DOWN * 0.11 + RIGHT * 0.48
+            ),
         )
+        detector_divider = Line(
+            silicon_frame.get_top() + LEFT * 1.035,
+            silicon_frame.get_bottom() + LEFT * 1.035,
+            color=CREAM,
+            stroke_width=1.1,
+        )
+        prism_exit = spectrometer.get_bottom()
+        zlp_landing = np.array([prism_exit[0], silicon_frame.get_top()[1], 0.0])
+        dispersed_paths = VGroup(
+            Line(
+                prism_exit,
+                zlp_landing,
+                color=BLUE,
+                stroke_width=3.0,
+            ),
+            CubicBezier(
+                prism_exit,
+                prism_exit + DOWN * 0.24,
+                silicon_frame.get_top() + LEFT * 1.19 + UP * 0.12,
+                silicon_frame.get_top() + LEFT * 1.1,
+                color=CYAN,
+                stroke_width=3.0,
+            ),
+            CubicBezier(
+                prism_exit,
+                prism_exit + DOWN * 0.24,
+                silicon_frame.get_top() + LEFT * 0.08 + UP * 0.04,
+                silicon_frame.get_top() + RIGHT * 0.72,
+                color=ORANGE,
+                stroke_width=3.0,
+            ),
+        )
+        dispersion_note = Text(
+            "more energy loss\nmore deflection",
+            color=MUTED,
+            font_size=12,
+            line_spacing=0.9,
+        ).move_to([0.05, -1.58, 0])
         daqiri = self.stage_box("DAQIRI", "packets to GPU", CYAN, 2.05, 0.92).move_to(
-            [1.25, -1.72, 0]
+            [1.63, -2.45, 0]
         )
         live = self.stage_box("LIVE PRODUCTS", "spectra + maps", GREEN, 2.35, 0.92).move_to(
-            [4.2, -1.72, 0]
+            [4.73, -2.45, 0]
         )
         camera_to_daqiri = Arrow(
             silicon_frame.get_right(), daqiri.get_left(), buff=0.08, color=CYAN, stroke_width=2.7
@@ -476,7 +530,10 @@ class CombinedDemoScene(Scene):
             source.get_bottom(), sample_box.get_top(), color=CYAN, stroke_width=2.5
         )
         transmitted_path = Line(
-            sample_box.get_bottom(), spectrometer.get_top(), color=ORANGE, stroke_width=2.2
+            sample_box.get_bottom(), entrance.get_center(), color=ORANGE, stroke_width=2.2
+        )
+        prism_input_path = Line(
+            entrance.get_center(), spectrometer.get_top(), color=ORANGE, stroke_width=2.2
         )
         scattered_paths = VGroup(
             Line(sample_box.get_bottom(), haadf.get_center() + LEFT * 0.4, color=CREAM),
@@ -513,10 +570,14 @@ class CombinedDemoScene(Scene):
             FadeIn(entrance),
             FadeIn(entrance_label),
             Create(transmitted_path),
+            Create(prism_input_path),
             FadeIn(spectrometer),
-            Create(dispersed_path),
+            Create(dispersed_paths),
+            FadeIn(dispersion_note),
             FadeIn(silicon_frame),
             FadeIn(silicon_pixels),
+            Create(detector_divider),
+            FadeIn(detector_region_labels),
             FadeIn(silicon_label),
             FadeIn(daqiri),
             FadeIn(live),
@@ -546,17 +607,31 @@ class CombinedDemoScene(Scene):
             ),
             run_time=1.0,
         )
+        self.play(
+            LaggedStart(
+                *[
+                    MoveAlongPath(electron, prism_input_path, run_time=0.65)
+                    for electron in transmitted_electrons
+                ],
+                lag_ratio=0.1,
+            ),
+            run_time=0.9,
+        )
         dispersed_electrons = VGroup(
-            *[Dot(dispersed_path.get_start(), radius=0.045, color=ORANGE) for _ in range(4)]
+            *[
+                Dot(path.get_start(), radius=0.045, color=color)
+                for path, color in zip(dispersed_paths, (BLUE, CYAN, ORANGE))
+                for _ in range(2)
+            ]
         )
         self.add(dispersed_electrons)
         self.play(
             LaggedStart(
                 *[
-                    MoveAlongPath(electron, dispersed_path, run_time=0.7)
-                    for electron in dispersed_electrons
+                    MoveAlongPath(electron, dispersed_paths[index // 2], run_time=0.75)
+                    for index, electron in enumerate(dispersed_electrons)
                 ],
-                lag_ratio=0.14,
+                lag_ratio=0.1,
             ),
             run_time=1.2,
         )
@@ -575,14 +650,14 @@ class CombinedDemoScene(Scene):
             VGroup(
                 self.chip("16 x 16", "registered probe positions", CYAN, 3.2),
                 self.chip(
-                    f"{scan['integrations_per_position']:,}",
-                    "short readouts per point",
+                    f"{scan['integrations_per_position']:,} frames",
+                    "single-frame readouts per point",
                     BLUE,
                     3.2,
                 ),
                 self.chip(f"{scan['dwell_ms']:.1f} ms", "dwell per point", ORANGE, 3.2),
                 self.chip(
-                    f"{scan['electrons_per_position'] / 1e6:.3f} million",
+                    "> 6 million",
                     "incident electrons per point",
                     GREEN,
                     3.2,
@@ -604,9 +679,13 @@ class CombinedDemoScene(Scene):
         source_labels = VGroup()
         lane_paths = VGroup()
         packet_dots = VGroup()
+        fpga_colors = (CYAN, ORANGE)
         for index in range(8):
             y = 2.1 - index * 0.48
-            label = Text(f"RX{index}", color=MUTED, font_size=12).move_to(LEFT * 6.25 + UP * y)
+            group_color = fpga_colors[index // 4]
+            label = Text(f"RX{index}", color=group_color, font_size=12, weight="BOLD").move_to(
+                LEFT * 6.25 + UP * y
+            )
             lane = Line(
                 LEFT * 5.85 + UP * y,
                 LEFT * 3.25 + UP * y,
@@ -617,13 +696,37 @@ class CombinedDemoScene(Scene):
                 width=0.32,
                 height=0.13,
                 corner_radius=0.02,
-                fill_color=CYAN if index < 4 else ORANGE,
+                fill_color=group_color,
                 fill_opacity=1,
                 stroke_width=0,
             ).move_to(lane.get_start())
             source_labels.add(label)
             lane_paths.add(lane)
             packet_dots.add(packet)
+        fpga_panels = VGroup(
+            RoundedRectangle(
+                width=3.68,
+                height=1.92,
+                corner_radius=0.1,
+                fill_color=CYAN,
+                fill_opacity=0.05,
+                stroke_color=CYAN,
+                stroke_width=1.0,
+            ).move_to([-4.82, 1.38, 0]),
+            RoundedRectangle(
+                width=3.68,
+                height=1.92,
+                corner_radius=0.1,
+                fill_color=ORANGE,
+                fill_opacity=0.05,
+                stroke_color=ORANGE,
+                stroke_width=1.0,
+            ).move_to([-4.82, -0.54, 0]),
+        )
+        fpga_labels = VGroup(
+            Text("FPGA 0", color=CYAN, font_size=11, weight="BOLD").move_to([-5.7, 2.43, 0]),
+            Text("FPGA 1", color=ORANGE, font_size=11, weight="BOLD").move_to([-5.7, 0.51, 0]),
+        )
         gpu = RoundedRectangle(
             width=1.75,
             height=4.35,
@@ -642,7 +745,7 @@ class CombinedDemoScene(Scene):
             .arrange(DOWN, buff=0.1)
             .move_to(gpu)
         )
-        tiled_frame, source_covers = self.native_tiled_frame(width=6.6)
+        tiled_frame, phase_source_covers = self.native_tiled_frame(width=6.6)
         tiled_frame.move_to(RIGHT * 3.25 + UP * 0.42)
         image = tiled_frame[0]
         zlp_label = Text(
@@ -658,10 +761,10 @@ class CombinedDemoScene(Scene):
             line_spacing=0.86,
         ).move_to(image.get_top() + UP * 0.34 + RIGHT * image.width * 0.1)
         frame_note = Text(
-            "8 sources x 120 tiles = 960 packets per frame  |  4,096 samples per tile",
+            "FPGA 0 / RX0-3: top half     FPGA 1 / RX4-7: bottom half",
             color=MUTED,
-            font_size=11,
-        ).next_to(tiled_frame, DOWN, buff=0.12)
+            font_size=10.5,
+        ).move_to([3.25, -1.27, 0])
         header = RoundedRectangle(
             width=4.7,
             height=0.72,
@@ -670,7 +773,7 @@ class CombinedDemoScene(Scene):
             fill_opacity=1,
             stroke_color=ORANGE,
             stroke_width=1.2,
-        ).move_to(RIGHT * 2.15 + DOWN * 1.75)
+        ).move_to(RIGHT * 2.15 + DOWN * 1.88)
         header_text = Text(
             "header: frame ID  |  source  |  tile ordinal  |  payload",
             color=CREAM,
@@ -678,6 +781,8 @@ class CombinedDemoScene(Scene):
         ).move_to(header)
         self.play(
             FadeIn(title),
+            FadeIn(fpga_panels),
+            FadeIn(fpga_labels),
             FadeIn(source_labels),
             Create(lane_paths),
             FadeIn(packet_dots),
@@ -700,15 +805,26 @@ class CombinedDemoScene(Scene):
             run_time=1.4,
         )
         self.play(FadeIn(header), FadeIn(header_text), run_time=0.45)
-        self.play(
-            LaggedStart(
-                *[FadeOut(covers, run_time=0.42) for covers in source_covers],
-                lag_ratio=0.34,
-            ),
-            run_time=2.7,
-        )
+        phase_label = None
+        for phase, source_groups in enumerate(phase_source_covers):
+            next_label = Text(
+                f"ZLP read {phase + 1} complete  +  CoreLoss {(phase + 1) * 25}%",
+                color=CREAM,
+                font_size=12,
+            ).move_to([3.25, -1.02, 0])
+            animations = [
+                AnimationGroup(
+                    *[FadeOut(covers, run_time=0.55) for covers in source_groups],
+                    lag_ratio=0,
+                ),
+                FadeIn(next_label),
+            ]
+            if phase_label is not None:
+                animations.append(FadeOut(phase_label))
+            self.play(*animations, run_time=0.65)
+            phase_label = next_label
         caption = self.caption(
-            "The ZLP and CoreLoss regions use different tile shapes with the same payload size.",
+            "Top and bottom arrive together; each ZLP read completes with one CoreLoss quarter.",
             ORANGE,
         )
         self.play(FadeIn(caption))
@@ -719,13 +835,14 @@ class CombinedDemoScene(Scene):
         title = self.title("Acquisition and analysis overlap on the GPU", "04 / streaming path")
         stages = (
             VGroup(
-                self.stage_box("CAMERA", "short frames", BLUE, 2.15),
-                self.stage_box("DAQIRI", "receive + assemble", CYAN, 2.35),
-                self.stage_box("CORRECT", "pedestal + mask", GREEN, 2.35),
-                self.stage_box("COUNT", "electron events", ORANGE, 2.2),
-                self.stage_box("ACCUMULATE", "spectra + maps", YELLOW, 2.45),
+                self.stage_box("CAMERA", "single frames", BLUE, 1.75),
+                self.stage_box("DAQIRI", "receive + assemble", CYAN, 2.0),
+                self.stage_box("BUCKET", "frame stacks", CREAM, 1.85),
+                self.stage_box("CORRECT", "pedestal + mask", GREEN, 2.0),
+                self.stage_box("COUNT", "electron events", ORANGE, 1.8),
+                self.stage_box("ACCUMULATE", "spectra + maps", YELLOW, 2.2),
             )
-            .arrange(RIGHT, buff=0.35)
+            .arrange(RIGHT, buff=0.25)
             .move_to(UP * 0.75)
         )
         links = VGroup(
@@ -743,7 +860,7 @@ class CombinedDemoScene(Scene):
             RIGHT * 1.2 + DOWN * 1.2
         )
         storage_arrow = Arrow(
-            stages[2].get_bottom(),
+            stages[3].get_bottom(),
             storage.get_top(),
             buff=0.1,
             color=MUTED,
@@ -753,12 +870,12 @@ class CombinedDemoScene(Scene):
             RIGHT * 4.55 + DOWN * 1.2
         )
         live_arrow = Arrow(
-            stages[4].get_bottom(), live.get_top(), buff=0.1, color=CYAN, stroke_width=2.4
+            stages[5].get_bottom(), live.get_top(), buff=0.1, color=CYAN, stroke_width=2.4
         )
         self.play(FadeIn(title), FadeIn(stages), Create(links), run_time=0.9)
         moving = []
         dots = VGroup()
-        for index in range(12):
+        for index in range(15):
             link = links[index % len(links)]
             dot = Dot(
                 link.get_start(),
@@ -777,13 +894,13 @@ class CombinedDemoScene(Scene):
             run_time=0.8,
         )
         note = Text(
-            "high-rate data remain on the GPU path",
+            "frame buckets accumulate while acquisition continues",
             color=CREAM,
             font_size=21,
         ).move_to(LEFT * 3.25 + DOWN * 1.25)
         self.play(FadeIn(note))
         caption = self.caption(
-            "Streaming removes the mandatory acquire-write-move-analyze sequence."
+            "Single detector frames are assembled into GPU stacks before correction and counting."
         )
         self.play(FadeIn(caption))
         self.wait(2.8)
