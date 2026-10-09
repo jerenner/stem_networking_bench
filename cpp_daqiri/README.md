@@ -806,6 +806,34 @@ the real FPGA wire payload is confirmed. If the FPGA emits native 4096-sample
 tile payloads, update the RX buffer sizes, MTU/packet-size notes, and
 `ipv4_len` together before setting it false.
 
+For temporary FPGA diagnostics, `stem_rx.payload_size` specifies the actual
+detector-data bytes **after** the 64-byte STEM header. It controls both packet
+length validation and the gather kernel's read limit. If omitted, it defaults
+to 7680 with prefix duplication enabled, or 8192 with duplication disabled.
+Explicit values must be positive, even, and at most 8192 bytes. Synthetic
+sources still require their generated 7680-byte or 8192-byte payloads.
+
+If an FPGA sends an 8192-byte UDP payload that includes the 64-byte STEM header,
+use this temporary configuration for the resulting 8234-byte Ethernet packet:
+
+```yaml
+stem_rx:
+  header_size: 42
+  payload_size: 8128
+  tile_duplicate_prefix_to_simulate_payload: false
+```
+
+Set both RX memory regions to `buf_size: 9018` to keep DAQIRI's calculated MTU
+at 9000, then restart the supervisor after updating its input YAML. The gather
+kernel copies the 4064 available samples into the beginning of each tile and
+leaves its final 32 sample positions zero in the raw assembled frame. This
+does not recover samples overwritten or omitted by the FPGA, or correct a
+shift in sample positions. Dark subtraction and other processing still act on
+those zero-filled positions, so use raw burst output to inspect this temporary
+format. Missing samples within a received tile do not increment the missing
+packet counters. Restore `payload_size: 8192` once the FPGA sends a separate
+64-byte header followed by all 4096 detector samples.
+
 For an HDF5 smoke run, copy the RX config, set `writer.noop: false`, and run at
 a low rate. The HDF5 writer is a debug sink, not the throughput default.
 Use `scripts/compare_h5_outputs.py` to make the HDS/non-HDS parity check a

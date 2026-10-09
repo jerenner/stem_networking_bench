@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "stem_synthetic.h"
+#include "stem_tile_payload.h"
 
 #include <array>
 #include <iostream>
@@ -127,6 +128,34 @@ void check_config_and_clock() {
   bad = cfg; bad.gpu_device = 1; rejects(bad);
   cfg.duration_seconds = -1; cfg.frames_per_tensor = 1; cfg.validate();
 }
+
+void check_tile_payload_sizes() {
+  require(stem::resolve_tile_payload_size(0, true) == 7680,
+          "omitted legacy payload retains its default");
+  require(stem::resolve_tile_payload_size(0, false) == 8192,
+          "omitted native payload retains its default");
+  for (bool duplicate : {false, true}) {
+    const auto size = stem::resolve_tile_payload_size(8128, duplicate);
+    stem::validate_tile_payload_size(size);
+    require(size == 8128, "explicit detector payload takes precedence");
+    require(stem::L4_HEADER_SIZE + stem::STEM_HEADER_SIZE + size == 8234,
+            "short FPGA packet length includes both headers");
+    require(stem::TILE_SAMPLES - size / sizeof(uint16_t) == 32,
+            "short FPGA packet is missing 32 detector samples");
+  }
+  for (uint16_t size : {uint16_t{0}, uint16_t{1}, uint16_t{8129},
+                        uint16_t{8194}, uint16_t{65535}}) {
+    bool rejected = false;
+    try {
+      stem::validate_tile_payload_size(size);
+    } catch (const std::runtime_error&) {
+      rejected = true;
+    }
+    require(rejected, "invalid detector payload accepted");
+  }
+  stem::validate_tile_payload_size(7680);
+  stem::validate_tile_payload_size(8192);
+}
 }  // namespace
 
 int main() {
@@ -137,8 +166,9 @@ int main() {
     }
     check_patterns_and_geometry();
     check_config_and_clock();
+    check_tile_payload_sizes();
     std::cout << "PASS: 510 source layouts, packet headers/checksums, tile coverage, "
-                 "patterns, invalid settings, and pacing debt\n";
+                 "patterns, invalid settings, pacing debt, and short tile payloads\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << "\n";

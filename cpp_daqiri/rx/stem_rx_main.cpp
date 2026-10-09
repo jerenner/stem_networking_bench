@@ -66,6 +66,7 @@
 #include "stem_kernels.h"
 #include "stem_packet.h"
 #include "stem_synthetic_source.h"
+#include "stem_tile_payload.h"
 
 namespace {
 
@@ -141,8 +142,9 @@ struct StemRxConfig {
   // the STEM custom header begins (Eth+IPv4+UDP = 42).
   uint16_t header_size = stem::L4_HEADER_SIZE;
 
-  // Payload (row) size in bytes after the STEM custom header.
-  uint16_t payload_size = stem::STEM_PAYLOAD_SIZE;
+  // Detector-data bytes after the STEM custom header. Zero selects the
+  // legacy/native default from tile_duplicate_prefix_to_simulate_payload.
+  uint16_t payload_size = 0;
 
   // Active source ID bitmask. 0xff (255) accepts all 8 sources.
   uint32_t expected_source_mask = 0xff;
@@ -190,6 +192,11 @@ struct StemRxConfig {
 
   ProcessorConfig processor;
   WriterConfig writer;
+
+  uint16_t effective_payload_size() const {
+    return stem::resolve_tile_payload_size(
+        payload_size, tile_duplicate_prefix_to_simulate_payload);
+  }
 };
 
 WriterConfig parse_writer_cfg(const YAML::Node& root) {
@@ -405,7 +412,10 @@ void apply_stem_rx_node(StemRxConfig& cfg, const YAML::Node& rx) {
   cfg.frames_per_tensor =
       rx["frames_per_tensor"].as<uint32_t>(cfg.frames_per_tensor);
   cfg.header_size = rx["header_size"].as<uint16_t>(cfg.header_size);
-  cfg.payload_size = rx["payload_size"].as<uint16_t>(cfg.payload_size);
+  if (rx["payload_size"]) {
+    cfg.payload_size = rx["payload_size"].as<uint16_t>();
+    stem::validate_tile_payload_size(cfg.payload_size);
+  }
   cfg.expected_source_mask =
       rx["expected_source_mask"].as<uint32_t>(cfg.expected_source_mask);
   cfg.batch_close_slack_packets = rx["batch_close_slack_packets"].as<uint32_t>(
@@ -422,6 +432,7 @@ void apply_stem_rx_node(StemRxConfig& cfg, const YAML::Node& rx) {
 }
 
 void validate_stem_rx_cfg(const StemRxConfig& cfg) {
+  stem::validate_tile_payload_size(cfg.effective_payload_size());
   if (cfg.frames_per_tensor == 0) {
     throw std::runtime_error("stem_rx.frames_per_tensor must be > 0");
   }
@@ -438,7 +449,7 @@ void validate_stem_rx_cfg(const StemRxConfig& cfg) {
     cfg.synthetic.validate();
     if (cfg.hds || !cfg.gpu_header_extract || cfg.capture_latency ||
         cfg.header_size != stem::L4_HEADER_SIZE ||
-        cfg.payload_size != cfg.synthetic.layout.payload_bytes()) {
+        cfg.effective_payload_size() != cfg.synthetic.layout.payload_bytes()) {
       throw std::runtime_error(
           "synthetic packets require hds=false, gpu_header_extract=true, "
           "capture_latency=false, header_size=42, and payload_size matching "
@@ -1921,9 +1932,7 @@ class FrameAssembler {
   }
 
   uint16_t available_payload_len() const {
-    return cfg_.tile_duplicate_prefix_to_simulate_payload
-               ? static_cast<uint16_t>(stem::STEM_PAYLOAD_SIZE)
-               : static_cast<uint16_t>(stem::TILE_PAYLOAD_BYTES);
+    return cfg_.effective_payload_size();
   }
 
   uint16_t packet_header_segment_len() const {
@@ -2292,10 +2301,9 @@ class FrameAssembler {
                           sizeof(stem::PacketPlacement) * pkts_to_gather,
                           cudaMemcpyHostToDevice, stream_));
 
-      // Match Holoscan's contract: tile_duplicate_prefix_to_simulate_payload
-      // fully determines whether each packet exposes a 7680 B test payload or
-      // a native 8192 B tile payload. HDS packet_ptrs already point at seg1
-      // payload byte 0; non-HDS packet_ptrs point at the wire packet base.
+      // The configured wire payload bounds reads. With duplication disabled,
+      // missing tile samples retain the zeros from cudaMemsetAsync above.
+      // HDS pointers start at seg1 payload byte 0; other pointers start at L2.
       stem::stem_gather_tile_packets_by_placement(
           d_pkt_ptrs_, d_placements_, output_slot->gpu_u16,
           available_payload_len(), gather_header_len(), pkts_to_gather,
@@ -2750,15 +2758,13 @@ void rx_worker(const StemRxConfig& cfg, std::shared_ptr<FramePipeline> pipeline,
 }
 
 void print_rx_start(const StemRxConfig& cfg) {
-  const uint16_t gather_available_payload_len =
-      cfg.tile_duplicate_prefix_to_simulate_payload
-          ? static_cast<uint16_t>(stem::STEM_PAYLOAD_SIZE)
-          : static_cast<uint16_t>(stem::TILE_PAYLOAD_BYTES);
+  const uint16_t gather_available_payload_len = cfg.effective_payload_size();
 
   std::cout << "stem_daqiri_rx starting on '" << cfg.interface_name
             << "' frames_per_tensor=" << cfg.frames_per_tensor
             << " header_size=" << cfg.header_size
-            << " payload_size=" << cfg.payload_size << " gpu_header_extract="
+            << " payload_size=" << gather_available_payload_len
+            << " gpu_header_extract="
             << (cfg.gpu_header_extract ? "true" : "false")
             << " hds=" << (cfg.hds ? "true" : "false") << " tile_dup_prefix="
             << (cfg.tile_duplicate_prefix_to_simulate_payload ? "true"
