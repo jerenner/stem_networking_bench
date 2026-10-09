@@ -61,6 +61,7 @@
 
 #include <daqiri/daqiri.h>
 
+#include "stem_arrival_order.h"
 #include "stem_aux_output.h"
 #include "stem_control_server.h"
 #include "stem_kernels.h"
@@ -138,11 +139,16 @@ struct StemRxConfig {
   // emitted output tensor. Matches cpp/stem_receiver_op.h frames_per_tensor.
   uint32_t frames_per_tensor = 128;
 
-  // Wire layout. header_size is the byte offset within a wire packet where
-  // the STEM custom header begins (Eth+IPv4+UDP = 42).
+  // Outer headers before the STEM header or headerless detector payload.
+  // Eth+IPv4+UDP = 42 bytes without VLAN tags or IPv4 options.
   uint16_t header_size = stem::L4_HEADER_SIZE;
 
-  // Detector-data bytes after the STEM custom header. Zero selects the
+  // Diagnostic arrival-order assembly can skip 64 custom bytes or treat
+  // the entire UDP payload as detector data when no STEM header is present.
+  uint16_t stem_header_size = stem::STEM_HEADER_SIZE;
+  bool assemble_by_arrival = false;
+
+  // Detector-data bytes after stem_header_size custom bytes. Zero selects the
   // legacy/native default from tile_duplicate_prefix_to_simulate_payload.
   uint16_t payload_size = 0;
 
@@ -412,6 +418,10 @@ void apply_stem_rx_node(StemRxConfig& cfg, const YAML::Node& rx) {
   cfg.frames_per_tensor =
       rx["frames_per_tensor"].as<uint32_t>(cfg.frames_per_tensor);
   cfg.header_size = rx["header_size"].as<uint16_t>(cfg.header_size);
+  cfg.stem_header_size =
+      rx["stem_header_size"].as<uint16_t>(cfg.stem_header_size);
+  cfg.assemble_by_arrival =
+      rx["assemble_by_arrival"].as<bool>(cfg.assemble_by_arrival);
   if (rx["payload_size"]) {
     cfg.payload_size = rx["payload_size"].as<uint16_t>();
     stem::validate_tile_payload_size(cfg.payload_size);
@@ -433,8 +443,25 @@ void apply_stem_rx_node(StemRxConfig& cfg, const YAML::Node& rx) {
 
 void validate_stem_rx_cfg(const StemRxConfig& cfg) {
   stem::validate_tile_payload_size(cfg.effective_payload_size());
+  if (cfg.stem_header_size != stem::STEM_HEADER_SIZE &&
+      !(cfg.assemble_by_arrival && cfg.stem_header_size == 0)) {
+    throw std::runtime_error(
+        "stem_rx.stem_header_size must be 64, or 0 with assemble_by_arrival=true");
+  }
+  if (static_cast<uint32_t>(cfg.header_size) + cfg.stem_header_size > 65535u) {
+    throw std::runtime_error("stem_rx combined header size exceeds 65535 bytes");
+  }
+  if (cfg.assemble_by_arrival && (cfg.capture_latency || cfg.synthetic_source)) {
+    throw std::runtime_error(
+        "assemble_by_arrival is a network diagnostic and requires "
+        "capture_latency=false and source=network");
+  }
   if (cfg.frames_per_tensor == 0) {
     throw std::runtime_error("stem_rx.frames_per_tensor must be > 0");
+  }
+  if (cfg.assemble_by_arrival && cfg.frames_per_tensor > stem::FRAMES_PER_WRAP) {
+    throw std::runtime_error(
+        "arrival-order frames_per_tensor must be in [1, 128]");
   }
   if ((cfg.expected_source_mask & 0xffu) == 0) {
     throw std::runtime_error(
@@ -1710,6 +1737,7 @@ class FrameAssembler {
                  std::shared_ptr<FramePipeline> pipeline)
       : cfg_(cfg),
         pipeline_(std::move(pipeline)),
+        arrival_sequence_(cfg.expected_source_mask & 0xffu),
         expected_source_count_(
             __builtin_popcount(cfg.expected_source_mask & 0xff)),
         rows_per_tensor_(cfg.frames_per_tensor * stem::FRAME_HEIGHT),
@@ -1731,6 +1759,11 @@ class FrameAssembler {
         cudaMalloc(reinterpret_cast<void**>(&d_placements_),
                    sizeof(stem::PacketPlacement) * placement_capacity_));
     STEM_CUDA_TRY(cudaStreamCreate(&stream_));
+    if (cfg_.assemble_by_arrival) {
+      STEM_CUDA_TRY(cudaEventCreateWithFlags(&arrival_gather_done_,
+                                            cudaEventDisableTiming));
+      arrival_gather_owners_.reserve(16);
+    }
 
     const uint32_t slot_count =
         cfg.writer.noop ? 1 : std::max<uint32_t>(1, cfg.writer.num_concurrent);
@@ -1765,6 +1798,8 @@ class FrameAssembler {
 
   ~FrameAssembler() {
     if (stream_) { cudaStreamSynchronize(stream_); }
+    arrival_gather_owners_.clear();
+    if (arrival_gather_done_) { cudaEventDestroy(arrival_gather_done_); }
     bool slots_busy = true;
     while (slots_busy) {
       slots_busy = false;
@@ -1858,6 +1893,37 @@ class FrameAssembler {
 
     validate_packet_layout_once(burst);
 
+    if (cfg_.assemble_by_arrival) {
+      reclaim_arrival_gather(false);
+      if (cfg_.hds && burst->hdr.hdr.num_segs < 2) {
+        fail_packet_layout("arrival-order HDS requires two packet segments");
+      }
+      for (int i = 0; i < n; ++i) {
+        const int segment = cfg_.hds ? 1 : 0;
+        const auto length = daqiri::get_segment_packet_length(burst, segment, i);
+        const uint32_t expected = available_payload_len() +
+                                  (cfg_.hds ? 0 : packet_header_segment_len());
+        if (static_cast<uint32_t>(length) != expected) {
+          fail_packet_layout("arrival-order packet length mismatch at packet " +
+                             std::to_string(i) + ": got " +
+                             std::to_string(length) + "B expected " +
+                             std::to_string(expected) + "B");
+        }
+        auto* ptr = static_cast<uint8_t*>(
+            daqiri::get_segment_packet_ptr(burst, segment, i));
+        if (ptr == nullptr) {
+          fail_packet_layout("null arrival-order packet pointer");
+        }
+        admit_arrival_packet(ptr, holder);
+        // Close exactly at the bucket boundary, even if a NIC burst spans
+        // several buckets. No received header can stall window progression.
+        if (current_batch_unique_packets_ >= expected_packets_per_batch_) {
+          try_close_batches(frames_assembled);
+        }
+      }
+      return;
+    }
+
     if (cfg_.hds) {
       if (n > 0 && burst->hdr.hdr.num_segs < 2) {
         fail_packet_layout("HDS enabled but burst has " +
@@ -1936,7 +2002,7 @@ class FrameAssembler {
   }
 
   uint16_t packet_header_segment_len() const {
-    return static_cast<uint16_t>(cfg_.header_size + stem::STEM_HEADER_SIZE);
+    return static_cast<uint16_t>(cfg_.header_size + cfg_.stem_header_size);
   }
 
   uint16_t gather_header_len() const {
@@ -2002,8 +2068,13 @@ class FrameAssembler {
       }
       std::cout << "stem_daqiri_rx HDS layout verified: seg0="
                 << actual_header_len << "B seg1=" << actual_payload_len
-                << "B; epoch_us remains in seg0 at byte "
-                << (cfg_.header_size + stem::STEM_HDR_OFF_EPOCH_US) << "\n";
+                << "B";
+      if (cfg_.assemble_by_arrival) {
+        std::cout << "; STEM header decoding disabled\n";
+      } else {
+        std::cout << "; epoch_us remains in seg0 at byte "
+                  << (cfg_.header_size + stem::STEM_HDR_OFF_EPOCH_US) << "\n";
+      }
     } else {
       if (burst->hdr.hdr.num_segs < 1) {
         fail_packet_layout("non-HDS burst has no packet segment");
@@ -2162,13 +2233,33 @@ class FrameAssembler {
 
     const uint64_t abs_frame = unwrap_frame_index(header.frame_index);
 
+    queue_packet(packet_ptr, holder, abs_frame, header.global_row, tile_index,
+                 header.row_number, header.source_id);
+  }
+
+  void admit_arrival_packet(uint8_t* packet_ptr,
+                            const std::shared_ptr<void>& holder) {
+    const auto position = arrival_sequence_.next();
+    stream_synced_ = true;
+    const auto row_number = static_cast<uint16_t>(
+        (position.frame % stem::FRAMES_PER_WRAP) * stem::ROWS_PER_SOURCE +
+        position.row_offset);
+    queue_packet(packet_ptr, holder, position.frame,
+                 static_cast<int16_t>(source_id_to_global_row(
+                     position.source, position.row_offset)),
+                 position.tile, row_number, position.source);
+  }
+
+  void queue_packet(uint8_t* packet_ptr, const std::shared_ptr<void>& holder,
+                     uint64_t abs_frame, int16_t global_row, uint16_t tile_index,
+                     uint16_t row_number, uint16_t source_id) {
     PacketEntry entry;
     entry.packet_ptr = packet_ptr;
     entry.abs_frame = abs_frame;
-    entry.global_row = header.global_row;
+    entry.global_row = global_row;
     entry.tile_index = tile_index;
-    entry.row_number = header.row_number;
-    entry.source_id = header.source_id;
+    entry.row_number = row_number;
+    entry.source_id = source_id;
     entry.holder = holder;
     pending_packets_.push_back(std::move(entry));
 
@@ -2238,6 +2329,7 @@ class FrameAssembler {
   }
 
   void close_batch_and_emit(uint64_t* frames_assembled) {
+    if (cfg_.assemble_by_arrival) { reclaim_arrival_gather(true); }
     const uint64_t batch_end =
         current_batch_start_abs_frame_ + cfg_.frames_per_tensor;
 
@@ -2277,6 +2369,13 @@ class FrameAssembler {
         pl.relative_frame = static_cast<uint8_t>(rel_frame);
         pl.valid = 1;
         h_placements_[pkts_to_gather] = pl;
+        // Retain each consumed burst until the asynchronous gather no longer
+        // reads its packets; arrival-order mode has no header-sync fence.
+        if (cfg_.assemble_by_arrival &&
+            (arrival_gather_owners_.empty() ||
+             arrival_gather_owners_.back() != read_it->holder)) {
+          arrival_gather_owners_.push_back(read_it->holder);
+        }
         pkts_to_gather++;
       }
       // do NOT write_it++ -- this entry is consumed
@@ -2309,6 +2408,10 @@ class FrameAssembler {
           available_payload_len(), gather_header_len(), pkts_to_gather,
           cfg_.frames_per_tensor, stem::FRAME_HEIGHT, stem::FRAME_WIDTH,
           cfg_.tile_duplicate_prefix_to_simulate_payload, stream_);
+      if (cfg_.assemble_by_arrival) {
+        STEM_CUDA_TRY(cudaEventRecord(arrival_gather_done_, stream_));
+        arrival_gather_pending_ = true;
+      }
 
       if (validation_mismatches_) {
         stem::validate_synthetic_frames(
@@ -2326,6 +2429,7 @@ class FrameAssembler {
       metadata.received_packets = pkts_to_gather;
       metadata.expected_packets = expected_packets_per_batch_;
       metadata.complete = pkts_to_gather >= expected_packets_per_batch_;
+      metadata.arrival_order = cfg_.assemble_by_arrival;
       pipeline_->process_slot(output_slot, metadata, stream_);
       output_slot->batch_index = emitted_batches_;
       STEM_CUDA_TRY(cudaEventRecord(output_slot->ready, stream_));
@@ -2336,6 +2440,10 @@ class FrameAssembler {
       // real downstream-visible frames.
       (*frames_assembled) += cfg_.frames_per_tensor;
       emitted_batches_++;
+    }
+
+    if (cfg_.assemble_by_arrival && output_slot == nullptr) {
+      arrival_gather_owners_.clear();
     }
 
     pending_packets_.erase(write_it, pending_packets_.end());
@@ -2377,8 +2485,25 @@ class FrameAssembler {
     }
   }
 
+  void reclaim_arrival_gather(bool wait) {
+    if (!arrival_gather_pending_) { return; }
+    if (wait) {
+      STEM_CUDA_TRY(cudaEventSynchronize(arrival_gather_done_));
+    } else {
+      const auto status = cudaEventQuery(arrival_gather_done_);
+      if (status == cudaErrorNotReady) { return; }
+      STEM_CUDA_TRY(status);
+    }
+    arrival_gather_owners_.clear();
+    arrival_gather_pending_ = false;
+  }
+
   const StemRxConfig& cfg_;
   std::shared_ptr<FramePipeline> pipeline_;
+  stem::ArrivalOrderSequence arrival_sequence_;
+  cudaEvent_t arrival_gather_done_ = nullptr;
+  bool arrival_gather_pending_ = false;
+  std::vector<std::shared_ptr<void>> arrival_gather_owners_;
   const uint32_t expected_source_count_;
   const uint32_t rows_per_tensor_;
   const uint32_t packet_cells_per_frame_;
@@ -2684,6 +2809,9 @@ void rx_worker(const StemRxConfig& cfg, std::shared_ptr<FramePipeline> pipeline,
         secs > 0 ? static_cast<double>(frames_assembled) / secs : 0.0;
 
     std::printf("stem_daqiri_rx complete:\n");
+    if (cfg.assemble_by_arrival) {
+      std::printf("  assembly mode    : arrival_order (synthetic frame boundaries)\n");
+    }
     std::printf("  duration         : %.3f s\n", secs);
     std::printf("  bursts polled    : %lu\n",
                 static_cast<unsigned long>(bursts_polled));
@@ -2763,9 +2891,17 @@ void print_rx_start(const StemRxConfig& cfg) {
   std::cout << "stem_daqiri_rx starting on '" << cfg.interface_name
             << "' frames_per_tensor=" << cfg.frames_per_tensor
             << " header_size=" << cfg.header_size
+            << " stem_header_size=" << cfg.stem_header_size
+            << " assembly="
+            << (cfg.assemble_by_arrival ? "arrival_order" : "header")
+            << " packets_per_frame="
+            << (__builtin_popcount(cfg.expected_source_mask & 0xffu) *
+                stem::TILE_PACKETS_PER_SOURCE)
             << " payload_size=" << gather_available_payload_len
             << " gpu_header_extract="
             << (cfg.gpu_header_extract ? "true" : "false")
+            << " header_decode="
+            << (cfg.assemble_by_arrival ? "disabled" : "enabled")
             << " hds=" << (cfg.hds ? "true" : "false") << " tile_dup_prefix="
             << (cfg.tile_duplicate_prefix_to_simulate_payload ? "true"
                                                               : "false")

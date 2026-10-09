@@ -107,6 +107,7 @@ struct BatchMetadata {
   uint32_t received_packets = 0;
   uint32_t expected_packets = 0;
   bool complete = true;
+  bool arrival_order = false;
 };
 
 struct BurstWriterStats {

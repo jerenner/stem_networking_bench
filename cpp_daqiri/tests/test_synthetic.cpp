@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "stem_synthetic.h"
+#include "stem_arrival_order.h"
 #include "stem_tile_payload.h"
 
 #include <array>
@@ -156,6 +157,50 @@ void check_tile_payload_sizes() {
   stem::validate_tile_payload_size(7680);
   stem::validate_tile_payload_size(8192);
 }
+
+void check_arrival_order() {
+  for (uint32_t mask = 1; mask <= 255; ++mask) {
+    stem::ArrivalOrderSequence sequence(mask);
+    std::vector<uint16_t> sources;
+    for (uint16_t id = 0; id < 8; ++id) {
+      if ((mask >> id) & 1u) { sources.push_back(id); }
+    }
+    const uint32_t packets_per_frame = sources.size() * 120;
+    require(sequence.packets_per_frame() == packets_per_frame,
+            "arrival-order mask controls frame workload");
+    // Vary simulated burst sizes and cross two legacy 128-frame wraps.
+    uint64_t observed = 0;
+    const uint64_t total = 257ull * packets_per_frame + 17;
+    while (observed < total) {
+      const uint64_t burst = std::min<uint64_t>(
+          (observed % 3 == 0) ? 16384 : 127, total - observed);
+      for (uint64_t i = 0; i < burst; ++i, ++observed) {
+        const auto position = sequence.next();
+        const uint32_t tile = observed % packets_per_frame;
+        require(position.frame == observed / packets_per_frame,
+                "arrival-order absolute frames must not wrap");
+        require(position.tile == tile && position.tile < 960,
+                "arrival-order tile bounds and contiguous coverage");
+        require(position.source == sources[tile / 120] &&
+                    position.row_offset == tile % 120,
+                "arrival-order virtual sparse source mapping");
+      }
+    }
+  }
+  stem::ArrivalOrderSequence receiver0(13), receiver1(13);
+  receiver0.next();
+  require(receiver0.next().tile == 1 && receiver1.next().tile == 0,
+          "each receiver has an independent arrival counter");
+  for (uint32_t mask : {0u, 256u, 257u}) {
+    bool rejected = false;
+    try {
+      stem::ArrivalOrderSequence invalid(mask);
+    } catch (const std::runtime_error&) {
+      rejected = true;
+    }
+    require(rejected, "invalid arrival-order source mask accepted");
+  }
+}
 }  // namespace
 
 int main() {
@@ -167,8 +212,10 @@ int main() {
     check_patterns_and_geometry();
     check_config_and_clock();
     check_tile_payload_sizes();
+    check_arrival_order();
     std::cout << "PASS: 510 source layouts, packet headers/checksums, tile coverage, "
-                 "patterns, invalid settings, pacing debt, and short tile payloads\n";
+                 "patterns, invalid settings, pacing debt, short tile payloads, "
+                 "and arrival-order assembly\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << "\n";

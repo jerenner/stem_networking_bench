@@ -454,6 +454,8 @@ struct BurstWriter::Impl {
     write_string_attribute(dataset, "processing_stage",
                            processing_stage_name(job.runtime.stage));
     write_string_attribute(dataset, "interface_name", first.interface_name);
+    write_string_attribute(dataset, "assembly_mode",
+                           first.arrival_order ? "arrival_order" : "header");
     write_string_attribute(dataset, "dtype",
                            output_float ? "float32" : "uint16");
   }
@@ -928,6 +930,8 @@ struct ThinnedStreamPublisher::Impl {
          << (slot.metadata.complete ? "true" : "false")
          << ",\"received_packets\":" << slot.metadata.received_packets
          << ",\"expected_packets\":" << slot.metadata.expected_packets
+         << ",\"assembly_mode\":\""
+         << (slot.metadata.arrival_order ? "arrival_order" : "header") << "\""
          << ",\"processing_stage\":\""
          << processing_stage_name(slot.runtime.stage)
          << "\",\"dtype\":\"float32\",\"byte_order\":\"little\""

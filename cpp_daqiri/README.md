@@ -834,6 +834,69 @@ format. Missing samples within a received tile do not increment the missing
 packet counters. Restore `payload_size: 8192` once the FPGA sends a separate
 64-byte header followed by all 4096 detector samples.
 
+### Headerless / Invalid-Header FPGA Diagnostics
+
+When the FPGA has not populated real STEM header fields, opt into
+`stem_rx.assemble_by_arrival: true`. Each receiver assigns synthetic absolute
+frame and tile indices to **every packet received** in NIC delivery order.
+It does not read STEM fields, filter source IDs, wait for `row_number == 0`,
+discard row offsets 120..127, or unwrap the received row counter. The existing
+GPU tile gather, correction kernels, live view, and HDF5 sinks still run.
+Header extraction and its GPU/CPU transfers are bypassed, so this is a
+receive/gather/processing diagnostic, not a full header-bookkeeping benchmark.
+
+Use the number of enabled bits in `expected_source_mask` to choose the workload:
+there are `120 * popcount(mask)` consecutive tiles per synthetic frame. With
+`0x0d` that is 360 tiles in slots 0..359; the remaining 600 slots stay zero.
+No claim is made about which physical FPGA sources contributed those packets.
+Use `0xff` for 960 tiles filling the entire image. At the same incoming packet
+rate that choice generates fewer frames and therefore less correction work
+per second than the 360-tile test; do not compare the FPS values directly.
+
+The byte layout is independently configurable. If all 8192 UDP payload bytes
+are detector samples, including the bytes formerly interpreted as the STEM
+header, use:
+
+```yaml
+stem_rx:
+  assemble_by_arrival: true
+  header_size: 42
+  stem_header_size: 0
+  payload_size: 8192
+  tile_duplicate_prefix_to_simulate_payload: false
+  expected_source_mask: 13  # 360 tiles/frame; use 255 for all 960
+```
+
+If the first 64 UDP payload bytes should still be skipped, instead use
+`stem_header_size: 64` and `payload_size: 8128`. Both layouts match the observed
+8234-byte Ethernet packet; keep both RX memory regions at `buf_size: 9018`
+for MTU 9000. `stem_header_size` defaults to 64 and may only be zero in this
+diagnostic mode. `assemble_by_arrival` defaults to false. Apply these settings
+to both receivers (including any overriding receiver-specific YAML blocks)
+and restart acquisition after rebuilding the receiver/container.
+For HDS, also set the NIC split boundary to `header_size + stem_header_size`
+(42 or 106 bytes) and size the payload segment for 8192 or 8128 bytes.
+
+For inspection, keep `writer.noop: true` and select
+`burst_writer.processing_stage: raw` and/or
+`thinned_stream.processing_stage: raw`. These expose uint16 raw bursts or
+float32 live-view products without hiding payload structure behind detector
+corrections. The normal processor flags still determine which correction
+kernels run in the background. To test corrected throughput, leave those
+flags enabled and optionally select the corrected output stage. Continuous
+full-frame HDF5 writing can itself limit throughput; prefer a short burst.
+
+These are **synthetic frames, not valid detector acquisitions**. Packet loss
+and reordering cannot be identified or repaired and shift all subsequent
+placements. NIC drop counters remain meaningful, but complete buckets only
+mean that enough packets were observed, not that no data was lost. Shutdown
+can emit a zero-padded incomplete final bucket. Burst dataset attributes and
+live-view metadata label `assembly_mode: arrival_order`; the continuous HDF5
+writer does not carry this label. Do not use these frames as dark calibrations
+or scientific spectra. This mode is refused for `source: synthetic` and for
+packet-stamped latency measurements. Restore header-based assembly once the
+FPGA sends valid metadata.
+
 For an HDF5 smoke run, copy the RX config, set `writer.noop: false`, and run at
 a low rate. The HDF5 writer is a debug sink, not the throughput default.
 Use `scripts/compare_h5_outputs.py` to make the HDS/non-HDS parity check a
