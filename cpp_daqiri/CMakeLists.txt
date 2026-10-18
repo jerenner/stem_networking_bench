@@ -242,6 +242,7 @@ if(STEM_DAQIRI_BUILD_RX)
     configs/stem_rx_igx_loopback_hds.yaml
     configs/stem_replay_hdf5.yaml
     configs/stem_rx_synthetic.yaml
+    configs/stem_instrument_readonly.yaml
   )
 endif()
 
@@ -275,6 +276,12 @@ install(TARGETS ${STEM_DAQIRI_INSTALL_TARGETS}
 )
 if(TARGET stem_daqiri_instrument_mock)
   install(PROGRAMS scripts/validate_mock_instrument.py DESTINATION bin)
+endif()
+if(TARGET stem_daqiri_supervisor)
+  install(PROGRAMS instrument/stem_instrument_readonly.py
+    DESTINATION bin RENAME stem_daqiri_instrument_readonly)
+  install(FILES instrument/requirements.txt
+    DESTINATION share/stem_daqiri RENAME instrument-requirements.txt)
 endif()
 if(STEM_DAQIRI_BUILD_RX)
   install(PROGRAMS scripts/validate_synthetic_rx.py DESTINATION bin)

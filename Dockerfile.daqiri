@@ -96,10 +96,12 @@ RUN rm -rf /workspace/stem/cpp_daqiri/build \
 FROM ${DAQIRI_BASE} AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libhdf5-dev libzmq5 \
+    && apt-get install -y --no-install-recommends libhdf5-dev libzmq5 openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=stem-daqiri-build /opt/stem_daqiri /opt/stem_daqiri
+
+RUN python3 -m pip install --no-cache-dir --break-system-packages pyzmq PyYAML
 
 ENV PATH=/opt/stem_daqiri/bin:${PATH}
 ENV LD_LIBRARY_PATH=/opt/stem_daqiri/lib:/opt/daqiri/lib:${LD_LIBRARY_PATH}

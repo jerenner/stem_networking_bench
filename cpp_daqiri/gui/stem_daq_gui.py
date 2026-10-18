@@ -25,6 +25,7 @@ STREAM_PROTOCOL_DIR = os.path.abspath(
 if STREAM_PROTOCOL_DIR not in sys.path:
     sys.path.insert(0, STREAM_PROTOCOL_DIR)
 from stem_stream_protocol import decode_product  # noqa: E402
+from stem_instrument_protocol import instrument_view, measurement_text  # noqa: E402
 
 
 STAGES = [
@@ -389,6 +390,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs = QtWidgets.QTabWidget()
         tabs.addTab(self._runtime_tab(), "Live controls")
         tabs.addTab(self._restart_tab(), "Apply on restart")
+        tabs.addTab(self._instrument_tab(), "Camera / detector")
         status = QtWidgets.QWidget()
         self.status_text = QtWidgets.QPlainTextEdit()
         self.status_text.setReadOnly(True)
@@ -397,6 +399,105 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(status, "DAQ state")
         layout.addWidget(tabs, 1)
         return panel
+
+    def _instrument_tab(self) -> QtWidgets.QWidget:
+        content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content)
+        self.instrument_badge = Badge("INSTRUMENT OFFLINE")
+        layout.addWidget(self.instrument_badge)
+        description = QtWidgets.QLabel(
+            "Read camera temperatures, bias/supply measurements, and FPGA link "
+            "status through the supervisor. Reads also work while acquisition is stopped."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        self.instrument_operation = QtWidgets.QLabel("No instrument operation")
+        self.instrument_operation.setWordWrap(True)
+        self.instrument_operation.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        layout.addWidget(self.instrument_operation)
+        pages = QtWidgets.QTabWidget()
+        self.instrument_read_buttons = {}
+        self.instrument_read_status = {}
+        for title, name, command, headings in (
+            ("Temperatures", "temperature", "camera.read_temperature", ["Channel", "Readback"]),
+            ("Biases / supplies", "biases", "camera.read_biases", ["Name", "Readback"]),
+            ("FPGA links", "links", "detector.read_link_status", ["Module", "Host", "Status", "Register 420"]),
+        ):
+            page = QtWidgets.QWidget()
+            page_layout = QtWidgets.QVBoxLayout(page)
+            button = QtWidgets.QPushButton("Read " + title.lower())
+            button.clicked.connect(
+                lambda _checked=False, request=command: self.send_control(
+                    "instrument_read", {"command": request}
+                )
+            )
+            button.setEnabled(False)
+            self.instrument_read_buttons[command] = button
+            page_layout.addWidget(button)
+            status = QtWidgets.QLabel("Not read")
+            status.setWordWrap(True)
+            status.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+            page_layout.addWidget(status)
+            self.instrument_read_status[name] = status
+            table = QtWidgets.QTableWidget(0, len(headings))
+            table.setHorizontalHeaderLabels(headings)
+            table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+            table.setMinimumHeight(230)
+            setattr(self, "instrument_" + name + "_table", table)
+            page_layout.addWidget(table)
+            pages.addTab(page, title)
+        layout.addWidget(pages, 1)
+        note = QtWidgets.QLabel(
+            "Temperatures use the camera's Q/B/HS labels (board/head probes). "
+            "Link flags are latched; reading them does not clear status or reset links. "
+            "Hardware mode currently supports reads only."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        return content
+
+    def _update_instrument(self, instrument: dict) -> None:
+        view = instrument_view(instrument)
+        self.instrument_badge.set_state(
+            "{} / {}".format("ONLINE" if view["online"] else "OFFLINE", view["mode"]),
+            view["online"],
+        )
+        operation = view["operation"]
+        busy = operation.get("state") == "running"
+        self.instrument_operation.setText(
+            "{}: {} {}".format(operation.get("name", ""), operation.get("state", "idle"),
+                               operation.get("error", "")).strip(": ")
+        )
+        for command, button in self.instrument_read_buttons.items():
+            button.setEnabled(view["online"] and not busy and command in view["commands"])
+            button.setToolTip(
+                "Configure FPGA module addresses in the server's instrument settings to enable link reads."
+                if command == "detector.read_link_status" and command not in view["commands"]
+                else ""
+            )
+        self.instrument_read_status["temperature"].setText(
+            view["temperature_status"] + "\n" + view["temperature_warning"]
+        )
+        self.instrument_read_status["biases"].setText(view["bias_status"])
+        self.instrument_read_status["links"].setText(view["link_status"])
+        for name in ("temperature", "biases"):
+            measurements = view["temperatures" if name == "temperature" else "biases"]
+            table = getattr(self, "instrument_" + name + "_table")
+            table.setRowCount(len(measurements))
+            for row, (channel, value) in enumerate(measurements.items()):
+                table.setItem(row, 0, QtWidgets.QTableWidgetItem(channel))
+                table.setItem(row, 1, QtWidgets.QTableWidgetItem(measurement_text(value)))
+        table = self.instrument_links_table
+        table.setRowCount(len(view["links"]))
+        for row, module in enumerate(view["links"]):
+            value = module.get("register420")
+            values = (module.get("module_id"), module.get("host"), module.get("status"),
+                      "unknown" if value is None else "0x{:08x}".format(value))
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(str(value))
+                item.setToolTip(json.dumps(module, indent=2))
+                table.setItem(row, column, item)
 
     def _runtime_tab(self) -> QtWidgets.QWidget:
         content = QtWidgets.QWidget()
@@ -980,6 +1081,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
     def update_state(self, state: dict, populate: bool) -> None:
+        self._update_instrument(state.get("instrument", {}))
         burst, thinned = state["burst_writer"], state["thinned_stream"]
         acquisition = state["acquisition"]
         running = bool(
@@ -1053,6 +1155,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Burst buffers are not allocated. Enable them under Apply on restart."
                 )
         summary = {
+            "instrument": state.get("instrument", {}),
             "supervisor": state.get("supervisor", {}),
             "acquisition": acquisition,
             "burst_writer": {

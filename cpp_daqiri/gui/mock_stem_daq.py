@@ -111,7 +111,8 @@ def initial_state(pub_endpoint: str, control_endpoint: str) -> dict:
                 "insertion_state": "retracted",
                 "temperature_c": 22.0,
                 "target_temperature_c": -20.0,
-                "biases": {"reset_v": 0.72, "substrate_v": 1.8, "guard_v": 0.45},
+                "temperatures": {},
+                "biases": {},
             },
             "detector": {
                 "synchronized": False,
@@ -222,6 +223,31 @@ def handle(state: dict, request: dict) -> dict:
         "camera.read_biases",
         "detector.read_link_status",
     }:
+        if command == "camera.read_temperature":
+            camera["temperatures"] = {
+                name: {"value": camera["temperature_c"] + index * .2, "unit": "C", "valid": True}
+                for index, name in enumerate(("Q1", "Q2", "Q3", "Q4", "B1", "B2", "HS1", "HS2"))
+            }
+        elif command == "camera.read_biases":
+            camera["biases"] = {
+                "AVDD": {"value": 2.5, "unit": "V"},
+                "VDDR": {"value": 1.8, "unit": "V"},
+                "BIASN": {"value": .4, "unit": "mA"},
+                "N3BUF": {"value": 4.02, "unit": "mA"},
+            }
+        elif command == "detector.read_link_status":
+            detector["modules"] = [
+                {"module_id": module, "host": "mock", "register420": 63 if detector["synchronized"] else 0,
+                 "status": "ready" if detector["synchronized"] else "unsynchronized",
+                 "masks": {"jesd_sync": 63 if detector["synchronized"] else 0}}
+                for module in range(4)
+            ]
+        names = {"camera.read_temperature": "temperature", "camera.read_biases": "biases",
+                 "detector.read_link_status": "links"}
+        if command in names:
+            state["instrument"].setdefault("reads", {})[names[command]] = {
+                "status": "ok", "sampled_at": time.time(), "stale": False, "error": ""
+            }
         return state
     if command == "scan.configure":
         scan.update(request.get("scan", {}))

@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 
 import numpy as np
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6 import QtWidgets
 from mock_stem_daq import handle, initial_state
-from stem_daq_gui import decode_product
+from stem_daq_gui import MainWindow, decode_product
 
 
 class ControlProtocolTest(unittest.TestCase):
@@ -97,6 +100,41 @@ class StreamProtocolTest(unittest.TestCase):
         np.testing.assert_array_equal(arrays["sum"], image)
         self.assertFalse(arrays["sum"].flags.owndata)
         self.assertFalse(arrays["sum"].flags.writeable)
+
+
+class InstrumentPanelTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_reads_work_without_acquisition_and_show_units_errors_and_capabilities(self):
+        host = QtWidgets.QWidget()
+        requests = []
+        host.send_control = lambda tag, request: requests.append(request)
+        panel = MainWindow._instrument_tab(host)
+        payload = {
+            "enabled": True, "service_online": True, "mode": "hardware_readonly",
+            "capabilities": {"read_only": True, "commands": ["camera.read_temperature", "camera.read_biases"]},
+            "camera": {"temperatures": {"Q3": {"value": 198.86, "unit": "C", "valid": False}},
+                       "biases": {"BIASN": {"value": .4, "unit": "mA"}}},
+            "reads": {"temperature": {"status": "error", "stale": True, "error": "SSH timed out"}},
+            "operation": {"state": "completed"},
+        }
+        try:
+            MainWindow._update_instrument(host, payload)
+            self.assertTrue(host.instrument_read_buttons["camera.read_temperature"].isEnabled())
+            self.assertFalse(host.instrument_read_buttons["detector.read_link_status"].isEnabled())
+            self.assertIn("suspect", host.instrument_temperature_table.item(0, 1).text())
+            self.assertEqual(host.instrument_biases_table.item(0, 1).text(), "0.4 mA")
+            self.assertIn("SSH timed out", host.instrument_read_status["temperature"].text())
+            host.instrument_read_buttons["camera.read_temperature"].click()
+            self.assertEqual(requests, [{"command": "camera.read_temperature"}])
+            payload["operation"]["state"] = "running"
+            MainWindow._update_instrument(host, payload)
+            self.assertFalse(host.instrument_read_buttons["camera.read_biases"].isEnabled())
+        finally:
+            panel.close()
+            host.close()
 
 
 if __name__ == "__main__":

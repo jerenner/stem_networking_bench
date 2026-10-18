@@ -112,11 +112,7 @@ class STEMDAQControlPalette : UIFrame
         string camera = STEMRoot() + ":Control:Camera:";
         string scan = STEMRoot() + ":Control:Scan:";
         string cameraService = "offline";
-        string detectorSync = "no";
-        string detectorAligned = "no";
         if (STEMReadBoolean(camera + "ServiceOnline", 0)) cameraService = "online";
-        if (STEMReadBoolean(camera + "DetectorSynchronized", 0)) detectorSync = "yes";
-        if (STEMReadBoolean(camera + "DetectorAligned", 0)) detectorAligned = "yes";
         self.DLGValue("viz-publishing", STEMReadBoolean(visual + "Publishing", 1));
         self.DLGValue("viz-stage", STEMStageIndex(STEMReadString(visual + "ProcessingStage", "corrected")));
         self.DLGValue("viz-rate", STEMReadNumber(visual + "RefreshHz", 1.0));
@@ -140,17 +136,61 @@ class STEMDAQControlPalette : UIFrame
         self.DLGValue("camera-mode", STEMReadString(camera + "Mode", "unknown"));
         self.DLGValue("camera-power", STEMReadString(camera + "PowerState", "unknown"));
         self.DLGValue("camera-insertion", STEMReadString(camera + "InsertionState", "unknown"));
-        self.DLGValue("camera-temperature", STEMReadNumber(camera + "TemperatureC", 0));
-        self.DLGValue("camera-target", STEMReadNumber(camera + "TargetTemperatureC", 0));
+        self.DLGValue("camera-temperature", STEMReadString(camera + "MaximumTemperature", "unknown"));
+        self.DLGValue("camera-target", STEMReadString(camera + "TargetTemperatureText", "unknown"));
         self.DLGValue("detector-links", STEMReadString(camera + "DetectorLinks", "unknown"));
-        self.DLGValue("detector-sync", detectorSync);
-        self.DLGValue("detector-aligned", detectorAligned);
+        self.DLGValue("detector-sync", STEMReadString(camera + "SynchronizationText", "unknown"));
+        self.DLGValue("detector-aligned", STEMReadString(camera + "AlignmentText", "unknown"));
         self.DLGValue("operation-name", STEMReadString(camera + "OperationName", ""));
         self.DLGValue("operation-state", STEMReadString(camera + "OperationState", "idle"));
         self.DLGValue("operation-step", STEMReadString(camera + "OperationStep", ""));
         self.DLGValue("operation-completed", STEMReadNumber(camera + "OperationCompletedSteps", 0));
         self.DLGValue("operation-total", STEMReadNumber(camera + "OperationTotalSteps", 0));
         self.DLGValue("operation-error", STEMReadString(camera + "OperationError", ""));
+        self.DLGValue("temperature-read-status", STEMReadString(camera + "TemperatureReadStatus", "not read"));
+        self.DLGValue("temperature-warning", STEMReadString(camera + "TemperatureWarning", ""));
+        self.DLGValue("bias-read-status", STEMReadString(camera + "BiasReadStatus", "not read"));
+        self.DLGValue("link-read-status", STEMReadString(camera + "LinkReadStatus", "not read"));
+        self.DLGValue("temp-Q1", STEMReadString(camera + "Temperature:Q1", "not read"));
+        self.DLGValue("temp-Q2", STEMReadString(camera + "Temperature:Q2", "not read"));
+        self.DLGValue("temp-Q3", STEMReadString(camera + "Temperature:Q3", "not read"));
+        self.DLGValue("temp-Q4", STEMReadString(camera + "Temperature:Q4", "not read"));
+        self.DLGValue("temp-B1", STEMReadString(camera + "Temperature:B1", "not read"));
+        self.DLGValue("temp-B2", STEMReadString(camera + "Temperature:B2", "not read"));
+        self.DLGValue("temp-HS1", STEMReadString(camera + "Temperature:HS1", "not read"));
+        self.DLGValue("temp-HS2", STEMReadString(camera + "Temperature:HS2", "not read"));
+        self.DLGValue("bias-DVDD18", STEMReadString(camera + "Bias:DVDD18", "not read"));
+        self.DLGValue("bias-DVDD33", STEMReadString(camera + "Bias:DVDD33", "not read"));
+        self.DLGValue("bias-DVDD2", STEMReadString(camera + "Bias:DVDD2", "not read"));
+        self.DLGValue("bias-LVDSBIAS", STEMReadString(camera + "Bias:LVDSBIAS", "not read"));
+        self.DLGValue("bias-AVDD", STEMReadString(camera + "Bias:AVDD", "not read"));
+        self.DLGValue("bias-VDDP", STEMReadString(camera + "Bias:VDDP", "not read"));
+        self.DLGValue("bias-VDDR", STEMReadString(camera + "Bias:VDDR", "not read"));
+        self.DLGValue("bias-VGUARD", STEMReadString(camera + "Bias:VGUARD", "not read"));
+        self.DLGValue("bias-BIASN", STEMReadString(camera + "Bias:BIASN", "not read"));
+        self.DLGValue("bias-BIASP", STEMReadString(camera + "Bias:BIASP", "not read"));
+        self.DLGValue("bias-N3BUF", STEMReadString(camera + "Bias:N3BUF", "not read"));
+        self.DLGValue("bias-OSBUF", STEMReadString(camera + "Bias:OSBUF", "not read"));
+        self.DLGValue("bias-LVDSB_SUM", STEMReadString(camera + "Bias:LVDSB_SUM", "not read"));
+        self.DLGValue("bias-3V3DIG", STEMReadString(camera + "Bias:3V3DIG", "not read"));
+        self.DLGValue("bias-3V3_ANA", STEMReadString(camera + "Bias:3V3_ANA", "not read"));
+        self.DLGValue("bias-3V3_EPR", STEMReadString(camera + "Bias:3V3_EPR", "not read"));
+        self.DLGValue("bias-4V3", STEMReadString(camera + "Bias:4V3", "not read"));
+        self.DLGValue("bias-2V8", STEMReadString(camera + "Bias:2V8", "not read"));
+        self.DLGValue("bias-2V0", STEMReadString(camera + "Bias:2V0", "not read"));
+        self.DLGValue("bias-M2V5", STEMReadString(camera + "Bias:M2V5", "not read"));
+        self.DLGValue("bias-BIASN_SUM", STEMReadString(camera + "Bias:BIASN_SUM", "not read"));
+        self.DLGValue("bias-BIASP_SUM", STEMReadString(camera + "Bias:BIASP_SUM", "not read"));
+        self.DLGValue("bias-N3BUF_SUM", STEMReadString(camera + "Bias:N3BUF_SUM", "not read"));
+        self.DLGValue("bias-OSBUF_SUM", STEMReadString(camera + "Bias:OSBUF_SUM", "not read"));
+        self.DLGValue("link-0", STEMReadString(camera + "Link:0", "not read"));
+        self.DLGValue("link-1", STEMReadString(camera + "Link:1", "not read"));
+        self.DLGValue("link-2", STEMReadString(camera + "Link:2", "not read"));
+        self.DLGValue("link-3", STEMReadString(camera + "Link:3", "not read"));
+        self.DLGValue("link-4", STEMReadString(camera + "Link:4", "not read"));
+        self.DLGValue("link-5", STEMReadString(camera + "Link:5", "not read"));
+        self.DLGValue("link-6", STEMReadString(camera + "Link:6", "not read"));
+        self.DLGValue("link-7", STEMReadString(camera + "Link:7", "not read"));
 
         self.DLGValue("scan-state", STEMReadString(scan + "State", "idle"));
         self.DLGValue("scan-number", STEMReadNumber(scan + "ScanNumber", 0));
@@ -305,8 +345,8 @@ class STEMDAQControlPalette : UIFrame
         items.DLGAddElement(STEMLabeledField("Mode", DLGCreateStringField("unknown", 28).DLGIdentifier("camera-mode")));
         items.DLGAddElement(STEMLabeledField("Power", DLGCreateStringField("unknown", 28).DLGIdentifier("camera-power")));
         items.DLGAddElement(STEMLabeledField("Insertion", DLGCreateStringField("unknown", 28).DLGIdentifier("camera-insertion")));
-        items.DLGAddElement(STEMLabeledField("Temperature C", DLGCreateRealField(0, 12, 2).DLGIdentifier("camera-temperature")));
-        items.DLGAddElement(STEMLabeledField("Target C", DLGCreateRealField(0, 12, 2).DLGIdentifier("camera-target")));
+        items.DLGAddElement(STEMLabeledField("Maximum valid temp", DLGCreateStringField("unknown", 28).DLGIdentifier("camera-temperature")));
+        items.DLGAddElement(STEMLabeledField("Target temperature", DLGCreateStringField("unknown", 28).DLGIdentifier("camera-target")));
         items.DLGAddElement(DLGGroupItems(DLGCreatePushButton("Power up", "OnCameraPowerUp"), DLGCreatePushButton("Power down", "OnCameraPowerDown")));
         items.DLGAddElement(DLGGroupItems(DLGCreatePushButton("Insert", "OnCameraInsert"), DLGCreatePushButton("Retract", "OnCameraRetract")));
         items.DLGAddElement(DLGGroupItems(DLGCreatePushButton("Read temperature", "OnCameraTemperature"), DLGCreatePushButton("Read biases", "OnCameraBiases")));
@@ -344,6 +384,89 @@ class STEMDAQControlPalette : UIFrame
         return box;
     }
 
+    taggroup CreateTemperatureBox(object self)
+    {
+        taggroup items;
+        taggroup box = DLGCreateBox("Camera Q/B/HS probe readings", items);
+        items.DLGAddElement(DLGCreateLabel("Board/head probes; names follow dsh output."));
+        items.DLGAddElement(STEMLabeledField("Read status / UTC", DLGCreateStringField("not read", 40).DLGIdentifier("temperature-read-status")));
+        items.DLGAddElement(STEMLabeledField("Warning", DLGCreateStringField("", 40).DLGIdentifier("temperature-warning")));
+        items.DLGAddElement(STEMLabeledField("Q1", DLGCreateStringField("not read", 20).DLGIdentifier("temp-Q1")));
+        items.DLGAddElement(STEMLabeledField("Q2", DLGCreateStringField("not read", 20).DLGIdentifier("temp-Q2")));
+        items.DLGAddElement(STEMLabeledField("Q3", DLGCreateStringField("not read", 20).DLGIdentifier("temp-Q3")));
+        items.DLGAddElement(STEMLabeledField("Q4", DLGCreateStringField("not read", 20).DLGIdentifier("temp-Q4")));
+        items.DLGAddElement(STEMLabeledField("B1", DLGCreateStringField("not read", 20).DLGIdentifier("temp-B1")));
+        items.DLGAddElement(STEMLabeledField("B2", DLGCreateStringField("not read", 20).DLGIdentifier("temp-B2")));
+        items.DLGAddElement(STEMLabeledField("HS1", DLGCreateStringField("not read", 20).DLGIdentifier("temp-HS1")));
+        items.DLGAddElement(STEMLabeledField("HS2", DLGCreateStringField("not read", 20).DLGIdentifier("temp-HS2")));
+        items.DLGAddElement(DLGCreatePushButton("Read temperatures", "OnCameraTemperature"));
+        items.DLGAddElement(DLGCreatePushButton("Refresh displayed readings", "OnRefresh"));
+        return box;
+    }
+
+    taggroup CreateBiasBox(object self)
+    {
+        taggroup items;
+        taggroup box = DLGCreateBox("Measured biases and supply rails", items);
+        items.DLGAddElement(STEMLabeledField("Read status / UTC", DLGCreateStringField("not read", 40).DLGIdentifier("bias-read-status")));
+        items.DLGAddElement(STEMLabeledField("DVDD18", DLGCreateStringField("not read", 20).DLGIdentifier("bias-DVDD18")));
+        items.DLGAddElement(STEMLabeledField("DVDD33", DLGCreateStringField("not read", 20).DLGIdentifier("bias-DVDD33")));
+        items.DLGAddElement(STEMLabeledField("DVDD2", DLGCreateStringField("not read", 20).DLGIdentifier("bias-DVDD2")));
+        items.DLGAddElement(STEMLabeledField("LVDSBIAS", DLGCreateStringField("not read", 20).DLGIdentifier("bias-LVDSBIAS")));
+        items.DLGAddElement(STEMLabeledField("AVDD", DLGCreateStringField("not read", 20).DLGIdentifier("bias-AVDD")));
+        items.DLGAddElement(STEMLabeledField("VDDP", DLGCreateStringField("not read", 20).DLGIdentifier("bias-VDDP")));
+        items.DLGAddElement(STEMLabeledField("VDDR", DLGCreateStringField("not read", 20).DLGIdentifier("bias-VDDR")));
+        items.DLGAddElement(STEMLabeledField("VGUARD", DLGCreateStringField("not read", 20).DLGIdentifier("bias-VGUARD")));
+        items.DLGAddElement(STEMLabeledField("BIASN", DLGCreateStringField("not read", 20).DLGIdentifier("bias-BIASN")));
+        items.DLGAddElement(STEMLabeledField("BIASP", DLGCreateStringField("not read", 20).DLGIdentifier("bias-BIASP")));
+        items.DLGAddElement(STEMLabeledField("N3BUF", DLGCreateStringField("not read", 20).DLGIdentifier("bias-N3BUF")));
+        items.DLGAddElement(STEMLabeledField("OSBUF", DLGCreateStringField("not read", 20).DLGIdentifier("bias-OSBUF")));
+        items.DLGAddElement(DLGCreatePushButton("Read biases", "OnCameraBiases"));
+        items.DLGAddElement(DLGCreatePushButton("Refresh displayed readings", "OnRefresh"));
+        return box;
+    }
+
+    taggroup CreateLinkBox(object self)
+    {
+        taggroup items;
+        taggroup box = DLGCreateBox("FPGA register 420 observations", items);
+        items.DLGAddElement(DLGCreateLabel("Latched flags; this read does not reset or clear them."));
+        items.DLGAddElement(STEMLabeledField("Read status / UTC", DLGCreateStringField("not read", 40).DLGIdentifier("link-read-status")));
+        items.DLGAddElement(STEMLabeledField("Module 0", DLGCreateStringField("not read", 50).DLGIdentifier("link-0")));
+        items.DLGAddElement(STEMLabeledField("Module 1", DLGCreateStringField("not read", 50).DLGIdentifier("link-1")));
+        items.DLGAddElement(STEMLabeledField("Module 2", DLGCreateStringField("not read", 50).DLGIdentifier("link-2")));
+        items.DLGAddElement(STEMLabeledField("Module 3", DLGCreateStringField("not read", 50).DLGIdentifier("link-3")));
+        items.DLGAddElement(STEMLabeledField("Module 4", DLGCreateStringField("not read", 50).DLGIdentifier("link-4")));
+        items.DLGAddElement(STEMLabeledField("Module 5", DLGCreateStringField("not read", 50).DLGIdentifier("link-5")));
+        items.DLGAddElement(STEMLabeledField("Module 6", DLGCreateStringField("not read", 50).DLGIdentifier("link-6")));
+        items.DLGAddElement(STEMLabeledField("Module 7", DLGCreateStringField("not read", 50).DLGIdentifier("link-7")));
+        items.DLGAddElement(DLGCreatePushButton("Read link status", "OnDetectorLinks"));
+        items.DLGAddElement(DLGCreatePushButton("Refresh displayed readings", "OnRefresh"));
+        return box;
+    }
+
+    taggroup CreateExtraBiasBox(object self)
+    {
+        taggroup items;
+        taggroup box = DLGCreateBox("Additional rails and summed bias currents", items);
+        items.DLGAddElement(DLGCreateLabel("Shares the Biases tab read; units come from the camera."));
+        items.DLGAddElement(STEMLabeledField("LVDSB_SUM", DLGCreateStringField("not read", 20).DLGIdentifier("bias-LVDSB_SUM")));
+        items.DLGAddElement(STEMLabeledField("3V3DIG", DLGCreateStringField("not read", 20).DLGIdentifier("bias-3V3DIG")));
+        items.DLGAddElement(STEMLabeledField("3V3_ANA", DLGCreateStringField("not read", 20).DLGIdentifier("bias-3V3_ANA")));
+        items.DLGAddElement(STEMLabeledField("3V3_EPR", DLGCreateStringField("not read", 20).DLGIdentifier("bias-3V3_EPR")));
+        items.DLGAddElement(STEMLabeledField("4V3", DLGCreateStringField("not read", 20).DLGIdentifier("bias-4V3")));
+        items.DLGAddElement(STEMLabeledField("2V8", DLGCreateStringField("not read", 20).DLGIdentifier("bias-2V8")));
+        items.DLGAddElement(STEMLabeledField("2V0", DLGCreateStringField("not read", 20).DLGIdentifier("bias-2V0")));
+        items.DLGAddElement(STEMLabeledField("M2V5", DLGCreateStringField("not read", 20).DLGIdentifier("bias-M2V5")));
+        items.DLGAddElement(STEMLabeledField("BIASN_SUM", DLGCreateStringField("not read", 20).DLGIdentifier("bias-BIASN_SUM")));
+        items.DLGAddElement(STEMLabeledField("BIASP_SUM", DLGCreateStringField("not read", 20).DLGIdentifier("bias-BIASP_SUM")));
+        items.DLGAddElement(STEMLabeledField("N3BUF_SUM", DLGCreateStringField("not read", 20).DLGIdentifier("bias-N3BUF_SUM")));
+        items.DLGAddElement(STEMLabeledField("OSBUF_SUM", DLGCreateStringField("not read", 20).DLGIdentifier("bias-OSBUF_SUM")));
+        items.DLGAddElement(DLGCreatePushButton("Read biases", "OnCameraBiases"));
+        items.DLGAddElement(DLGCreatePushButton("Refresh displayed readings", "OnRefresh"));
+        return box;
+    }
+
     taggroup CreateDialog(object self)
     {
         taggroup items;
@@ -354,11 +477,19 @@ class STEMDAQControlPalette : UIFrame
         taggroup burstTab = tabs.DLGAddTab("Burst");
         taggroup cameraTab = tabs.DLGAddTab("Camera");
         taggroup scanTab = tabs.DLGAddTab("Scan");
+        taggroup temperatureTab = tabs.DLGAddTab("Temps");
+        taggroup biasTab = tabs.DLGAddTab("Biases");
+        taggroup extraBiasTab = tabs.DLGAddTab("Rails");
+        taggroup linkTab = tabs.DLGAddTab("Links");
         statusTab.DLGAddElement(self.CreateStatusBox());
         visualizationTab.DLGAddElement(self.CreateVisualizationBox());
         burstTab.DLGAddElement(self.CreateBurstBox());
         cameraTab.DLGAddElement(self.CreateCameraBox());
         scanTab.DLGAddElement(self.CreateScanBox());
+        temperatureTab.DLGAddElement(self.CreateTemperatureBox());
+        biasTab.DLGAddElement(self.CreateBiasBox());
+        extraBiasTab.DLGAddElement(self.CreateExtraBiasBox());
+        linkTab.DLGAddElement(self.CreateLinkBox());
         taggroup wrapper = DLGCreateGroup();
         wrapper.DLGAddElement(tabs);
         items.DLGAddElement(wrapper);

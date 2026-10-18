@@ -304,10 +304,21 @@ Implemented in the DAQIRI path as the current hardware-free integration:
 
 ### Phase 2: read-only hardware probes
 
-- Verify SSH reachability and host identity.
-- Read camera temperature and biases.
-- Read per-board firmware and link status.
-- Compare parsed results against the legacy tools and operator observations.
+Implemented as the opt-in `instrument.mode: hardware_readonly` service, using
+the newer `sw_server_doeels_claude` code and recovered `sw_server/lib` as protocol
+references. See [`../cpp_daqiri/instrument/README.md`](../cpp_daqiri/instrument/README.md).
+
+- Fixed SSH reads for camera Q/B/HS temperatures and measured bias/supply values.
+- Direct UDP register 420 reads for per-board JESD status; no clearing/reset.
+- Separate serialized worker, cached timestamped observations, stale/error
+  reporting, and explicit rejection of all hardware-changing commands.
+- Qt readout tab and native DM telemetry tabs using the same supervisor endpoint.
+- Hardware-free parser, UDP, GUI/DM-bridge, and native supervisor/service tests.
+
+Still required on the actual instrument: verify SSH reachability and host
+identity, confirm board addresses, and compare readbacks with trusted legacy
+tools/operator observations. Firmware-version reads and live safety/interlock
+validation are not yet implemented.
 
 ### Phase 3: isolated maintenance actions
 

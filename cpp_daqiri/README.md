@@ -705,6 +705,25 @@ log records operation acceptance and final status. See
 [`../docs/CAMERA_HEAD_CONTROL_PLAN.md`](../docs/CAMERA_HEAD_CONTROL_PLAN.md) for
 the boundary between this mock and future reviewed hardware adapters.
 
+#### Read-only camera and FPGA telemetry
+
+`instrument.mode: hardware_readonly` selects the new live adapter rather than
+the mock. It provides the same `camera.read_temperature`, `camera.read_biases`,
+and `detector.read_link_status` commands to both the Qt and DigitalMicrograph
+controls. Camera reads use the recovered fixed SSH/`dsh` commands; board status
+uses the original UDP register-read protocol for register 420. This mode rejects
+all power, bias-setting, link-reset/alignment, and scan operations. It never runs
+the old server or its initialization routines.
+
+Start with [`configs/stem_instrument_readonly.yaml`](configs/stem_instrument_readonly.yaml),
+which keeps acquisition stopped. Reads are explicitly requested, asynchronous,
+and timestamped; normal GUI state polls return cached observations and do not
+probe the hardware. The service stays in its own process while the supervisor
+retains the existing public control endpoint. Rebuild the container to install
+the adapter and its SSH/Python dependencies. See
+[`instrument/README.md`](instrument/README.md) for the protocol details,
+credential mounts, first IGX test, GUI readout tabs, and hardware-free tests.
+
 The PySide6 console combines the SUB viewer with the REP controls:
 
 ```bash

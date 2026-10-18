@@ -10,6 +10,10 @@ import json
 import os
 import time
 
+from stem_instrument_protocol import (
+    BIAS_CHANNELS, TEMPERATURE_CHANNELS, instrument_view, link_text, measurement_text,
+)
+
 
 TAG_ROOT = "STEM DAQ"
 REQUEST_SEQUENCE = TAG_ROOT + ":Control:Request:Sequence"
@@ -108,9 +112,15 @@ def build_request(command, tags):
         "abort_scan": "scan.abort",
     }
     if command in instrument_actions:
+        if tags.get_bool(_field(CAMERA_ROOT, "ReadOnly"), False) and command not in (
+            "refresh_instrument", "camera_read_temperature", "camera_read_biases", "detector_read_links"
+        ):
+            raise ValueError("This instrument backend supports reads only")
         return {"command": instrument_actions[command]}
 
     if command == "configure_scan":
+        if tags.get_bool(_field(CAMERA_ROOT, "ReadOnly"), False):
+            raise ValueError("Scan configuration is unavailable in read-only mode")
         return {
             "command": "scan.configure",
             "scan": {
@@ -467,6 +477,27 @@ class PersistentTagMailbox(object):
         for value_type, root, name, value in instrument_fields:
             if value is not None:
                 setters[value_type](_field(root, name), value)
+        view = instrument_view(instrument)
+        self.tags.set_bool(_field(CAMERA_ROOT, "ReadOnly"), view["read_only"])
+        self.tags.set_string(_field(CAMERA_ROOT, "MaximumTemperature"), view["maximum_temperature"])
+        self.tags.set_string(_field(CAMERA_ROOT, "TargetTemperatureText"), view["target_temperature"])
+        self.tags.set_string(_field(CAMERA_ROOT, "AlignmentText"), view["aligned"])
+        self.tags.set_string(_field(CAMERA_ROOT, "TemperatureReadStatus"), view["temperature_status"])
+        self.tags.set_string(_field(CAMERA_ROOT, "BiasReadStatus"), view["bias_status"])
+        self.tags.set_string(_field(CAMERA_ROOT, "LinkReadStatus"), view["link_status"])
+        self.tags.set_string(_field(CAMERA_ROOT, "TemperatureWarning"), view["temperature_warning"])
+        self.tags.set_string(_field(CAMERA_ROOT, "SynchronizationText"), view["synchronized"])
+        for name in TEMPERATURE_CHANNELS:
+            self.tags.set_string(_field(CAMERA_ROOT, "Temperature:" + name),
+                                 measurement_text(view["temperatures"].get(name)))
+        for name in BIAS_CHANNELS:
+            self.tags.set_string(_field(CAMERA_ROOT, "Bias:" + name),
+                                 measurement_text(view["biases"].get(name)))
+        modules = {str(item["module_id"]): item for item in view["links"]}
+        for module_id in range(8):
+            module = modules.get(str(module_id))
+            self.tags.set_string(_field(CAMERA_ROOT, "Link:" + str(module_id)),
+                                 link_text(module) if module else "not read")
         self.state_sequence += 1
         self.tags.set_string(STATE_JSON, json.dumps(state, sort_keys=True))
         for name, value in status.items():

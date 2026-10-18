@@ -1,0 +1,44 @@
+%YAML 1.2
+---
+# Standalone instrument-read test: the supervisor stays online with RX stopped.
+# For acquisition, copy the instrument block into your working RX configuration.
+source: "network"
+control:
+  enabled: true
+  start_acquisition: false
+  endpoint: "tcp://*:5557"
+  runtime_config_path: "/tmp/stem_daqiri_runtime.yaml"
+
+instrument:
+  enabled: true
+  mode: "hardware_readonly"
+  endpoint: "ipc:///tmp/stem_daqiri_instrument.ipc"
+  launch_service: true
+  service_binary: "/opt/stem_daqiri/bin/stem_daqiri_instrument_readonly"
+  readonly:
+    timeout_seconds: 8.0
+    stale_after_seconds: 120.0
+    audit_log_path: "/tmp/stem_instrument_reads.jsonl"
+    camera:
+      host: "192.168.111.90"
+      user: "root"
+      port: 22
+      # Mount these files read-only into the container. No password is stored.
+      identity_file: "/run/camera_ssh/id_ed25519"
+      known_hosts_file: "/run/camera_ssh/known_hosts"
+      # Preserve out-of-range readings with a warning; never hide a bad probe.
+      temperature_min_c: -50.0
+      temperature_max_c: 150.0
+    detector:
+      # Protocol matches sw_server/lib/NetworkInterface.cxx::ReadRegister.
+      # Only register 420 and the protocol's padding read of register 0 are read.
+      # No clear/reset write is performed; these flags are latched.
+      transport: "udp"
+      port: 42000
+      timeout_seconds: 0.2
+      retries: 7
+      modules:
+        - {id: 0, host: "10.20.20.32"}
+        - {id: 1, host: "10.20.21.32"}
+        - {id: 2, host: "10.20.22.32"}
+        - {id: 3, host: "10.20.23.32"}

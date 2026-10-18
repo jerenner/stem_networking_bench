@@ -264,6 +264,39 @@ class MailboxTest(unittest.TestCase):
         self.assertEqual(status["burst"], "armed / waiting")
         self.assertIn("detector.resync", status["instrument"])
 
+    def test_real_readbacks_and_unknown_state_replace_previous_values(self):
+        snapshot = state()
+        snapshot["instrument"].update(
+            mode="hardware_readonly",
+            capabilities={"read_only": True},
+            reads={"temperature": {"status": "error", "sampled_at": 1000.0,
+                                    "stale": True, "error": "SSH timed out"}},
+        )
+        snapshot["instrument"]["camera"].update(
+            temperatures={"Q1": {"value": 44.63, "unit": "C", "valid": True},
+                          "Q3": {"value": 198.86, "unit": "C", "valid": False}},
+            biases={"AVDD": {"value": 2.5, "unit": "V"},
+                    "BIASN": {"value": .4, "unit": "mA"}},
+        )
+        snapshot["instrument"]["detector"].update(synchronized=None, aligned=None)
+        snapshot["instrument"]["camera"]["target_temperature_c"] = None
+        self.mailbox.publish_state(snapshot)
+        self.assertIn("suspect", self.tags.get_string(path(CAMERA_ROOT, "Temperature:Q3")))
+        self.assertEqual(self.tags.get_string(path(CAMERA_ROOT, "Bias:BIASN")), "0.4 mA")
+        self.assertIn("STALE", self.tags.get_string(path(CAMERA_ROOT, "TemperatureReadStatus")))
+        self.assertEqual(self.tags.get_string(path(CAMERA_ROOT, "SynchronizationText")), "unknown")
+        self.assertEqual(self.tags.get_string(path(CAMERA_ROOT, "AlignmentText")), "unknown")
+        self.assertEqual(self.tags.get_string(path(CAMERA_ROOT, "TargetTemperatureText")), "unknown")
+        self.assertTrue(self.tags.get_bool(path(CAMERA_ROOT, "ReadOnly")))
+        self.assertEqual(build_request("camera_read_temperature", self.tags),
+                         {"command": "camera.read_temperature"})
+        for action in ("camera_power_up", "camera_insert", "detector_resync", "start_scan", "configure_scan"):
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                build_request(action, self.tags)
+        snapshot["instrument"]["camera"]["temperatures"] = {}
+        self.mailbox.publish_state(snapshot)
+        self.assertEqual(self.tags.get_string(path(CAMERA_ROOT, "Temperature:Q3")), "not read")
+
 
 class BridgeTest(unittest.TestCase):
     def test_pending_command_has_priority_over_state_poll(self):

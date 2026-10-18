@@ -48,7 +48,8 @@ Open `stem_dm_viewer.py` from DM's Python script editor, ensure **Execute in
 background** is selected, and execute it. DM should open the **STEM DAQ
 Control** palette and create up to four live images when two receivers publish
 both products. The palette uses separate **Status**, **Visualization**,
-**Burst**, **Camera**, and **Scan** tabs so it fits on a typical DM workspace.
+**Burst**, **Camera**, **Scan**, and separate telemetry tabs so it fits on a
+typical DM workspace.
 Closing the palette or
 pressing **Stop DM viewer and close** asks the Python loop to release its
 sockets and finish normally; wait for `STEM DM viewer stopped` before executing
@@ -73,7 +74,7 @@ Phase one provides:
 - thinned-stream publishing, processing stage, refresh rate, representative
   frame, product selection, and thresholds;
 - burst stage, destination, bucket/capture counts, completeness policy,
-  thresholds, configure, arm, disarm, and abort; and
+  thresholds, configure, arm, disarm, and abort;
 - mock camera power, insertion/retraction, temperature and bias reads;
 - mock detector link status, resynchronization, and automatic alignment;
 - mock scan timing/dimensions, configure, start, stop, and abort; and
@@ -82,11 +83,22 @@ Phase one provides:
 
 Instrument operations are asynchronous on the IGX. A DM button queues an
 intent-level request and returns immediately; normal state polling updates the
-operation name, current step, step count, and error. The initial service is
-strictly a mock and sends no camera-head SSH/`dsh` or FPGA control traffic.
-Camera and detector actions may enforce preconditions, for example camera
+operation name, current step, step count, and error. With `instrument.mode: mock`
+these operations are strictly simulated and send no camera-head SSH/`dsh` or
+FPGA control traffic. Camera and detector actions may enforce preconditions, for example camera
 insertion requires a completed mock power-up and auto-alignment requires a
 completed mock resync.
+
+With `instrument.mode: hardware_readonly`, the **Temps**, **Biases**, **Rails**,
+and **Links** tabs show actual camera/FPGA measurements requested through the
+same supervisor port. Temperature probes retain their Q/B/HS names; supply/bias
+values include their actual voltage/current units. Read timestamps, stale/error
+status, and suspect probe warnings are shown rather than substituting zeroes.
+Link flags are latched observations and reading them does not reset hardware.
+All camera/detector/scan writes remain unavailable in this mode. Setup and the
+first instrument-only IGX test are documented in
+[`../instrument/README.md`](../instrument/README.md). No new Python packages or
+camera credentials are needed on the Windows DM machine.
 
 The Python loop polls DAQ state automatically. Press **Refresh** in the palette
 to copy the newest cached state and accepted settings into the displayed

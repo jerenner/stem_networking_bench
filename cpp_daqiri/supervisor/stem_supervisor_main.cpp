@@ -202,12 +202,16 @@ class PersistentSupervisor {
     instrument_endpoint_ = yaml_map_value<std::string>(
         instrument, "endpoint", "ipc:///tmp/stem_daqiri_instrument.ipc");
     launch_instrument_service_ =
-        yaml_map_value(instrument, "launch_service", instrument_mode_ == "mock");
+        yaml_map_value(instrument, "launch_service",
+                       instrument_mode_ == "mock" ||
+                       instrument_mode_ == "hardware_readonly");
     instrument_binary_ = getenv_or(
         "STEM_DAQIRI_INSTRUMENT_BIN",
         yaml_map_value<std::string>(
             instrument, "service_binary",
-            "/opt/stem_daqiri/bin/stem_daqiri_instrument_mock"));
+            instrument_mode_ == "hardware_readonly"
+                ? "/opt/stem_daqiri/bin/stem_daqiri_instrument_readonly"
+                : "/opt/stem_daqiri/bin/stem_daqiri_instrument_mock"));
     cached_instrument_state_ = instrument_enabled_
         ? "{\"enabled\":true,\"service_online\":false,\"mode\":\"" +
               json_escape(instrument_mode_) +
@@ -501,9 +505,10 @@ class PersistentSupervisor {
   void start_instrument_service() {
     if (!instrument_enabled_) { return; }
     if (launch_instrument_service_) {
-      if (instrument_mode_ != "mock") {
+      if (instrument_mode_ != "mock" &&
+          instrument_mode_ != "hardware_readonly") {
         throw std::runtime_error(
-            "automatic instrument launch is currently limited to mock mode");
+            "automatic instrument launch requires mock or hardware_readonly mode");
       }
       remove_stale_instrument_socket();
       std::vector<std::string> arguments = {
@@ -523,7 +528,8 @@ class PersistentSupervisor {
         std::lock_guard<std::mutex> lock(mu_);
         instrument_pid_ = pid;
       }
-      std::cerr << "DAQ supervisor started mock instrument pid " << pid
+      std::cerr << "DAQ supervisor started " << instrument_mode_
+                << " instrument pid " << pid
                 << " using " << instrument_config_ << "\n";
     }
 
