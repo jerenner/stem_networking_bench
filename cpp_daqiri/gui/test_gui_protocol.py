@@ -10,7 +10,7 @@ import unittest
 import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 from mock_stem_daq import handle, initial_state
 from stem_daq_gui import MainWindow, decode_product
 
@@ -106,6 +106,36 @@ class InstrumentPanelTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_small_camera_panel_can_scroll_to_bottom_on_every_page(self):
+        host = QtWidgets.QWidget()
+        host.send_control = lambda *_: None
+        panel = MainWindow._instrument_tab(host)
+        try:
+            self.assertIsInstance(panel, QtWidgets.QScrollArea)
+            self.assertTrue(panel.widgetResizable())
+            self.assertEqual(panel.horizontalScrollBarPolicy(),
+                             QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            panel.resize(420, 260)
+            panel.show()
+            pages = panel.widget().findChild(QtWidgets.QTabWidget)
+            layout = panel.widget().layout()
+            bottom_note = layout.itemAt(layout.count() - 1).widget()
+            for index in range(pages.count()):
+                with self.subTest(page=pages.tabText(index)):
+                    pages.setCurrentIndex(index)
+                    self.app.processEvents()
+                    scrollbar = panel.verticalScrollBar()
+                    self.assertGreater(scrollbar.maximum(), 0)
+                    scrollbar.setValue(scrollbar.maximum())
+                    self.app.processEvents()
+                    bottom = bottom_note.mapTo(panel.viewport(),
+                                               QtCore.QPoint(0, bottom_note.height() - 1))
+                    self.assertGreaterEqual(bottom.y(), 0)
+                    self.assertLess(bottom.y(), panel.viewport().height())
+        finally:
+            panel.close()
+            host.close()
 
     def test_emulated_service_is_explicitly_labeled(self):
         host = QtWidgets.QWidget()

@@ -455,7 +455,14 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         note.setWordWrap(True)
         layout.addWidget(note)
-        return content
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroll.setWidget(content)
+        return scroll
 
     def _update_instrument(self, instrument: dict) -> None:
         view = instrument_view(instrument)
