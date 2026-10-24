@@ -5,12 +5,112 @@ or DigitalMicrograph to a separate local service. Clients keep using the same
 supervisor control endpoint, normally port 5557. Neither GUI needs a route to
 the camera or FPGA control network.
 
-There are two explicitly selected backends:
+There are three explicitly selected backends:
 
 - `instrument.mode: mock`: existing simulated camera, detector, and scan actions.
 - `instrument.mode: hardware_readonly`: actual temperature, bias, and link reads,
   with all hardware-changing commands rejected. This is the first live adapter,
   not a port of the old server's initialization or acquisition logic.
+- `instrument.mode: emulated_readonly`: the real read-only adapter and parsers,
+  connected to persistent local camera-text and FPGA-UDP responders instead of
+  hardware. No physical camera connection or credentials are needed.
+
+## Persistent camera/FPGA emulation
+
+Use [`../configs/stem_instrument_emulated.yaml`](../configs/stem_instrument_emulated.yaml)
+to test the newly added readbacks interactively from either Qt or DM. The
+supervisor launches the usual Python read-only service, which owns the emulator
+listeners and threads for as long as that service runs. Stopping acquisition or
+disconnecting a GUI does not stop the emulator. Its state resets when the
+supervisor/service exits; "persistent" does not mean saved across program restarts.
+
+```text
+DM or Qt -> existing public ZMQ control port -> supervisor
+  -> read-only instrument service / serialized worker
+     -> camera adapter -> loopback TCP -> emulated dsh text -> real parsers
+     -> FPGA adapter -> loopback UDP -> emulated register replies -> real decoder
+```
+
+This tests command routing, the same fixed camera command selection, camera text
+parsing, all 24 supply/bias measurements with units, named temperature probes,
+the actual 24-byte FPGA register protocol/retries, asynchronous operation state,
+errors, stale observations, and both GUI readouts. It **does not** implement an
+SSH server or test SSH handshakes, keys, host verification, physical network
+routing, hardware behavior, or a thermal/scan model. Only the camera transport
+is replaced by a private TCP text exchange; FPGA reads still use the actual UDP
+register-read implementation. This deliberately avoids setting up an SSH daemon
+and test credentials just to exercise the camera's text readbacks.
+
+All internal listeners bind only `127.0.0.1`, using automatically selected ports.
+Each emulated board has its own UDP port. There is no external-target setting or
+real-hardware fallback in this mode: any leftover `readonly.camera` or
+`readonly.detector` hardware targets/helpers are ignored. Ordinary `get_state`
+polls remain cached; they generate no camera or FPGA read requests. GUI read
+status includes **SIMULATED**, and full state reports
+`instrument.mode: emulated_readonly` and `instrument.simulated: true`.
+
+After rebuilding the existing image with RX/ZeroMQ support, stop any other
+supervisor using port 5557, then run this minimal test on the IGX:
+
+```bash
+sudo docker run --rm -it --name stem-instrument-demo --network host \
+  stem_daqiri:burst-zmq \
+  /opt/stem_daqiri/bin/stem_daqiri_supervisor \
+  /opt/stem_daqiri/bin/configs/stem_instrument_emulated.yaml
+```
+
+No privileged mode, GPU allocation, hugepages, dark file, FPGA stream, camera
+credentials, or additional SSH forwards are required. Existing port-5557
+forwarding works unchanged. Launch the Qt controls-only GUI or the DM viewer,
+then use their **Read temperatures**, **Read biases**, and **Read link status**
+buttons. DM's **Refresh displayed readings** copies the completed samples into
+the palette. There are no detector images from this instrument-only config.
+Its Start acquisition button is not usable because no RX source is configured.
+
+From a second IGX terminal, validate all readbacks through the supervisor:
+
+```bash
+sudo docker exec stem-instrument-demo python3 \
+  /opt/stem_daqiri/bin/validate_emulated_instrument.py
+
+# Exercise every fault and recovery path, then return to fresh healthy samples.
+sudo docker exec stem-instrument-demo python3 \
+  /opt/stem_daqiri/bin/validate_emulated_instrument.py --exercise-failures
+
+# Leave an individual scenario active so its results can be examined in the GUI.
+sudo docker exec stem-instrument-demo python3 \
+  /opt/stem_daqiri/bin/validate_emulated_instrument.py \
+  --scenario link_errors --module-id 1
+```
+
+The client can also run from a host checkout or over the forwarded control port;
+it needs only `pyzmq` and accepts `--endpoint tcp://127.0.0.1:15557`. It refuses
+to run unless the reported backend is `emulated_readonly`. Fault commands are
+separately rejected by both the supervisor and real-hardware service.
+
+Available scenarios are `healthy`, `suspect_temperature` (Q3=198.86 C),
+`camera_error`, `camera_timeout`, `malformed_temperature`, `fpga_timeout`,
+`malformed_fpga`, `link_errors`, and `unsynchronized`. FPGA faults affect only
+the selected module, leaving other modules readable. Camera errors/timeouts
+affect both camera commands; malformed temperature data affects temperature
+only. A suspect thermistor is retained and warned about, not a transport error.
+Likewise, successfully reading latched FPGA errors is a completed read; it does
+not mean the link is healthy.
+
+The supplied config sets four modules, small response delays, a slow +/-0.2 C
+temperature oscillation, and a one-second camera read timeout. These are demo
+signals, not measured detector dynamics. `module_count` supports 1-8 modules;
+`camera_delay_ms`, `fpga_delay_ms`, `temperature_drift_c`, and
+`read_timeout_seconds` are startup options. `emulator.set_scenario` changes
+only the scenario and fault module at runtime; it refuses changes during a read
+and marks old cached samples stale until they are measured again.
+
+This mode remains read-only: power, insert/retract, resync, and scan actions are
+rejected. Use the original `mock` backend to test those simulated control flows.
+The emulator creates **no detector frame packets** and does not replace
+DAQIRI's network, synthetic, or HDF5 sources. To combine image acquisition with
+emulated camera readouts, copy only the `instrument` block into your complete
+working acquisition config and retain its actual data-source settings.
 
 ## Read-only operations
 
@@ -50,6 +150,9 @@ register 0. The response must be 24 bytes, echo the first two words, and return
 `0x70000000 | 420` in word 2; word 3 is the status register value. No write bit
 is set. Each attempt uses a new connected UDP socket, with a configurable
 timeout/retry bound; it never opens a detector data port or changes routing.
+
+Each module can optionally override the global UDP port with a `port` field;
+normal hardware configurations continue to use port 42000 by default.
 
 Register 420 is decoded as six-bit masks at bits 5:0 (JESD sync), 13:8
 (not-in-table), 21:16 (disparity error), and 29:24 (characters-were-Ks). Full
@@ -140,6 +243,7 @@ From the repository root with the GUI/test Python environment activated:
 
 ```bash
 python -m unittest discover -s cpp_daqiri/instrument -p 'test_readonly.py' -v
+python -m unittest discover -s cpp_daqiri/instrument -p 'test_emulator.py' -v
 python -m unittest discover -s cpp_daqiri/dm -p 'test_*.py' -v
 QT_QPA_PLATFORM=offscreen python -m unittest discover \
   -s cpp_daqiri/gui -p 'test_gui_protocol.py' -v
@@ -155,10 +259,13 @@ routing requests over local ZeroMQ, provide a locally built supervisor:
 
 ```bash
 STEM_TEST_SUPERVISOR_BIN=/path/to/stem_daqiri_supervisor \
-  python -m unittest discover -s cpp_daqiri/instrument -p 'test_readonly.py' -v
+  python -m unittest discover -s cpp_daqiri/instrument -p 'test_*.py' -v
 ```
 
-That test replaces SSH/register subprocesses with `test_hardware_process.py` and
-does not launch RX. Running tests requires permission to bind localhost sockets;
+The hardware-read test replaces SSH/register subprocesses with
+`test_hardware_process.py`. The emulator integration test launches the persistent
+backend and runs the complete scenario-validation client, including recovery,
+through a compiled supervisor. Neither test launches RX or contacts hardware.
+Running tests requires permission to bind localhost sockets;
 the native DM palette still needs a separate Windows/DM check. Full CUDA/Docker
 and actual instrument readback validation must be done on the IGX.

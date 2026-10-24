@@ -1,0 +1,29 @@
+%YAML 1.2
+---
+# Camera/FPGA readback emulation only: no RX, GPU work, or real hardware traffic.
+source: "network"
+control:
+  enabled: true
+  start_acquisition: false
+  endpoint: "tcp://*:5557"
+  runtime_config_path: "/tmp/stem_daqiri_runtime.yaml"
+
+instrument:
+  enabled: true
+  mode: "emulated_readonly"
+  endpoint: "ipc:///tmp/stem_daqiri_instrument.ipc"
+  launch_service: true
+  service_binary: "/opt/stem_daqiri/bin/stem_daqiri_instrument_readonly"
+  readonly:
+    stale_after_seconds: 120.0
+    audit_log_path: "/tmp/stem_instrument_emulated_audit.jsonl"
+  emulator:
+    module_count: 4
+    scenario: "healthy"
+    fault_module: 0
+    camera_delay_ms: 50
+    fpga_delay_ms: 2
+    temperature_drift_c: 0.2
+    read_timeout_seconds: 1.0
+    # Listeners bind only 127.0.0.1 with dynamically assigned ports.
+    # No camera IP, SSH identity, or physical FPGA address is used.

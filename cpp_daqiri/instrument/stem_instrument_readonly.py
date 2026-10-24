@@ -159,6 +159,8 @@ class HardwareReader:
                 raise ValueError("detector module IDs must be integers from 0 to 7")
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", str(module.get("host", ""))):
                 raise ValueError("invalid detector module host")
+            if "port" in module and (type(module["port"]) is not int or not 1 <= module["port"] <= 65535):
+                raise ValueError("detector module port must be an integer in [1,65535]")
         identifiers = [item["id"] for item in self.modules]
         if len(set(identifiers)) != len(identifiers):
             raise ValueError("detector module IDs must be unique")
@@ -227,7 +229,8 @@ class HardwareReader:
         for module in self.modules:
             try:
                 if self.transport == "udp":
-                    value = read_link_register(module["host"], self.port, self.register_timeout, self.retries)
+                    value = read_link_register(module["host"], module.get("port", self.port),
+                                               self.register_timeout, self.retries)
                 else:
                     raw = self.runner(
                         self.reader_argv + ["--host", module["host"], "--register", "420"], self.timeout,
@@ -253,8 +256,14 @@ class HardwareReader:
 
 
 class ReadOnlyInstrumentService:
-    def __init__(self, config, reader=None, clock=time.time):
+    def __init__(self, config, reader=None, clock=time.time, emulator=None):
         self.config = config
+        self.emulator = emulator
+        self.mode = config.get("mode", "hardware_readonly")
+        if self.mode not in ("hardware_readonly", "emulated_readonly"):
+            raise ValueError("unsupported read-only instrument mode")
+        if (self.mode == "emulated_readonly") != (emulator is not None):
+            raise ValueError("emulated_readonly mode requires its loopback emulator")
         self.reader = reader if reader is not None else HardwareReader(config.get("readonly", {}))
         self.clock = clock
         self.stale_seconds = finite_number(config.get("readonly", {}).get("stale_after_seconds", 120))
@@ -266,7 +275,8 @@ class ReadOnlyInstrumentService:
         self.stopping = threading.Event()
         self.next_id = 1
         self.state = {
-            "enabled": True, "service_online": True, "mode": "hardware_readonly",
+            "enabled": True, "service_online": True, "mode": self.mode,
+            "simulated": emulator is not None,
             "capabilities": {
                 "read_only": True, "commands": self.reader.supported_commands,
                 "camera_control": False, "detector_control": False, "scan_control": False,
@@ -279,7 +289,8 @@ class ReadOnlyInstrumentService:
             "operation": {"state": "idle", "name": "", "id": "", "error": "",
                           "step": "", "completed_steps": 0, "total_steps": 0},
             "reads": {name: {"status": "not_read", "sampled_at": None, "attempted_at": None,
-                             "error": "", "raw": ""} for name in READS.values()},
+                             "error": "", "raw": "", "simulated": emulator is not None}
+                      for name in READS.values()},
         }
         self.worker = threading.Thread(target=self._work, name="instrument-reader", daemon=True)
         self.worker.start()
@@ -304,6 +315,8 @@ class ReadOnlyInstrumentService:
             record["stale"] = timestamp is None or record["status"] != "ok" or (
                 record["age_seconds"] > self.stale_seconds
             )
+        if self.emulator is not None:
+            state["emulator"] = self.emulator.snapshot()
         return state
 
     def handle(self, request):
@@ -313,8 +326,28 @@ class ReadOnlyInstrumentService:
         if command == "shutdown":
             self.stopping.set()
             return {"ok": True}
+        if command.startswith("emulator."):
+            if self.emulator is None:
+                return {"ok": False, "error": "emulator commands require emulated_readonly mode"}
+            if command == "emulator.get_state":
+                return {"ok": True, "instrument": self.snapshot()}
+            if command != "emulator.set_scenario" or set(request) - {
+                "command", "request_id", "scenario", "module_id"
+            }:
+                return {"ok": False, "error": "unsupported emulator command or parameters"}
+            with self.lock:
+                if self.state["operation"]["state"] == "running":
+                    return {"ok": False, "error": "an instrument read is already running"}
+                try:
+                    self.emulator.set_scenario(request.get("scenario"), request.get("module_id", 0))
+                except ValueError as error:
+                    return {"ok": False, "error": str(error)}
+                for record in self.state["reads"].values():
+                    record.update(status="scenario_changed", error="")
+            return {"ok": True, "message": "emulator scenario updated; request fresh readbacks",
+                    "instrument": self.snapshot()}
         if command not in READS:
-            return {"ok": False, "error": "command unavailable in hardware_readonly mode: " + str(command)}
+            return {"ok": False, "error": "command unavailable in " + self.mode + " mode: " + str(command)}
         if set(request) - {"command", "request_id"}:
             return {"ok": False, "error": "read commands accept no hardware parameters"}
         with self.lock:
@@ -365,7 +398,23 @@ class ReadOnlyInstrumentService:
 
     def close(self):
         self.stopping.set()
+        if self.emulator is not None:
+            self.emulator.close()
         self.worker.join()
+
+
+def create_service(config):
+    if config.get("mode") != "emulated_readonly":
+        return ReadOnlyInstrumentService(config)
+    from stem_instrument_emulator import InstrumentEmulator
+
+    emulator = InstrumentEmulator(config.get("emulator", {}))
+    try:
+        reader = HardwareReader(emulator.reader_config(), runner=emulator.camera_runner)
+        return ReadOnlyInstrumentService(config, reader=reader, emulator=emulator)
+    except BaseException:
+        emulator.close()
+        raise
 
 
 def main():
@@ -376,12 +425,12 @@ def main():
     parser.add_argument("config", type=Path)
     args = parser.parse_args()
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))["instrument"]
-    if not config.get("enabled") or config.get("mode") != "hardware_readonly":
-        raise ValueError("requires instrument.enabled=true and mode=hardware_readonly")
+    if not config.get("enabled") or config.get("mode") not in ("hardware_readonly", "emulated_readonly"):
+        raise ValueError("requires enabled hardware_readonly or emulated_readonly instrument mode")
     endpoint = config.get("endpoint", "ipc:///tmp/stem_daqiri_instrument.ipc")
     if not (endpoint.startswith("ipc://") or endpoint.startswith("tcp://127.0.0.1:")):
         raise ValueError("instrument service endpoint must be local IPC or loopback TCP")
-    service = ReadOnlyInstrumentService(config)
+    service = create_service(config)
     signal.signal(signal.SIGINT, lambda *_: service.stopping.set())
     signal.signal(signal.SIGTERM, lambda *_: service.stopping.set())
     context = zmq.Context()
@@ -391,7 +440,7 @@ def main():
     socket.setsockopt(zmq.SNDTIMEO, 1000)
     try:
         socket.bind(endpoint)
-        print("read-only instrument service listening on " + endpoint, flush=True)
+        print(service.mode + " instrument service listening on " + endpoint, flush=True)
         while not service.stopping.is_set():
             try:
                 request = socket.recv_json()

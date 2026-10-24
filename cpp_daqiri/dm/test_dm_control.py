@@ -297,6 +297,21 @@ class MailboxTest(unittest.TestCase):
         self.mailbox.publish_state(snapshot)
         self.assertEqual(self.tags.get_string(path(CAMERA_ROOT, "Temperature:Q3")), "not read")
 
+    def test_emulated_readbacks_are_labeled_and_remain_readonly(self):
+        snapshot = state()
+        snapshot["instrument"].update(
+            mode="emulated_readonly", simulated=True,
+            reads={"temperature": {"status": "ok", "simulated": True,
+                                    "sampled_at": 1000, "stale": False}},
+        )
+        self.mailbox.publish_state(snapshot)
+        self.assertIn("SIMULATED", self.tags.get_string(path(CAMERA_ROOT, "TemperatureReadStatus")))
+        self.assertEqual(self.tags.get_string(path(CAMERA_ROOT, "Mode")), "emulated_readonly")
+        self.assertTrue(self.tags.get_bool(path(CAMERA_ROOT, "ReadOnly")))
+        self.assertEqual(build_request("camera_read_biases", self.tags), {"command": "camera.read_biases"})
+        with self.assertRaises(ValueError):
+            build_request("camera_power_up", self.tags)
+
 
 class BridgeTest(unittest.TestCase):
     def test_pending_command_has_priority_over_state_poll(self):

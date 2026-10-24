@@ -314,6 +314,12 @@ references. See [`../cpp_daqiri/instrument/README.md`](../cpp_daqiri/instrument/
   reporting, and explicit rejection of all hardware-changing commands.
 - Qt readout tab and native DM telemetry tabs using the same supervisor endpoint.
 - Hardware-free parser, UDP, GUI/DM-bridge, and native supervisor/service tests.
+- Persistent opt-in `emulated_readonly` backend: the same read-only adapter
+  consumes local camera-text and FPGA-UDP responses through the supervisor,
+  with simulated readouts explicitly labeled in both GUIs. Healthy, malformed,
+  timeout, suspect-probe, and link-error scenarios support interactive testing
+  with acquisition stopped. It does not emulate SSH authentication or generate
+  detector frames, and cannot fall back to real hardware targets.
 
 Still required on the actual instrument: verify SSH reachability and host
 identity, confirm board addresses, and compare readbacks with trusted legacy

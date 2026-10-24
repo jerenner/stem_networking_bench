@@ -705,6 +705,27 @@ log records operation acceptance and final status. See
 [`../docs/CAMERA_HEAD_CONTROL_PLAN.md`](../docs/CAMERA_HEAD_CONTROL_PLAN.md) for
 the boundary between this mock and future reviewed hardware adapters.
 
+#### Persistent camera/FPGA emulator
+
+`instrument.mode: emulated_readonly` connects the real read-only adapter to
+persistent loopback camera-text and FPGA-register responders. The supervisor
+launches it automatically and it remains available while acquisition is stopped.
+Both Qt and DM use their existing read buttons and control port; results are
+explicitly marked **SIMULATED**. This tests the actual camera parsers and FPGA
+UDP read protocol without camera credentials or hardware traffic, but does not
+test SSH authentication or generate detector images.
+
+After rebuilding the image, run the supervisor with installed config
+`/opt/stem_daqiri/bin/configs/stem_instrument_emulated.yaml` (or copy
+[`configs/stem_instrument_emulated.yaml`](configs/stem_instrument_emulated.yaml)
+to a host-mounted config). The installed `validate_emulated_instrument.py`
+client verifies all readbacks and can inject timeout, malformed-response,
+suspect-probe, and FPGA-link fault scenarios. See
+[`instrument/README.md`](instrument/README.md#persistent-camerafpga-emulation)
+for the minimal Docker invocation and validation commands. The original `mock`
+mode remains available for simulated power/scan operations; the new emulator
+is specifically for exercising the read-only hardware-adapter path.
+
 #### Read-only camera and FPGA telemetry
 
 `instrument.mode: hardware_readonly` selects the new live adapter rather than

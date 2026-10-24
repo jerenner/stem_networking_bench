@@ -107,6 +107,22 @@ class InstrumentPanelTest(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
+    def test_emulated_service_is_explicitly_labeled(self):
+        host = QtWidgets.QWidget()
+        host.send_control = lambda *_: None
+        panel = MainWindow._instrument_tab(host)
+        try:
+            MainWindow._update_instrument(host, {
+                "enabled": True, "service_online": True, "mode": "emulated_readonly",
+                "reads": {"temperature": {"status": "ok", "simulated": True}},
+            })
+            self.assertIn("emulated_readonly", host.instrument_badge.text())
+            self.assertIn("SIMULATED", host.instrument_read_status["temperature"].text())
+            self.assertTrue(host.instrument_read_buttons["camera.read_temperature"].isEnabled())
+        finally:
+            panel.close()
+            host.close()
+
     def test_reads_work_without_acquisition_and_show_units_errors_and_capabilities(self):
         host = QtWidgets.QWidget()
         requests = []

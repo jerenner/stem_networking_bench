@@ -295,6 +295,7 @@ class SupervisorIntegrationTest(unittest.TestCase):
                 self.assertEqual(state["instrument"]["camera"]["biases"]["BIASN"]["unit"], "mA")
                 self.assertTrue(state["instrument"]["detector"]["synchronized"])
                 self.assertFalse(request("camera.power_up")["ok"])
+                self.assertFalse(request("emulator.set_scenario")["ok"])
                 calls = [json.loads(line) for line in (directory / "calls.jsonl").read_text().splitlines()]
                 self.assertEqual(calls, ["dsh sensor temp", "dsh bias adc volts", "register 420", "register 420"])
                 self.assertTrue(request("shutdown_supervisor")["ok"])

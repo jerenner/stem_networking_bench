@@ -199,17 +199,18 @@ class PersistentSupervisor {
     const YAML::Node instrument = original_root["instrument"];
     instrument_enabled_ = yaml_map_value(instrument, "enabled", false);
     instrument_mode_ = yaml_map_value<std::string>(instrument, "mode", "mock");
+    const bool readonly_instrument = instrument_mode_ == "hardware_readonly" ||
+                                     instrument_mode_ == "emulated_readonly";
     instrument_endpoint_ = yaml_map_value<std::string>(
         instrument, "endpoint", "ipc:///tmp/stem_daqiri_instrument.ipc");
     launch_instrument_service_ =
         yaml_map_value(instrument, "launch_service",
-                       instrument_mode_ == "mock" ||
-                       instrument_mode_ == "hardware_readonly");
+                       instrument_mode_ == "mock" || readonly_instrument);
     instrument_binary_ = getenv_or(
         "STEM_DAQIRI_INSTRUMENT_BIN",
         yaml_map_value<std::string>(
             instrument, "service_binary",
-            instrument_mode_ == "hardware_readonly"
+            readonly_instrument
                 ? "/opt/stem_daqiri/bin/stem_daqiri_instrument_readonly"
                 : "/opt/stem_daqiri/bin/stem_daqiri_instrument_mock"));
     cached_instrument_state_ = instrument_enabled_
@@ -367,6 +368,11 @@ class PersistentSupervisor {
         if (command.rfind("mock.", 0) == 0 && instrument_mode_ != "mock") {
           throw std::runtime_error("mock commands require instrument.mode=mock");
         }
+        if (command.rfind("emulator.", 0) == 0 &&
+            instrument_mode_ != "emulated_readonly") {
+          throw std::runtime_error(
+              "emulator commands require instrument.mode=emulated_readonly");
+        }
         const std::string instrument_response =
             forward_to_instrument(request_text, 1500);
         const YAML::Node parsed = YAML::Load(instrument_response);
@@ -490,7 +496,8 @@ class PersistentSupervisor {
            command.rfind("detector.", 0) == 0 ||
            command.rfind("scan.", 0) == 0 ||
            command.rfind("operation.", 0) == 0 ||
-           command.rfind("mock.", 0) == 0;
+           command.rfind("mock.", 0) == 0 ||
+           command.rfind("emulator.", 0) == 0;
   }
 
   void remove_stale_instrument_socket() const {
@@ -506,9 +513,10 @@ class PersistentSupervisor {
     if (!instrument_enabled_) { return; }
     if (launch_instrument_service_) {
       if (instrument_mode_ != "mock" &&
-          instrument_mode_ != "hardware_readonly") {
+          instrument_mode_ != "hardware_readonly" &&
+          instrument_mode_ != "emulated_readonly") {
         throw std::runtime_error(
-            "automatic instrument launch requires mock or hardware_readonly mode");
+            "automatic instrument launch requires mock, hardware_readonly, or emulated_readonly mode");
       }
       remove_stale_instrument_socket();
       std::vector<std::string> arguments = {

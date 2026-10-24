@@ -27,6 +27,8 @@ def read_status(record):
     if not record:
         return "not read (legacy/mock state)"
     status = record.get("status", "not_read")
+    if record.get("simulated"):
+        status = "SIMULATED / " + status
     timestamp = record.get("sampled_at")
     if timestamp is not None:
         stamp = datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc)
@@ -54,7 +56,9 @@ def instrument_view(instrument):
     detector = instrument.get("detector", {})
     records = instrument.get("reads", {})
     capabilities = instrument.get("capabilities", {})
-    read_only = capabilities.get("read_only", instrument.get("mode") == "hardware_readonly")
+    read_only = capabilities.get("read_only", instrument.get("mode") in (
+        "hardware_readonly", "emulated_readonly"
+    ))
     commands = capabilities.get("commands")
     if commands is None:
         commands = ["camera.read_temperature", "camera.read_biases", "detector.read_link_status"]

@@ -100,6 +100,16 @@ first instrument-only IGX test are documented in
 [`../instrument/README.md`](../instrument/README.md). No new Python packages or
 camera credentials are needed on the Windows DM machine.
 
+For camera-free testing of the same readouts, use
+`instrument.mode: emulated_readonly` and the
+[`emulated instrument config`](../configs/stem_instrument_emulated.yaml).
+The supervisor starts persistent local responders, using the real parsers and
+FPGA register-read protocol. These read statuses display **SIMULATED**. The DM
+script and existing control-port forward need no changes, and no camera login
+is needed. It emulates readbacks, not SSH authentication, detector frame data,
+or hardware-changing camera/scan operations; see the
+[`emulator guide`](../instrument/README.md#persistent-camerafpga-emulation).
+
 The Python loop polls DAQ state automatically. Press **Refresh** in the palette
 to copy the newest cached state and accepted settings into the displayed
 fields. Control requests temporarily serialize with image receipt; they do not

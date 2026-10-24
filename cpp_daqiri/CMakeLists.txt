@@ -243,6 +243,7 @@ if(STEM_DAQIRI_BUILD_RX)
     configs/stem_replay_hdf5.yaml
     configs/stem_rx_synthetic.yaml
     configs/stem_instrument_readonly.yaml
+    configs/stem_instrument_emulated.yaml
   )
 endif()
 
@@ -280,6 +281,8 @@ endif()
 if(TARGET stem_daqiri_supervisor)
   install(PROGRAMS instrument/stem_instrument_readonly.py
     DESTINATION bin RENAME stem_daqiri_instrument_readonly)
+  install(FILES instrument/stem_instrument_emulator.py DESTINATION bin)
+  install(PROGRAMS scripts/validate_emulated_instrument.py DESTINATION bin)
   install(FILES instrument/requirements.txt
     DESTINATION share/stem_daqiri RENAME instrument-requirements.txt)
 endif()
