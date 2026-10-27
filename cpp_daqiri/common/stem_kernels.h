@@ -40,6 +40,9 @@ namespace stem {
 // definitions so the two pipelines produce identical batched tensors.
 // ---------------------------------------------------------------------------
 struct PacketHeaderInfo {
+  // For fpga_tiles: row_number/frame_index are the firmware frame counter,
+  // source_id is the full byte-2 ID, row_offset is byte 3, and global_row is
+  // a validity sentinel (0 or -1). Legacy semantics remain unchanged.
   uint16_t row_number;
   uint16_t source_id;
   uint16_t frame_index;
@@ -102,7 +105,8 @@ void stem_tx_update_burst_headers(
 // byte-for-byte equivalent to the Holoscan StemReceiverOp output.
 // ---------------------------------------------------------------------------
 void stem_extract_packet_headers(uint8_t** src_ptrs, PacketHeaderInfo* headers,
-                                 uint32_t num_pkts, cudaStream_t stream);
+                                 uint32_t num_pkts, cudaStream_t stream,
+                                 bool fpga_tiles = false);
 
 // Tile-readout placement gather: scatter each packet's available payload
 // into its (ZLP or core) tile within a full

@@ -455,7 +455,13 @@ struct BurstWriter::Impl {
                            processing_stage_name(job.runtime.stage));
     write_string_attribute(dataset, "interface_name", first.interface_name);
     write_string_attribute(dataset, "assembly_mode",
-                           first.arrival_order ? "arrival_order" : "header");
+                           first.assembly_mode());
+    if (first.fpga_tiles) {
+      write_string_attribute(dataset, "mapping_status", "provisional");
+      write_string_attribute(dataset, "fpga_zlp_slot_order",
+                             first.fpga_zlp_row_first ? "row_then_read"
+                                                      : "read_then_row");
+    }
     write_string_attribute(dataset, "dtype",
                            output_float ? "float32" : "uint16");
   }
@@ -931,7 +937,9 @@ struct ThinnedStreamPublisher::Impl {
          << ",\"received_packets\":" << slot.metadata.received_packets
          << ",\"expected_packets\":" << slot.metadata.expected_packets
          << ",\"assembly_mode\":\""
-         << (slot.metadata.arrival_order ? "arrival_order" : "header") << "\""
+         << slot.metadata.assembly_mode() << "\""
+         << ",\"mapping_provisional\":"
+         << (slot.metadata.fpga_tiles ? "true" : "false")
          << ",\"processing_stage\":\""
          << processing_stage_name(slot.runtime.stage)
          << "\",\"dtype\":\"float32\",\"byte_order\":\"little\""

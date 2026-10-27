@@ -31,6 +31,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -64,6 +65,7 @@
 #include "stem_arrival_order.h"
 #include "stem_aux_output.h"
 #include "stem_control_server.h"
+#include "stem_fpga_tiles.h"
 #include "stem_kernels.h"
 #include "stem_packet.h"
 #include "stem_synthetic_source.h"
@@ -148,6 +150,11 @@ struct StemRxConfig {
   uint16_t stem_header_size = stem::STEM_HEADER_SIZE;
   bool assemble_by_arrival = false;
 
+  bool fpga_tile_headers = false;
+  bool fpga_zlp_row_first = false;
+  std::vector<uint16_t> expected_tile_ids;
+  std::array<bool, 256> expected_tile_id_enabled{};
+
   // Detector-data bytes after stem_header_size custom bytes. Zero selects the
   // legacy/native default from tile_duplicate_prefix_to_simulate_payload.
   uint16_t payload_size = 0;
@@ -202,6 +209,18 @@ struct StemRxConfig {
   uint16_t effective_payload_size() const {
     return stem::resolve_tile_payload_size(
         payload_size, tile_duplicate_prefix_to_simulate_payload);
+  }
+
+  uint32_t expected_packets_per_frame() const {
+    return fpga_tile_headers
+               ? static_cast<uint32_t>(expected_tile_ids.size()) *
+                     stem::FPGA_TILES_PER_LINK
+               : __builtin_popcount(expected_source_mask & 0xffu) *
+                     stem::TILE_PACKETS_PER_SOURCE;
+  }
+
+  bool protect_gather_inputs() const {
+    return assemble_by_arrival || fpga_tile_headers;
   }
 };
 
@@ -422,6 +441,32 @@ void apply_stem_rx_node(StemRxConfig& cfg, const YAML::Node& rx) {
       rx["stem_header_size"].as<uint16_t>(cfg.stem_header_size);
   cfg.assemble_by_arrival =
       rx["assemble_by_arrival"].as<bool>(cfg.assemble_by_arrival);
+  if (rx["header_format"]) {
+    const auto format = rx["header_format"].as<std::string>();
+    if (format != "legacy" && format != "fpga_tiles") {
+      throw std::runtime_error("stem_rx.header_format must be legacy or fpga_tiles");
+    }
+    cfg.fpga_tile_headers = format == "fpga_tiles";
+  }
+  if (rx["fpga_zlp_slot_order"]) {
+    const auto order = rx["fpga_zlp_slot_order"].as<std::string>();
+    if (order != "read_then_row" && order != "row_then_read") {
+      throw std::runtime_error(
+          "stem_rx.fpga_zlp_slot_order must be read_then_row or row_then_read");
+    }
+    cfg.fpga_zlp_row_first = order == "row_then_read";
+  }
+  if (rx["expected_tile_ids"]) {
+    cfg.expected_tile_ids = rx["expected_tile_ids"].as<std::vector<uint16_t>>();
+    cfg.expected_tile_id_enabled.fill(false);
+    for (const auto id : cfg.expected_tile_ids) {
+      if (!stem::valid_fpga_tile_id(id) || cfg.expected_tile_id_enabled[id]) {
+        throw std::runtime_error(
+            "stem_rx.expected_tile_ids must contain unique IDs in 0..29 or 128..157");
+      }
+      cfg.expected_tile_id_enabled[id] = true;
+    }
+  }
   if (rx["payload_size"]) {
     cfg.payload_size = rx["payload_size"].as<uint16_t>();
     stem::validate_tile_payload_size(cfg.payload_size);
@@ -443,6 +488,20 @@ void apply_stem_rx_node(StemRxConfig& cfg, const YAML::Node& rx) {
 
 void validate_stem_rx_cfg(const StemRxConfig& cfg) {
   stem::validate_tile_payload_size(cfg.effective_payload_size());
+  if (cfg.fpga_tile_headers &&
+      (cfg.assemble_by_arrival || cfg.synthetic_source || cfg.capture_latency ||
+       cfg.stem_header_size != stem::STEM_HEADER_SIZE ||
+       cfg.effective_payload_size() != stem::TILE_PAYLOAD_BYTES ||
+       cfg.tile_duplicate_prefix_to_simulate_payload)) {
+    throw std::runtime_error(
+        "header_format=fpga_tiles requires source=network, assemble_by_arrival=false, "
+        "capture_latency=false, stem_header_size=64, payload_size=8192 and "
+        "tile_duplicate_prefix_to_simulate_payload=false");
+  }
+  if (cfg.fpga_tile_headers && cfg.expected_tile_ids.empty()) {
+    throw std::runtime_error(
+        "header_format=fpga_tiles requires explicit expected_tile_ids for each receiver");
+  }
   if (cfg.stem_header_size != stem::STEM_HEADER_SIZE &&
       !(cfg.assemble_by_arrival && cfg.stem_header_size == 0)) {
     throw std::runtime_error(
@@ -459,11 +518,12 @@ void validate_stem_rx_cfg(const StemRxConfig& cfg) {
   if (cfg.frames_per_tensor == 0) {
     throw std::runtime_error("stem_rx.frames_per_tensor must be > 0");
   }
-  if (cfg.assemble_by_arrival && cfg.frames_per_tensor > stem::FRAMES_PER_WRAP) {
+  if (cfg.protect_gather_inputs() &&
+      cfg.frames_per_tensor > stem::FRAMES_PER_WRAP) {
     throw std::runtime_error(
-        "arrival-order frames_per_tensor must be in [1, 128]");
+        "arrival-order/FPGA frames_per_tensor must be in [1, 128]");
   }
-  if ((cfg.expected_source_mask & 0xffu) == 0) {
+  if (!cfg.fpga_tile_headers && (cfg.expected_source_mask & 0xffu) == 0) {
     throw std::runtime_error(
         "stem_rx.expected_source_mask must enable at least one source");
   }
@@ -1737,17 +1797,18 @@ class FrameAssembler {
                  std::shared_ptr<FramePipeline> pipeline)
       : cfg_(cfg),
         pipeline_(std::move(pipeline)),
-        arrival_sequence_(cfg.expected_source_mask & 0xffu),
+        arrival_sequence_(cfg.fpga_tile_headers
+                              ? 0xffu : cfg.expected_source_mask & 0xffu),
         expected_source_count_(
             __builtin_popcount(cfg.expected_source_mask & 0xff)),
         rows_per_tensor_(cfg.frames_per_tensor * stem::FRAME_HEIGHT),
-        packet_cells_per_frame_(expected_source_count_ *
-                                stem::TILE_PACKETS_PER_SOURCE),
+        packet_cells_per_frame_(
+            cfg.fpga_tile_headers ? stem::FULL_FRAME_TILE_PACKETS
+                                 : expected_source_count_ * stem::TILE_PACKETS_PER_SOURCE),
         placement_capacity_(cfg.frames_per_tensor *
                             stem::FULL_FRAME_TILE_PACKETS),
         expected_packets_per_batch_(cfg.frames_per_tensor *
-                                    expected_source_count_ *
-                                    stem::TILE_PACKETS_PER_SOURCE) {
+                                    cfg.expected_packets_per_frame()) {
     STEM_CUDA_TRY(cudaMallocHost(reinterpret_cast<void**>(&h_pkt_ptrs_),
                                  sizeof(uint8_t*) * placement_capacity_));
     STEM_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_pkt_ptrs_),
@@ -1759,10 +1820,10 @@ class FrameAssembler {
         cudaMalloc(reinterpret_cast<void**>(&d_placements_),
                    sizeof(stem::PacketPlacement) * placement_capacity_));
     STEM_CUDA_TRY(cudaStreamCreate(&stream_));
-    if (cfg_.assemble_by_arrival) {
-      STEM_CUDA_TRY(cudaEventCreateWithFlags(&arrival_gather_done_,
+    if (cfg_.protect_gather_inputs()) {
+      STEM_CUDA_TRY(cudaEventCreateWithFlags(&gather_done_,
                                             cudaEventDisableTiming));
-      arrival_gather_owners_.reserve(16);
+      gather_owners_.reserve(16);
     }
 
     const uint32_t slot_count =
@@ -1798,8 +1859,8 @@ class FrameAssembler {
 
   ~FrameAssembler() {
     if (stream_) { cudaStreamSynchronize(stream_); }
-    arrival_gather_owners_.clear();
-    if (arrival_gather_done_) { cudaEventDestroy(arrival_gather_done_); }
+    gather_owners_.clear();
+    if (gather_done_) { cudaEventDestroy(gather_done_); }
     bool slots_busy = true;
     while (slots_busy) {
       slots_busy = false;
@@ -1836,6 +1897,9 @@ class FrameAssembler {
 
   std::vector<int64_t>& latencies_us() { return latencies_us_; }
   uint64_t tile_packets_ignored() const { return tile_packets_ignored_; }
+  uint64_t invalid_headers() const { return invalid_headers_; }
+  uint64_t duplicate_packets() const { return duplicate_packets_; }
+  uint64_t late_packets() const { return late_packets_; }
   uint64_t incomplete_batches() const { return incomplete_batches_; }
   uint64_t incomplete_missing_total() const {
     return incomplete_missing_total_;
@@ -1868,7 +1932,8 @@ class FrameAssembler {
     }
     STEM_CUDA_TRY(cudaMemcpyAsync(d_burst_ptrs_, h_burst_ptrs_, sizeof(uint8_t*) * n,
                                   cudaMemcpyHostToDevice, stream_));
-    stem::stem_extract_packet_headers(d_burst_ptrs_, d_burst_headers_, n, stream_);
+    stem::stem_extract_packet_headers(d_burst_ptrs_, d_burst_headers_, n, stream_,
+                                      cfg_.fpga_tile_headers);
     STEM_CUDA_TRY(cudaMemcpyAsync(h_burst_headers_, d_burst_headers_,
                                   sizeof(stem::PacketHeaderInfo) * n,
                                   cudaMemcpyDeviceToHost, stream_));
@@ -1892,9 +1957,9 @@ class FrameAssembler {
     *total_bytes += daqiri::get_burst_tot_byte(burst);
 
     validate_packet_layout_once(burst);
+    if (cfg_.protect_gather_inputs()) { reclaim_gather_inputs(false); }
 
     if (cfg_.assemble_by_arrival) {
-      reclaim_arrival_gather(false);
       if (cfg_.hds && burst->hdr.hdr.num_segs < 2) {
         fail_packet_layout("arrival-order HDS requires two packet segments");
       }
@@ -1980,7 +2045,8 @@ class FrameAssembler {
   // Force-emit anything still pending at shutdown. Useful for short
   // smoke runs so we at least get one tensor's worth of work logged.
   void flush(uint64_t* frames_assembled) {
-    while (current_batch_unique_packets_ > 0) {
+    while (current_batch_unique_packets_ > 0 ||
+           (cfg_.fpga_tile_headers && !pending_packets_.empty())) {
       close_batch_and_emit(frames_assembled);
     }
   }
@@ -2010,6 +2076,16 @@ class FrameAssembler {
   }
 
   stem::PacketHeaderInfo parse_packet_header(const uint8_t* stem_hdr) const {
+    if (cfg_.fpga_tile_headers) {
+      const auto wire = stem::decode_fpga_tile_header(stem_hdr);
+      stem::PacketHeaderInfo header{};
+      header.row_number = wire.frame_number;
+      header.frame_index = wire.frame_number;
+      header.source_id = wire.tile_id;
+      header.row_offset = wire.tile_slot;
+      header.global_row = wire.valid ? 0 : -1;
+      return header;
+    }
     const uint16_t row_number =
         static_cast<uint16_t>(stem_hdr[stem::STEM_HDR_OFF_ROW_NUMBER_LO]) |
         (static_cast<uint16_t>(stem_hdr[stem::STEM_HDR_OFF_ROW_NUMBER_HI])
@@ -2071,6 +2147,8 @@ class FrameAssembler {
                 << "B";
       if (cfg_.assemble_by_arrival) {
         std::cout << "; STEM header decoding disabled\n";
+      } else if (cfg_.fpga_tile_headers) {
+        std::cout << "; FPGA tile header decoding enabled\n";
       } else {
         std::cout << "; epoch_us remains in seg0 at byte "
                   << (cfg_.header_size + stem::STEM_HDR_OFF_EPOCH_US) << "\n";
@@ -2204,6 +2282,10 @@ class FrameAssembler {
   void admit_packet(uint8_t* packet_ptr, const stem::PacketHeaderInfo& header,
                     const std::shared_ptr<void>& holder,
                     uint64_t* drops_unexpected_source) {
+    if (cfg_.fpga_tile_headers) {
+      admit_fpga_packet(packet_ptr, header, holder, drops_unexpected_source);
+      return;
+    }
     if ((header.source_id >= 8) ||
         !((cfg_.expected_source_mask >> header.source_id) & 0x1u) ||
         header.global_row < 0) {
@@ -2237,6 +2319,40 @@ class FrameAssembler {
                  header.row_number, header.source_id);
   }
 
+  void admit_fpga_packet(uint8_t* packet_ptr, const stem::PacketHeaderInfo& header,
+                         const std::shared_ptr<void>& holder,
+                         uint64_t* drops_unexpected_source) {
+    if (header.global_row < 0 || !stem::valid_fpga_tile_id(header.source_id) ||
+        header.row_offset >= stem::FPGA_TILES_PER_LINK) {
+      invalid_headers_++;
+      return;
+    }
+    if (!cfg_.expected_tile_id_enabled[header.source_id]) {
+      (*drops_unexpected_source)++;
+      return;
+    }
+    const int64_t frame = fpga_frame_counter_.unwrap(header.frame_index);
+    if (frame < 0 || (stream_synced_ &&
+                     static_cast<uint64_t>(frame) < current_batch_start_abs_frame_)) {
+      late_packets_++;
+      return;
+    }
+    if (!stream_synced_) {
+      stream_synced_ = true;
+      // Fixed counter-aligned buckets avoid a permanently partial phase when
+      // destinations rotate in blocks (e.g. eight firmware frames per NIC).
+      current_batch_start_abs_frame_ = static_cast<uint64_t>(frame) -
+          static_cast<uint64_t>(frame) % cfg_.frames_per_tensor;
+      std::cout << "stem_daqiri_rx '" << cfg_.interface_name
+                << "' synchronized to firmware frame " << frame
+                << " (batch starts at " << current_batch_start_abs_frame_ << ")\n";
+    }
+    const auto tile = stem::fpga_tile_index(
+        header.source_id, header.row_offset, cfg_.fpga_zlp_row_first);
+    queue_packet(packet_ptr, holder, static_cast<uint64_t>(frame), 0, tile,
+                 header.row_number, header.source_id);
+  }
+
   void admit_arrival_packet(uint8_t* packet_ptr,
                             const std::shared_ptr<void>& holder) {
     const auto position = arrival_sequence_.next();
@@ -2253,6 +2369,15 @@ class FrameAssembler {
   void queue_packet(uint8_t* packet_ptr, const std::shared_ptr<void>& holder,
                      uint64_t abs_frame, int16_t global_row, uint16_t tile_index,
                      uint16_t row_number, uint16_t source_id) {
+    if (cfg_.fpga_tile_headers &&
+        abs_frame < current_batch_start_abs_frame_ + cfg_.frames_per_tensor) {
+      const auto cell = (abs_frame - current_batch_start_abs_frame_) *
+                            packet_cells_per_frame_ + tile_index;
+      if (current_batch_occupied_[cell]) {
+        duplicate_packets_++;
+        return;
+      }
+    }
     PacketEntry entry;
     entry.packet_ptr = packet_ptr;
     entry.abs_frame = abs_frame;
@@ -2324,12 +2449,16 @@ class FrameAssembler {
     if (current_batch_unique_packets_ >= expected_packets_per_batch_) {
       return true;
     }
+    if (cfg_.fpga_tile_headers) {
+      return future_packet_count_ > 0 &&
+             future_packet_count_ >= cfg_.batch_close_slack_packets;
+    }
     return current_batch_unique_packets_ > 0 &&
            future_packet_count_ >= cfg_.batch_close_slack_packets;
   }
 
   void close_batch_and_emit(uint64_t* frames_assembled) {
-    if (cfg_.assemble_by_arrival) { reclaim_arrival_gather(true); }
+    if (cfg_.protect_gather_inputs()) { reclaim_gather_inputs(true); }
     const uint64_t batch_end =
         current_batch_start_abs_frame_ + cfg_.frames_per_tensor;
 
@@ -2359,6 +2488,7 @@ class FrameAssembler {
         assert(cell < emit_cell_generation_.size());
         if (emit_cell_generation_[cell] == emit_generation_) {
           // Duplicate (frame, row|tile) within this close; drop the later copy.
+          if (cfg_.fpga_tile_headers) { duplicate_packets_++; }
           continue;
         }
         emit_cell_generation_[cell] = emit_generation_;
@@ -2370,11 +2500,11 @@ class FrameAssembler {
         pl.valid = 1;
         h_placements_[pkts_to_gather] = pl;
         // Retain each consumed burst until the asynchronous gather no longer
-        // reads its packets; arrival-order mode has no header-sync fence.
-        if (cfg_.assemble_by_arrival &&
-            (arrival_gather_owners_.empty() ||
-             arrival_gather_owners_.back() != read_it->holder)) {
-          arrival_gather_owners_.push_back(read_it->holder);
+        // reads its packets, including closes that share a received burst.
+        if (cfg_.protect_gather_inputs() &&
+            (gather_owners_.empty() ||
+             gather_owners_.back() != read_it->holder)) {
+          gather_owners_.push_back(read_it->holder);
         }
         pkts_to_gather++;
       }
@@ -2408,9 +2538,9 @@ class FrameAssembler {
           available_payload_len(), gather_header_len(), pkts_to_gather,
           cfg_.frames_per_tensor, stem::FRAME_HEIGHT, stem::FRAME_WIDTH,
           cfg_.tile_duplicate_prefix_to_simulate_payload, stream_);
-      if (cfg_.assemble_by_arrival) {
-        STEM_CUDA_TRY(cudaEventRecord(arrival_gather_done_, stream_));
-        arrival_gather_pending_ = true;
+      if (cfg_.protect_gather_inputs()) {
+        STEM_CUDA_TRY(cudaEventRecord(gather_done_, stream_));
+        gather_pending_ = true;
       }
 
       if (validation_mismatches_) {
@@ -2430,6 +2560,8 @@ class FrameAssembler {
       metadata.expected_packets = expected_packets_per_batch_;
       metadata.complete = pkts_to_gather >= expected_packets_per_batch_;
       metadata.arrival_order = cfg_.assemble_by_arrival;
+      metadata.fpga_tiles = cfg_.fpga_tile_headers;
+      metadata.fpga_zlp_row_first = cfg_.fpga_zlp_row_first;
       pipeline_->process_slot(output_slot, metadata, stream_);
       output_slot->batch_index = emitted_batches_;
       STEM_CUDA_TRY(cudaEventRecord(output_slot->ready, stream_));
@@ -2442,8 +2574,8 @@ class FrameAssembler {
       emitted_batches_++;
     }
 
-    if (cfg_.assemble_by_arrival && output_slot == nullptr) {
-      arrival_gather_owners_.clear();
+    if (cfg_.protect_gather_inputs() && output_slot == nullptr) {
+      gather_owners_.clear();
     }
 
     pending_packets_.erase(write_it, pending_packets_.end());
@@ -2485,25 +2617,26 @@ class FrameAssembler {
     }
   }
 
-  void reclaim_arrival_gather(bool wait) {
-    if (!arrival_gather_pending_) { return; }
+  void reclaim_gather_inputs(bool wait) {
+    if (!gather_pending_) { return; }
     if (wait) {
-      STEM_CUDA_TRY(cudaEventSynchronize(arrival_gather_done_));
+      STEM_CUDA_TRY(cudaEventSynchronize(gather_done_));
     } else {
-      const auto status = cudaEventQuery(arrival_gather_done_);
+      const auto status = cudaEventQuery(gather_done_);
       if (status == cudaErrorNotReady) { return; }
       STEM_CUDA_TRY(status);
     }
-    arrival_gather_owners_.clear();
-    arrival_gather_pending_ = false;
+    gather_owners_.clear();
+    gather_pending_ = false;
   }
 
   const StemRxConfig& cfg_;
   std::shared_ptr<FramePipeline> pipeline_;
   stem::ArrivalOrderSequence arrival_sequence_;
-  cudaEvent_t arrival_gather_done_ = nullptr;
-  bool arrival_gather_pending_ = false;
-  std::vector<std::shared_ptr<void>> arrival_gather_owners_;
+  stem::FpgaFrameCounter fpga_frame_counter_;
+  cudaEvent_t gather_done_ = nullptr;
+  bool gather_pending_ = false;
+  std::vector<std::shared_ptr<void>> gather_owners_;
   const uint32_t expected_source_count_;
   const uint32_t rows_per_tensor_;
   const uint32_t packet_cells_per_frame_;
@@ -2528,6 +2661,9 @@ class FrameAssembler {
   uint64_t incomplete_batches_ = 0;
   uint64_t incomplete_missing_total_ = 0;
   uint64_t incomplete_missing_max_ = 0;
+  uint64_t invalid_headers_ = 0;
+  uint64_t duplicate_packets_ = 0;
+  uint64_t late_packets_ = 0;
 
   std::vector<std::unique_ptr<OutputSlot>> output_slots_;
   uint64_t output_pool_drops_ = 0;
@@ -2811,6 +2947,8 @@ void rx_worker(const StemRxConfig& cfg, std::shared_ptr<FramePipeline> pipeline,
     std::printf("stem_daqiri_rx complete:\n");
     if (cfg.assemble_by_arrival) {
       std::printf("  assembly mode    : arrival_order (synthetic frame boundaries)\n");
+    } else if (cfg.fpga_tile_headers) {
+      std::printf("  assembly mode    : fpga_tiles (provisional physical map)\n");
     }
     std::printf("  duration         : %.3f s\n", secs);
     std::printf("  bursts polled    : %lu\n",
@@ -2824,12 +2962,20 @@ void rx_worker(const StemRxConfig& cfg, std::shared_ptr<FramePipeline> pipeline,
                 static_cast<unsigned long>(frames_assembled), fps);
     std::printf("  unexpected source: %lu\n",
                 static_cast<unsigned long>(drops_unexpected_source));
-    std::printf("  tile dropped pkts: %lu  (row_offset >= 120)\n",
-                static_cast<unsigned long>(asm_state.tile_packets_ignored()));
+    std::printf("  tile dropped pkts: %lu%s\n",
+                static_cast<unsigned long>(asm_state.tile_packets_ignored()),
+                cfg.fpga_tile_headers ? "" : "  (row_offset >= 120)");
+    if (cfg.fpga_tile_headers) {
+      std::printf("  invalid headers : %lu\n",
+                  static_cast<unsigned long>(asm_state.invalid_headers()));
+      std::printf("  duplicate packets: %lu\n",
+                  static_cast<unsigned long>(asm_state.duplicate_packets()));
+    }
     // The previous "out-of-window" counter was a bug -- those packets are
     // now retained across batch boundaries. Report 0 explicitly so any
     // existing parser that grepped that line still works.
-    std::printf("  out-of-window    : 0\n");
+    std::printf("  out-of-window    : %lu\n",
+                static_cast<unsigned long>(asm_state.late_packets()));
     std::printf("  incomplete batches: %lu\n",
                 static_cast<unsigned long>(asm_state.incomplete_batches()));
     std::printf(
@@ -2893,10 +3039,10 @@ void print_rx_start(const StemRxConfig& cfg) {
             << " header_size=" << cfg.header_size
             << " stem_header_size=" << cfg.stem_header_size
             << " assembly="
-            << (cfg.assemble_by_arrival ? "arrival_order" : "header")
-            << " packets_per_frame="
-            << (__builtin_popcount(cfg.expected_source_mask & 0xffu) *
-                stem::TILE_PACKETS_PER_SOURCE)
+            << (cfg.assemble_by_arrival ? "arrival_order"
+                : cfg.fpga_tile_headers ? "fpga_tiles" : "header")
+            << " header_format=" << (cfg.fpga_tile_headers ? "fpga_tiles" : "legacy")
+            << " packets_per_frame=" << cfg.expected_packets_per_frame()
             << " payload_size=" << gather_available_payload_len
             << " gpu_header_extract="
             << (cfg.gpu_header_extract ? "true" : "false")
@@ -2921,6 +3067,16 @@ void print_rx_start(const StemRxConfig& cfg) {
             << " writer.num_concurrent=" << cfg.writer.num_concurrent
             << " source_mask=0x" << std::hex << cfg.expected_source_mask
             << std::dec << " duration=" << cfg.total_time_to_recv_s << " s\n";
+  if (cfg.fpga_tile_headers) {
+    std::cout << "  expected_tile_ids=[";
+    for (size_t i = 0; i < cfg.expected_tile_ids.size(); ++i) {
+      if (i != 0) { std::cout << ','; }
+      std::cout << cfg.expected_tile_ids[i];
+    }
+    std::cout << "] fpga_zlp_slot_order="
+              << (cfg.fpga_zlp_row_first ? "row_then_read" : "read_then_row")
+              << " mapping=provisional payload_order=row_major\n";
+  }
 }
 
 OutputSlot* acquire_replay_slot(

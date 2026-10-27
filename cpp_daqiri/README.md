@@ -874,6 +874,97 @@ format. Missing samples within a received tile do not increment the missing
 packet counters. Restore `payload_size: 8192` once the FPGA sends a separate
 64-byte header followed by all 4096 detector samples.
 
+### FPGA Link-ID Header Assembly
+
+`configs/stem_rx_igx_fpga_tiles.yaml` selects `stem_rx.header_format: fpga_tiles`
+instead of the legacy row-header format. It decodes the 64-byte STEM header
+identically on the CPU and GPU: `5A 5A` at bytes 0..1, link ID at byte 2,
+tile slot 0..15 at byte 3, little-endian 16-bit firmware frame counter at bytes
+4..5, and `A5 A5` at bytes 8..9. Invalid markers, IDs, and slot upper bits are
+rejected. The ETH field and idle-cycle filler are ignored, not used as source
+IDs or timestamps. No ADC sample bits are modified by assembly.
+
+The provisional ID assignment is:
+
+| Region | Top IDs | Bottom IDs |
+| --- | --- | --- |
+| ZLP | 0..5 | 128..133 |
+| CoreLoss | 6..29 | 134..157 |
+
+Set `assemble_by_arrival: false`, `stem_header_size: 64`, `payload_size: 8192`,
+`tile_duplicate_prefix_to_simulate_payload: false`, and `capture_latency: false`.
+Keep the outer `header_size: 42` for untagged Ethernet/IPv4/UDP. The packet is
+8298 bytes excluding FCS and needs IPv4 MTU 8284 or larger; `buf_size: 9018`
+keeps DAQIRI's MTU at 9000. If a flow uses `ipv4_len`, set it to 8284.
+
+**Explicit `expected_tile_ids` are required.** List only the IDs routed to each
+receiver, including the bottom-half bit; receiver overrides replace the common
+list. For example, if both NICs independently receive IDs 128..135:
+
+```yaml
+stem_rx:
+  header_format: fpga_tiles
+  assemble_by_arrival: false
+  header_size: 42
+  stem_header_size: 64
+  payload_size: 8192
+  tile_duplicate_prefix_to_simulate_payload: false
+  capture_latency: false
+  fpga_zlp_slot_order: read_then_row
+  expected_tile_ids: [128, 129, 130, 131, 132, 133, 134, 135]
+```
+
+The example file lists all 60 IDs for a complete two-half detector, not a claim
+that every link is connected. Each selected link contributes 16 expected
+packets per firmware frame. Unlike the old sparse-source simulator, IDs are
+**never compacted**: missing links/halves remain zero in the raw image, and
+completeness is measured against the configured ID list. `expected_source_mask`
+is ignored in this mode. A complete sparse bucket is not a fully populated
+image; dark subtraction can make absent raw pixels nonzero.
+
+For `half = id >> 7`, `link = id & 127`, and `slot = tile_num`, the default map
+is (all coordinates are zero-based):
+
+```text
+ZLP, link < 6:
+    read = slot / 4; vertical_tile = slot % 4
+    row = half * 512 + vertical_tile * 128
+    col = read * 192 + link * 32
+CoreLoss, link >= 6:
+    row = half * 512 + slot * 32
+    col = 768 + (link - 6) * 128
+```
+
+`fpga_zlp_slot_order: row_then_read` instead uses `read = slot % 4` and
+`vertical_tile = slot / 4`. Neither option reverses sample order or sensor
+rows. Payloads are still assumed row-major within each tile: ADC-channel
+deinterleaving and physical alignment shifts are not inferred automatically.
+
+Assembly starts in the counter-aligned bucket containing the first valid
+expected packet, rather than waiting up to 7 seconds for counter zero. It
+unwraps the 16-bit counter
+and preserves packet identity across reordering and loss. Out-of-window late
+packets, malformed headers and duplicates have separate counters. Lost packets
+leave the correct tile empty instead of shifting later placements. Entirely
+missing batch windows can be skipped without retaining bursts indefinitely;
+shutdown flushes a final partial bucket with zero padding. A startup bucket
+can be incomplete, and gaps of 32768 firmware frames or a transmitter counter
+reset require restarting acquisition. Destination-routing gaps are not
+distinguished from loss: provide the actual routing pattern when interpreting
+missing-packet counters. NIC streams are never joined for assembly.
+If destinations alternate every eight firmware frames, use
+`frames_per_tensor: 8` for contiguous raw burst captures; a 128-frame bucket
+spanning routing gaps may never meet `strict_complete: true`. Empty windows
+are counted as missing but do not produce image tensors.
+
+**The spatial map and use of firmware frames as image boundaries are still
+provisional.** Frame identity here follows firmware labels, not a verified
+sensor exposure, and no one-tile header/payload skew is compensated. Burst HDF5
+attributes include `assembly_mode: fpga_tiles`, `mapping_status: provisional`
+and the ZLP slot order; live metadata also flags the map as provisional. The
+existing gather and processing kernels are unchanged. Use raw inspection
+before relying on BLR/dark calibrations derived for another arrangement.
+
 ### Headerless / Invalid-Header FPGA Diagnostics
 
 When the FPGA has not populated real STEM header fields, opt into

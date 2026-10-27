@@ -108,6 +108,12 @@ struct BatchMetadata {
   uint32_t expected_packets = 0;
   bool complete = true;
   bool arrival_order = false;
+  bool fpga_tiles = false;
+  bool fpga_zlp_row_first = false;
+
+  const char* assembly_mode() const {
+    return arrival_order ? "arrival_order" : fpga_tiles ? "fpga_tiles" : "header";
+  }
 };
 
 struct BurstWriterStats {

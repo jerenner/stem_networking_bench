@@ -894,8 +894,24 @@ for path in rx_configs:
     source_mask = int(rx.get("expected_source_mask", 0))
     if frames_per_tensor <= 0:
         raise AssertionError(f"{path.name}: frames_per_tensor must be > 0")
-    if source_mask & 0xff == 0:
+    fpga_tiles = rx.get("header_format", "legacy") == "fpga_tiles"
+    if not fpga_tiles and source_mask & 0xff == 0:
         raise AssertionError(f"{path.name}: expected_source_mask enables no sources")
+    if fpga_tiles:
+        for index in range(int(data.get("num_receivers", 1))):
+            effective = dict(rx)
+            effective.update(data.get(f"receiver{index}", {}))
+            ids = effective.get("expected_tile_ids", [])
+            if (not ids or len(ids) != len(set(ids)) or
+                    any(not isinstance(i, int) or not (0 <= i < 30 or 128 <= i < 158)
+                        for i in ids)):
+                raise AssertionError(f"{path.name}: invalid expected_tile_ids")
+            if (effective.get("assemble_by_arrival", False) or
+                    effective.get("stem_header_size", 64) != 64 or
+                    effective.get("payload_size") != 8192 or
+                    effective.get("tile_duplicate_prefix_to_simulate_payload", True) or
+                    effective.get("capture_latency", False)):
+                raise AssertionError(f"{path.name}: invalid FPGA tile layout")
     if rx.get("hds", False) and rx.get("gpu_header_extract", False):
         raise AssertionError(f"{path.name}: hds and gpu_header_extract are mutually exclusive")
     if path.name.startswith("stem_rx_spark"):

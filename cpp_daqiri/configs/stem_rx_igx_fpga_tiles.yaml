@@ -1,0 +1,131 @@
+# New FPGA header format, with provisional link-ID/slot-to-image placement.
+# Full-detector expected IDs are shown. Restrict expected_tile_ids separately
+# per receiver to the links actually routed there before a live test.
+%YAML 1.2
+---
+source: "network"
+num_receivers: 2
+
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "raw"
+    master_core: 8
+    debug: false
+    log_level: "info"
+    loopback: ""
+    rx_meta_buffers: 1024
+    memory_regions:
+    - name: "Data_RX_GPU_0"
+      kind: "device"
+      affinity: 0
+      num_bufs: 262144
+      buf_size: 9018  # DAQIRI configures MTU 9000; packet length is 8298.
+    - name: "Data_RX_GPU_1"
+      kind: "device"
+      affinity: 0
+      num_bufs: 262144
+      buf_size: 9018
+    interfaces:
+    - name: "rx_port_0"
+      address: "0005:03:00.0"
+      rx:
+        flow_isolation: true
+        queues:
+        - name: "rx_q_0"
+          id: 0
+          cpu_core: 9
+          batch_size: 16384
+          timeout_us: 0
+          memory_regions: ["Data_RX_GPU_0"]
+        flows:
+        - name: "flow_0"
+          id: 0
+          action: {type: queue, id: 0}
+          match: {udp_dst: 23130}
+    - name: "rx_port_1"
+      address: "0005:03:00.1"
+      rx:
+        flow_isolation: true
+        queues:
+        - name: "rx_q_1"
+          id: 0
+          cpu_core: 10
+          batch_size: 16384
+          timeout_us: 0
+          memory_regions: ["Data_RX_GPU_1"]
+        flows:
+        - name: "flow_1"
+          id: 0
+          action: {type: queue, id: 0}
+          match: {udp_dst: 23130}
+
+stem_rx:
+  header_format: "fpga_tiles"
+  assemble_by_arrival: false
+  header_size: 42
+  stem_header_size: 64
+  payload_size: 8192
+  tile_duplicate_prefix_to_simulate_payload: false
+  frames_per_tensor: 128
+  batch_close_slack_packets: 512
+  total_time_to_recv: -1.0
+  capture_latency: false
+  gpu_header_extract: true
+  fpga_zlp_slot_order: "read_then_row"
+  # These IDs are not compacted: a bottom-only capture stays in rows 512..1023.
+  # A full frame has 60 links * 16 slots = 960 packets.
+  expected_tile_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                      10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                      20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+                      128, 129, 130, 131, 132, 133, 134, 135, 136, 137,
+                      138, 139, 140, 141, 142, 143, 144, 145, 146, 147,
+                      148, 149, 150, 151, 152, 153, 154, 155, 156, 157]
+
+receiver0:
+  interface_name: "rx_port_0"
+  # Override expected_tile_ids here if this NIC receives only a subset.
+receiver1:
+  interface_name: "rx_port_1"
+
+# Raw inspection first. Copy the processor settings from the existing dual
+# config to exercise corrections; applying old calibrations to this unverified
+# geometry is a throughput test, not a calibrated detector acquisition.
+processor:
+  noop: true
+  subtract_dark_frame: false
+  apply_valid_pixel_mask: false
+  apply_blr_correction: false
+  apply_dynamic_half_column_mask: false
+
+writer:
+  noop: true
+  num_concurrent: 3
+  filepath: "/data/stem_fpga_tiles.h5"
+  dataset_name: "/processed"
+
+burst_writer:
+  enabled: true
+  start_armed: false
+  processing_stage: "raw"
+  filepath_template: "/data/stem_fpga_tiles_rx{receiver}_{capture}_{stage}.h5"
+  dataset_name: "/frames"
+  buckets_per_capture: 1
+  capture_count: 1
+  strict_complete: true
+
+thinned_stream:
+  enabled: true
+  endpoint: "tcp://*:5556"
+  processing_stage: "raw"
+  total_refresh_hz: 1.0
+  representative_frame_index: 64
+  include_representative_frame: true
+  include_bucket_sum: true
+  queue_depth: 2
+
+control:
+  enabled: true
+  start_acquisition: false
+  endpoint: "tcp://*:5557"
+  runtime_config_path: "/tmp/stem_daqiri_runtime.yaml"

@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "stem_fpga_tiles.h"
 #include "stem_kernels.h"
 #include "stem_packet.h"
 
@@ -131,7 +132,8 @@ source_id_to_global_row(uint32_t source_id, uint32_t row_offset) {
 // ===========================================================================
 __global__ void stem_extract_packet_headers_kernel(uint8_t** src_ptrs,
                                                    PacketHeaderInfo* headers,
-                                                   uint32_t num_pkts) {
+                                                   uint32_t num_pkts,
+                                                   bool fpga_tiles) {
   const uint32_t pkt_idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (pkt_idx >= num_pkts) return;
 
@@ -141,7 +143,14 @@ __global__ void stem_extract_packet_headers_kernel(uint8_t** src_ptrs,
   h.epoch_us = 0;
 
   uint8_t* src = src_ptrs[pkt_idx];
-  if (src != nullptr) {
+  if (src != nullptr && fpga_tiles) {
+    const auto header = decode_fpga_tile_header(src);
+    h.row_number = header.frame_number;
+    h.frame_index = header.frame_number;
+    h.source_id = header.tile_id;
+    h.row_offset = header.tile_slot;
+    h.global_row = header.valid ? 0 : -1;
+  } else if (src != nullptr) {
     h.row_number =
         (static_cast<uint16_t>(src[5]) << 8) | static_cast<uint16_t>(src[4]);
     h.source_id =
@@ -159,12 +168,13 @@ __global__ void stem_extract_packet_headers_kernel(uint8_t** src_ptrs,
 }
 
 void stem_extract_packet_headers(uint8_t** src_ptrs, PacketHeaderInfo* headers,
-                                 uint32_t num_pkts, cudaStream_t stream) {
+                                 uint32_t num_pkts, cudaStream_t stream,
+                                 bool fpga_tiles) {
   if (num_pkts == 0) { return; }
   const uint32_t threads = 256;
   const uint32_t blocks = (num_pkts + threads - 1) / threads;
   stem_extract_packet_headers_kernel<<<blocks, threads, 0, stream>>>(
-      src_ptrs, headers, num_pkts);
+      src_ptrs, headers, num_pkts, fpga_tiles);
   check_cuda_launch("stem_extract_packet_headers_kernel");
 }
 
