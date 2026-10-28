@@ -1392,8 +1392,9 @@ std::string yaml_node_to_json(const YAML::Node& node) {
     for (const auto& entry : node) {
       if (!first) { output << ","; }
       first = false;
-      output << "\"" << control_json_escape(entry.first.as<std::string>())
-             << "\":" << yaml_node_to_json(entry.second);
+      const std::string key = entry.first.as<std::string>();
+      output << "\"" << control_json_escape(key) << "\":"
+             << (key == "password" ? "\"[REDACTED]\"" : yaml_node_to_json(entry.second));
     }
     output << "}";
     return output.str();

@@ -3,6 +3,7 @@
 
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -13,6 +14,11 @@ def main():
             raise SystemExit(17)
         command, output = "register 420", '{"register420":63}'
     else:
+        for destination, password in json.loads(os.getenv("STEM_CAMERA_SSH_PASSWORDS", "{}")).items():
+            answer = subprocess.run([os.environ["SSH_ASKPASS"], destination + "'s password: "],
+                                    capture_output=True, text=True, check=True)
+            if answer.stdout != password + "\n":
+                raise SystemExit(17)
         command = sys.stdin.read().strip()
         if command == "dsh sensor temp":
             output = "Q1 : 44.63\nQ2 : 41.91\nQ3 : 54.62\nQ4 : 46.05\nB1 : 36.06\nB2 : 35.53\nHS1 : 32.46\nHS2 : 32.76"

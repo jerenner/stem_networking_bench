@@ -107,8 +107,9 @@ std::string yaml_to_json(const YAML::Node& node) {
     for (const auto& entry : node) {
       if (!first) { output << ","; }
       first = false;
-      output << "\"" << json_escape(entry.first.as<std::string>()) << "\":"
-             << yaml_to_json(entry.second);
+      const std::string key = entry.first.as<std::string>();
+      output << "\"" << json_escape(key) << "\":"
+             << (key == "password" ? "\"[REDACTED]\"" : yaml_to_json(entry.second));
     }
     output << "}";
     return output.str();
@@ -675,6 +676,8 @@ class PersistentSupervisor {
   void prepare_child_config(const std::string& source,
                             const std::string& destination) {
     YAML::Node child = YAML::LoadFile(source);
+    // The instrument service uses the original config; RX needs no credentials.
+    child.remove("instrument");
     child["control"]["enabled"] = true;
     child["control"]["endpoint"] = child_endpoint_;
     child["control"]["runtime_config_path"] = runtime_config_;

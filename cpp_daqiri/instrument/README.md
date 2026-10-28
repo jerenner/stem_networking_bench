@@ -196,10 +196,10 @@ is called with `--host HOST --register 420` and returns JSON containing
    directory. Confirm camera/board addresses with the instrument owner and
    edit them there. The included addresses are recovered examples, not
    automatically discovered devices.
-3. Prepare an authorized camera SSH identity and a `known_hosts` file with the
-   camera's verified host key. This adapter uses noninteractive key/agent
-   authentication (`BatchMode=yes`) and strict host-key checking, not a stored
-   password or an interactive prompt. Mount a key directory read-only as below.
+3. Prepare an authorized camera SSH identity (or the YAML password option below)
+   and a `known_hosts` file with the camera's verified host key. Authentication
+   is noninteractive and host-key checking remains strict. Mount the SSH files
+   read-only as below.
 4. Start the supervisor with acquisition stopped. This minimal test needs no
    GPU access, DPDK privileges, dark frame, or live receiver stream:
 
@@ -215,10 +215,77 @@ sudo docker run --rm -it --network host \
 ```
 
 The mounted directory should contain the configured `id_ed25519` and
-`known_hosts` files. The identity must work without a passphrase prompt; an
-appropriately mounted SSH agent is another option. Do not bake credentials into
-the image or commit them. If SSH or a board is unreachable, a requested read
-shows the error while the supervisor stays available.
+`known_hosts` files. For key authentication the identity must work without a
+passphrase prompt; an appropriately mounted SSH agent is another option.
+With a YAML password only the `known_hosts` file is needed, not a private key.
+Do not bake credentials into the image or commit them. If SSH or a board is
+unreachable, a requested read shows the error while the supervisor stays available.
+
+### YAML passwords and a mothership2 jump
+
+When the camera can only be reached from `mothership2`, add `jump_host` under
+`instrument.readonly.camera`. The IGX connects to the jump host and forwards a
+TCP connection from there to the camera's SSH port. Camera commands still run
+on the camera, not on mothership2; no camera-control installation on the jump
+host is required. The jump SSH server must allow TCP forwarding and be able to
+reach `192.168.111.90:22`.
+
+For example, replace the camera settings in your LOCAL host-mounted YAML with:
+
+```yaml
+instrument:
+  enabled: true
+  mode: "hardware_readonly"
+  launch_service: true
+  service_binary: "/opt/stem_daqiri/bin/stem_daqiri_instrument_readonly"
+  readonly:
+    timeout_seconds: 20.0  # Total time for both SSH hops and the camera read.
+    camera:
+      host: "192.168.111.90"
+      user: "root"
+      port: 22
+      password: "YOUR_CAMERA_PASSWORD"
+      known_hosts_file: "/run/camera_ssh/known_hosts"
+      jump_host:
+        host: "mothership2"  # Must resolve/be reachable from the IGX container.
+        user: "YOUR_MOTHERSHIP_USER"
+        port: 22
+        password: "YOUR_MOTHERSHIP_PASSWORD"
+```
+
+Keep your other `instrument.readonly` settings as needed. Do not create a second
+`instrument` block. Changing these settings requires restarting the supervisor.
+The image must be rebuilt once to install the new `stem_camera_ssh.py` helper;
+no `sshpass`, GUI package, or separate tunnel process is needed. The existing
+Docker command and SSH-directory mount otherwise stay the same. No DM/Qt-side
+connection changes are necessary.
+
+Both `password` fields must be quoted YAML strings. If a hop should use a key
+instead, omit its `password` and supply its own `identity_file` (or an available
+agent). Camera and jump authentication are independent; password takes priority
+over an identity-file setting on the same hop. A jump defaults to user `root`
+and port 22 if omitted; specify your actual mothership username explicitly.
+The jump inherits the camera's `known_hosts_file`, or can provide its own file.
+The file must contain verified host keys for both hosts. Password auth does not
+disable host verification, and MFA/keyboard-interactive logins or encrypted-key
+passphrase prompts are not handled by this adapter.
+
+Password delivery uses OpenSSH's `SSH_ASKPASS_REQUIRE=force` with the bundled
+helper. Only exact password prompts for the configured `user@host` are answered.
+Passwords are passed in the SSH subprocess environment, never in command-line
+arguments. They are redacted from control/config status JSON and camera-read
+errors; the supervisor omits the instrument block from the RX child config.
+The original local YAML necessarily remains plaintext: restrict its access and
+keep it outside Git. Make authentication changes in the local YAML, not through
+the GUI; this is a supervisor startup setting.
+
+The implementation uses an SSH `ProxyCommand` with `ssh -W` (the same forwarding
+mechanism as ProxyJump), so known-host and authentication options can be applied
+explicitly to each hop. The OpenSSH manuals document
+[password prompt helpers](https://man.openbsd.org/ssh.1#SSH_ASKPASS_REQUIRE) and
+[per-hop proxy configuration](https://man.openbsd.org/ssh_config#ProxyJump).
+This jump carries **camera SSH only**. FPGA register reads use UDP and do not
+automatically traverse the jump; configure direct routing for those separately.
 
 Connect the existing GUI control SSH forward, then either launch the Qt GUI
 with `--controls-only --control-endpoint tcp://127.0.0.1:15557`, or launch the

@@ -23,9 +23,17 @@ instrument:
       host: "192.168.111.90"
       user: "root"
       port: 22
-      # Mount these files read-only into the container. No password is stored.
+      # Key authentication (default). Alternatively remove identity_file and set
+      # password: "YOUR_CAMERA_PASSWORD" in your LOCAL YAML, never in Git.
       identity_file: "/run/camera_ssh/id_ed25519"
       known_hosts_file: "/run/camera_ssh/known_hosts"
+      # Optional SSH jump; its authentication is independent of the camera's.
+      # jump_host:
+      #   host: "mothership2"
+      #   user: "YOUR_MOTHERSHIP_USER"
+      #   password: "YOUR_MOTHERSHIP_PASSWORD"
+      #   port: 22
+      # The same known_hosts file is used for both hops unless overridden here.
       # Preserve out-of-range readings with a warning; never hide a bad probe.
       temperature_min_c: -50.0
       temperature_max_c: 150.0

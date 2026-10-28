@@ -251,6 +251,10 @@ class SupervisorIntegrationTest(unittest.TestCase):
                                   "endpoint": "ipc://" + str(directory / "reads.ipc"),
                                   "readonly": config()}}
             cfg["instrument"]["readonly"]["detector"]["reader_argv"] = [sys.executable, str(here / "test_hardware_process.py")]
+            # Config export must redact secrets even when key auth is used.
+            cfg["instrument"]["readonly"]["camera"]["jump_host"] = {
+                "host": "jump.example", "user": "operator", "password": "test-jump-secret-only",
+            }
             path = directory / "config.yaml"
             path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
             environment = dict(os.environ)
@@ -276,6 +280,10 @@ class SupervisorIntegrationTest(unittest.TestCase):
             try:
                 state = request("get_state")
                 self.assertFalse(state["acquisition"]["running"])
+                self.assertNotIn("test-jump-secret-only", json.dumps(state))
+                self.assertEqual(state["effective_config"]["instrument"]["readonly"]["camera"]["jump_host"]["password"],
+                                 "[REDACTED]")
+                self.assertNotIn("instrument", yaml.safe_load((directory / "child.yaml").read_text()))
                 self.assertFalse((directory / "calls.jsonl").exists())
                 for command in ("camera.read_temperature", "camera.read_biases", "detector.read_link_status"):
                     response = request(command)

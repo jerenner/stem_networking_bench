@@ -11,6 +11,7 @@ import argparse
 import copy
 import json
 import math
+import os
 import queue
 import re
 import signal
@@ -127,21 +128,34 @@ def read_link_register(host, port=42000, timeout=.2, retries=7):
     raise RuntimeError("register 420 read failed after {} attempts: {}".format(retries, last_error))
 
 
-def execute(argv, timeout, stdin=None):
+def execute(argv, timeout, stdin=None, env=None):
     """Check process status and limit how long a read can occupy the worker."""
-    try:
-        result = subprocess.run(
-            argv, input=stdin, text=True, capture_output=True,
-            timeout=timeout, check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("hardware read timed out after {} s".format(timeout)) from error
-    if result.returncode:
-        detail = (result.stderr or result.stdout).strip()[-1000:]
-        raise RuntimeError("hardware read exited {}: {}".format(result.returncode, detail))
-    if len(result.stdout) > 1024 * 1024:
+    with subprocess.Popen(
+        argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=os.name == "posix",
+        env=None if env is None else dict(os.environ, **env),
+    ) as process:
+        try:
+            output, errors = process.communicate(input=stdin, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            # A timed-out SSH jump must not leave its proxy/askpass children
+            # alive or holding the captured stderr pipe open.
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise RuntimeError("hardware read timed out after {} s".format(timeout)) from error
+        if process.returncode:
+            detail = (errors or output).strip()[-1000:]
+            raise RuntimeError("hardware read exited {}: {}".format(process.returncode, detail))
+    if len(output) > 1024 * 1024:
         raise RuntimeError("hardware response exceeds 1 MiB")
-    return result.stdout
+    return output
 
 
 class HardwareReader:
@@ -188,25 +202,19 @@ class HardwareReader:
     def camera_read(self, command):
         if command not in ("sensor temp", "bias adc volts"):
             raise ValueError("camera command is not in the read-only allowlist")
-        host = self.camera.get("host", "")
-        user = self.camera.get("user", "root")
-        for name, value in (("host", host), ("user", user)):
-            if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", value):
-                raise ValueError("invalid camera SSH " + name)
-        port = int(self.camera.get("port", 22))
-        if not 1 <= port <= 65535:
-            raise ValueError("invalid camera SSH port")
-        argv = [
-            "ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-            "-o", "ConnectTimeout={}".format(max(1, int(self.timeout))),
-            "-p", str(port),
-        ]
-        if self.camera.get("identity_file"):
-            argv.extend(["-i", self.camera["identity_file"], "-o", "IdentitiesOnly=yes"])
-        if self.camera.get("known_hosts_file"):
-            argv.extend(["-o", "UserKnownHostsFile=" + self.camera["known_hosts_file"]])
-        argv.append(user + "@" + host)
-        return self.runner(argv, self.timeout, "dsh " + command + "\n")
+        from stem_camera_ssh import camera_ssh_command, PASSWORD_ENV
+
+        argv, environment = camera_ssh_command(self.camera, self.timeout)
+        try:
+            if environment is None:
+                return self.runner(argv, self.timeout, "dsh " + command + "\n")
+            return self.runner(argv, self.timeout, "dsh " + command + "\n", env=environment)
+        except (RuntimeError, OSError) as error:
+            detail = str(error)
+            for password in sorted(json.loads((environment or {}).get(PASSWORD_ENV, "{}")).values(),
+                                   key=len, reverse=True):
+                detail = detail.replace(password, "[REDACTED]")
+            raise RuntimeError(detail) from None
 
     def read(self, name):
         if name == "temperature":
