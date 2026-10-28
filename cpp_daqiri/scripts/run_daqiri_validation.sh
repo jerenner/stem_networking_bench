@@ -138,6 +138,10 @@ with h5py.File(tmp / "stem_pipeline_input.h5", "w") as f:
     frames = np.arange(5 * 4 * 4, dtype=np.uint16).reshape(5, 4, 4)
     f.create_dataset("/frames", data=frames)
     f.create_dataset("/float_frames", data=frames.astype(np.float32) / 10.0)
+    signed = np.resize(np.array([-2048, -2047, -1, 0, 1, 2047, -32, 32,
+                                 -3000, 3000],
+                                dtype=np.int16), frames.shape)
+    f.create_dataset("/signed_frames", data=signed)
     dyn = np.full((2, 6, 3), 10, dtype=np.uint16)
     dyn[:, 1, 1] = 100
     dyn[:, 4, 2] = 80
@@ -148,6 +152,7 @@ with h5py.File(tmp / "stem_pipeline_input.h5", "w") as f:
     dyn_two_sided[:, 5, 2] = -80
     dyn_two_sided[:, 7, 0] = -1000
     f.create_dataset("/dyn_two_sided_frames", data=dyn_two_sided)
+    f.create_dataset("/signed_dyn_frames", data=dyn_two_sided.astype(np.int16))
 
 with h5py.File(tmp / "stem_pipeline_corr.h5", "w") as f:
     dark = np.arange(16, dtype=np.float32).reshape(4, 4) / 2.0
@@ -611,6 +616,36 @@ processor:
 writer:
   noop: true
 """)
+
+# Replay captures as signed values, not as wire-encoded ADC words. These cases
+# cover negative raw output, partial buckets, correction, BLR, masking and sums.
+for case in ("raw", "window", "correction", "reduce", "blr", "burst_raw",
+             "burst_thresholded", "thinned", "dynamic_two_sided"):
+    text = (tmp / f"stem_case_{case}.yaml").read_text()
+    text = text.replace('dataset_name: "/frames"',
+                        'dataset_name: "/signed_frames"', 1)
+    text = text.replace('dataset_name: "/dyn_two_sided_frames"',
+                        'dataset_name: "/signed_dyn_frames"', 1)
+    text = text.replace(f"stem_case_{case}_", f"stem_case_signed_{case}_")
+    # A stale network block must not cause already decoded HDF5 data to be
+    # decoded again (e.g. a valid int16 value of -3000 is not a 12-bit word).
+    text += '\nstem_rx:\n  sample_encoding: "twos_complement_12"\n'
+    write(f"stem_case_signed_{case}.yaml", text)
+
+text = (tmp / "stem_case_signed_blr.yaml").read_text()
+text = text.replace("subtract_dark_frame: false", f'''subtract_dark_frame: true
+  dark_frame_path: "{common_corr}"
+  dark_frame_dataset: "/dark"''')
+text = text.replace("apply_valid_pixel_mask: false", '''apply_valid_pixel_mask: true
+  valid_pixel_mask_dataset: "/valid_pixel_mask"''')
+text = text.replace("apply_dynamic_half_column_mask: false", '''apply_dynamic_half_column_mask: true
+  dynamic_mask_median_window_pixels: 3
+  dynamic_mask_threshold_ratio: 1.0
+  dynamic_mask_threshold_offset: 500.0
+  dynamic_mask_excluded_edge_rows: 0
+  dynamic_mask_two_sided: true''')
+write("stem_case_signed_full.yaml", text.replace("stem_case_signed_blr_",
+                                               "stem_case_signed_full_"))
 PY
 
     cat > "${tmpdir}/run_hdf5_container.sh" <<'EOS'
@@ -648,6 +683,9 @@ run_ok stem_case_blr.yaml
 run_ok stem_case_burst_raw.yaml
 run_ok stem_case_burst_thresholded.yaml
 run_ok stem_case_thinned.yaml
+for case in raw window correction reduce blr burst_raw burst_thresholded thinned dynamic_two_sided full; do
+    run_ok "stem_case_signed_${case}.yaml"
+done
 
 run_fail stem_case_bad_repeat.yaml
 run_fail stem_case_bad_writer.yaml
@@ -679,6 +717,7 @@ with h5py.File(tmp / "stem_pipeline_input.h5", "r") as f_in, \
         h5py.File(tmp / "stem_pipeline_corr.h5", "r") as f_corr:
     frames = f_in["/frames"][...]
     float_frames = f_in["/float_frames"][...]
+    signed = f_in["/signed_frames"][...]
     dyn = f_in["/dyn_frames"][...]
     dyn_two_sided = f_in["/dyn_two_sided_frames"][...]
     dark = f_corr["/dark"][...]
@@ -742,6 +781,42 @@ for col_start in (0, 2):
     blr_expected[:, 2:, col_start:col_start + 2] -= bottom[:, None, None]
 expected["blr"] = (blr_expected, np.float32, tmp / "stem_case_blr_out.h5")
 
+signed_blr = signed[:2].astype(np.float32)
+signed_input = signed_blr.copy()
+for col_start in (0, 2):
+    top = np.mean(signed_input[:, 0, col_start:col_start + 2], axis=1)
+    bottom = np.mean(signed_input[:, 3, col_start:col_start + 2], axis=1)
+    signed_blr[:, :2, col_start:col_start + 2] -= top[:, None, None]
+    signed_blr[:, 2:, col_start:col_start + 2] -= bottom[:, None, None]
+signed_corrected = np.where(mask == 0.0, 0.0,
+                            signed[:2].astype(np.float32) - dark).astype(np.float32)
+full = signed[:2].astype(np.float32) - dark
+before_blr = full.copy()
+for col_start in (0, 2):
+    top = before_blr[:, 0, col_start:col_start + 2].mean(axis=1)
+    bottom = before_blr[:, 3, col_start:col_start + 2].mean(axis=1)
+    full[:, :2, col_start:col_start + 2] -= top[:, None, None]
+    full[:, 2:, col_start:col_start + 2] -= bottom[:, None, None]
+mean = full.mean(axis=0)
+for row in range(4):
+    lo, hi = (0, 2) if row < 2 else (2, 4)
+    # The CUDA median selects the upper middle element for even windows.
+    neighbors = np.sort(mean[max(lo, row - 1):min(hi, row + 2)], axis=0)
+    median = neighbors[neighbors.shape[0] // 2]
+    invalid = (mask[row] == 0.0) | (np.abs(mean[row] - median) > 500.0)
+    full[:, row, invalid] = 0.0
+for name, want, dtype in (
+    ("raw", signed, np.int16),
+    ("window", signed[1:4], np.int16),
+    ("correction", signed_corrected, np.float32),
+    ("reduce", signed[:3].astype(np.float32).sum(axis=0, keepdims=True), np.float32),
+    ("blr", signed_blr, np.float32),
+    ("dynamic_two_sided", dyn_two_sided_expected, np.float32),
+    ("full", full, np.float32),
+):
+    expected[f"signed_{name}"] = (
+        want, dtype, tmp / f"stem_case_signed_{name}_out.h5")
+
 for name, (want, dtype, path) in expected.items():
     with h5py.File(path, "r") as f:
         got = f["/processed"][...]
@@ -760,6 +835,24 @@ with h5py.File(tmp / "stem_case_burst_raw_rx0_0.h5", "r") as f:
     assert f["/frames"].attrs["processing_stage"] == "raw"
 np.testing.assert_array_equal(raw_burst, frames[:4])
 print(f"PASS burst_raw: shape={raw_burst.shape} dtype={raw_burst.dtype}")
+
+with h5py.File(tmp / "stem_case_signed_burst_raw_rx0_0.h5", "r") as f:
+    signed_burst = f["/frames"][...]
+    assert signed_burst.dtype == np.dtype("int16")
+    assert f["/frames"].attrs["dtype"] == "int16"
+np.testing.assert_array_equal(signed_burst, signed[:4])
+print(f"PASS signed_burst_raw: shape={signed_burst.shape} dtype={signed_burst.dtype}")
+
+signed_thresholded = signed_corrected.copy()
+signed_thresholded[:, :, :2] = np.where(signed_corrected[:, :, :2] > 5.0,
+                                       signed_corrected[:, :, :2], 0.0)
+signed_thresholded[:, :, 2:] = np.where(signed_corrected[:, :, 2:] > 20.0,
+                                       signed_corrected[:, :, 2:], 0.0)
+with h5py.File(tmp / "stem_case_signed_burst_thresholded_rx0_0.h5", "r") as f:
+    got_signed_thresholded = f["/frames"][...]
+    assert got_signed_thresholded.dtype == np.dtype("float32")
+np.testing.assert_array_equal(got_signed_thresholded, signed_thresholded)
+print("PASS signed_burst_thresholded")
 
 corrected = np.where(
     mask == 0.0,
@@ -895,6 +988,18 @@ for path in rx_configs:
     if frames_per_tensor <= 0:
         raise AssertionError(f"{path.name}: frames_per_tensor must be > 0")
     fpga_tiles = rx.get("header_format", "legacy") == "fpga_tiles"
+    encodings = set()
+    for index in range(int(data.get("num_receivers", 1))):
+        effective = dict(rx)
+        effective.update(data.get(f"receiver{index}", rx.get(f"receiver{index}", {})))
+        encoding = effective.get("sample_encoding", "uint16")
+        if encoding not in ("uint16", "twos_complement_12"):
+            raise AssertionError(f"{path.name}: invalid sample_encoding")
+        if data.get("source") == "synthetic" and encoding != "uint16":
+            raise AssertionError(f"{path.name}: synthetic input must stay unsigned")
+        encodings.add(encoding)
+    if len(encodings) != 1:
+        raise AssertionError(f"{path.name}: receiver sample encodings differ")
     if not fpga_tiles and source_mask & 0xff == 0:
         raise AssertionError(f"{path.name}: expected_source_mask enables no sources")
     if fpga_tiles:

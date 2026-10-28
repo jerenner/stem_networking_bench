@@ -12,6 +12,8 @@
 #include <optional>
 #include <string>
 
+#include "stem_samples.h"
+
 namespace stem {
 
 enum class ProcessingStage {
@@ -62,6 +64,7 @@ struct BurstRuntimeState {
   bool armed = false;
   bool busy = false;
   bool output_float32 = false;
+  SampleType output_type = SampleType::kUint16;
   uint32_t capacity_buckets = 0;
   BurstRuntimeConfig config;
 };
@@ -110,6 +113,7 @@ struct BatchMetadata {
   bool arrival_order = false;
   bool fpga_tiles = false;
   bool fpga_zlp_row_first = false;
+  SampleEncoding sample_encoding = SampleEncoding::kUint16;
 
   const char* assembly_mode() const {
     return arrival_order ? "arrival_order" : fpga_tiles ? "fpga_tiles" : "header";
@@ -132,7 +136,7 @@ class BurstWriter {
     void* token = nullptr;
     void* device_ptr = nullptr;
     size_t bytes = 0;
-    bool float32 = false;
+    SampleType sample_type = SampleType::kUint16;
     ProcessingStage stage = ProcessingStage::kRaw;
     ThresholdConfig threshold;
 
@@ -141,7 +145,7 @@ class BurstWriter {
 
   BurstWriter(const BurstWriterConfig& config, uint32_t height,
               uint32_t width, uint32_t frames_per_bucket,
-              uint32_t receiver_count, bool raw_input_float32);
+              uint32_t receiver_count, SampleType raw_input_type);
   ~BurstWriter();
 
   BurstWriter(const BurstWriter&) = delete;
@@ -155,7 +159,7 @@ class BurstWriter {
   void disarm(bool abort_capture);
   std::optional<Reservation> reserve(const BatchMetadata& metadata);
   void submit_copy(const Reservation& reservation, const void* source,
-                   bool source_float32, cudaStream_t stream);
+                   SampleType source_type, cudaStream_t stream);
   void submit_direct(const Reservation& reservation, cudaStream_t stream);
   void drain();
   BurstWriterStats stats() const;

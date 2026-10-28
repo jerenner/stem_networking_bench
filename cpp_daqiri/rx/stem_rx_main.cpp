@@ -4,7 +4,7 @@
  *
  * stem_daqiri_rx: daqiri-based RX that assembles STEM-format UDP packets into
  * batched GPU frame tensors of shape
- *   [frames_per_tensor, 1024, 3840] uint16
+ *   [frames_per_tensor, 1024, 3840] uint16 or decoded int16
  *
  * Reassembly is tile-readout only (mirrors upstream/tiling): each packet
  * is scattered into its (ZLP or core) tile within the 1024 x 3840 frame
@@ -158,6 +158,7 @@ struct StemRxConfig {
   // Detector-data bytes after stem_header_size custom bytes. Zero selects the
   // legacy/native default from tile_duplicate_prefix_to_simulate_payload.
   uint16_t payload_size = 0;
+  stem::SampleEncoding sample_encoding = stem::SampleEncoding::kUint16;
 
   // Active source ID bitmask. 0xff (255) accepts all 8 sources.
   uint32_t expected_source_mask = 0xff;
@@ -441,6 +442,10 @@ void apply_stem_rx_node(StemRxConfig& cfg, const YAML::Node& rx) {
       rx["stem_header_size"].as<uint16_t>(cfg.stem_header_size);
   cfg.assemble_by_arrival =
       rx["assemble_by_arrival"].as<bool>(cfg.assemble_by_arrival);
+  if (rx["sample_encoding"]) {
+    cfg.sample_encoding = stem::parse_sample_encoding(
+        rx["sample_encoding"].as<std::string>());
+  }
   if (rx["header_format"]) {
     const auto format = rx["header_format"].as<std::string>();
     if (format != "legacy" && format != "fpga_tiles") {
@@ -488,6 +493,10 @@ void apply_stem_rx_node(StemRxConfig& cfg, const YAML::Node& rx) {
 
 void validate_stem_rx_cfg(const StemRxConfig& cfg) {
   stem::validate_tile_payload_size(cfg.effective_payload_size());
+  if (cfg.synthetic_source &&
+      cfg.sample_encoding != stem::SampleEncoding::kUint16) {
+    throw std::runtime_error("synthetic input requires sample_encoding=uint16");
+  }
   if (cfg.fpga_tile_headers &&
       (cfg.assemble_by_arrival || cfg.synthetic_source || cfg.capture_latency ||
        cfg.stem_header_size != stem::STEM_HEADER_SIZE ||
@@ -673,6 +682,10 @@ std::vector<StemRxConfig> parse_stem_rx_cfgs(const YAML::Node& root) {
     apply_stem_rx_node(cfg, receiver_node);
     cfg.receiver_id = static_cast<uint32_t>(i);
     validate_stem_rx_cfg(cfg);
+    if (!cfgs.empty() && cfg.sample_encoding != cfgs.front().sample_encoding) {
+      throw std::runtime_error(
+          "shared processing/output requires the same sample_encoding for all receivers");
+    }
     cfgs.push_back(std::move(cfg));
   }
   return cfgs;
@@ -750,7 +763,7 @@ struct OutputSlot {
   uint64_t batch_index = 0;
   uint32_t frames = 0;
   void* output_ptr = nullptr;
-  bool output_float = false;
+  stem::SampleType output_type = stem::SampleType::kUint16;
   uint32_t output_rank = 3;
   uint32_t output_frames = 0;
   uint32_t output_height = 0;
@@ -883,8 +896,7 @@ class AsyncFrameSink {
   void write_slot(OutputSlot* slot) {
     const uint32_t batch_frames =
         slot->output_rank == 2 ? 1 : slot->output_frames;
-    const size_t elem_size =
-        slot->output_float ? sizeof(float) : sizeof(uint16_t);
+    const size_t elem_size = stem::sample_type_bytes(slot->output_type);
     const size_t elems = static_cast<size_t>(batch_frames) *
                          slot->output_height * slot->output_width;
     const size_t bytes = elems * elem_size;
@@ -899,9 +911,11 @@ class AsyncFrameSink {
       return;
     }
     try {
-      const H5::DataType h5_type = slot->output_float
-                                       ? H5::PredType::NATIVE_FLOAT
-                                       : H5::PredType::NATIVE_UINT16;
+      const H5::DataType h5_type =
+          slot->output_type == stem::SampleType::kFloat32
+              ? H5::PredType::NATIVE_FLOAT
+              : slot->output_type == stem::SampleType::kInt16
+                    ? H5::PredType::NATIVE_INT16 : H5::PredType::NATIVE_UINT16;
       if (!dataset_) {
         hsize_t dims[3] = {batch_frames, slot->output_height,
                            slot->output_width};
@@ -913,12 +927,12 @@ class AsyncFrameSink {
         prop.setChunk(3, chunk_dims);
         dataset_ = std::make_unique<H5::DataSet>(
             file_->createDataSet(cfg_.dataset_name, h5_type, filespace, prop));
-        dataset_float_ = slot->output_float;
+        dataset_type_ = slot->output_type;
         dataset_height_ = slot->output_height;
         dataset_width_ = slot->output_width;
         current_frames_ = batch_frames;
       } else {
-        if (dataset_float_ != slot->output_float ||
+        if (dataset_type_ != slot->output_type ||
             dataset_height_ != slot->output_height ||
             dataset_width_ != slot->output_width) {
           std::fprintf(
@@ -966,7 +980,7 @@ class AsyncFrameSink {
   std::unique_ptr<H5::H5File> file_;
   std::unique_ptr<H5::DataSet> dataset_;
   hsize_t current_frames_ = 0;
-  bool dataset_float_ = false;
+  stem::SampleType dataset_type_ = stem::SampleType::kUint16;
   hsize_t dataset_height_ = 0;
   hsize_t dataset_width_ = 0;
 #endif
@@ -978,13 +992,15 @@ class FramePipeline {
                 const stem::BurstWriterConfig& burst_writer,
                 const stem::ThinnedStreamConfig& thinned_stream,
                 uint32_t height, uint32_t width, uint32_t frames_per_bucket,
-                uint32_t receiver_count, bool raw_input_float32 = false)
+                uint32_t receiver_count,
+                stem::SampleType raw_input_type = stem::SampleType::kUint16)
       : processor_(processor),
         height_(height),
         width_(width),
+        raw_input_type_(raw_input_type),
         sink_(writer),
         burst_writer_(burst_writer, height, width, frames_per_bucket,
-                      receiver_count, raw_input_float32),
+                      receiver_count, raw_input_type),
         thinned_stream_(thinned_stream, height, width, frames_per_bucket,
                         receiver_count) {
     if (height_ == 0 || width_ == 0) {
@@ -1046,12 +1062,11 @@ class FramePipeline {
     return processor_produces_float(processor_);
   }
 
-  void allocate_slot_buffers(OutputSlot* slot, uint32_t max_frames,
-                             bool input_float = false) const {
+  void allocate_slot_buffers(OutputSlot* slot, uint32_t max_frames) const {
     const uint64_t frame_pixels = static_cast<uint64_t>(height_) * width_;
     const uint64_t full_values =
         static_cast<uint64_t>(max_frames) * frame_pixels;
-    if (input_float || produces_float()) {
+    if (raw_input_type_ == stem::SampleType::kFloat32 || produces_float()) {
       STEM_CUDA_TRY(cudaMalloc(&slot->gpu_float, full_values * sizeof(float)));
     }
     if (!processor_.noop) {
@@ -1075,18 +1090,19 @@ class FramePipeline {
   }
 
   void process_slot(OutputSlot* slot, const stem::BatchMetadata& metadata,
-                    cudaStream_t stream, bool input_float = false) {
+                    cudaStream_t stream) {
     const uint32_t frames = metadata.frames;
     if (frames == 0) { return; }
 
     auto burst_reservation = burst_writer_.reserve(metadata);
     auto thinned_reservation = thinned_stream_.reserve(metadata);
     const void* original_input =
-        input_float ? static_cast<const void*>(slot->gpu_float)
-                    : static_cast<const void*>(slot->gpu_u16);
+        raw_input_type_ == stem::SampleType::kFloat32
+            ? static_cast<const void*>(slot->gpu_float)
+            : static_cast<const void*>(slot->gpu_u16);
 
     const auto emit_thinned = [&](stem::ProcessingStage stage,
-                                  const void* input, bool float32,
+                                  const void* input, stem::SampleType input_type,
                                   bool subtract_dark,
                                   bool apply_threshold) {
       if (!thinned_reservation || thinned_reservation->stage != stage) {
@@ -1095,9 +1111,9 @@ class FramePipeline {
       const uint32_t representative_index =
           thinned_reservation->representative_frame_index;
       const auto& threshold = thinned_reservation->threshold;
-      if (float32) {
+      stem::visit_samples(input, input_type, [&](const auto* typed_input) {
         stem::stem_extract_representative_and_sum(
-            static_cast<const float*>(input),
+            typed_input,
             subtract_dark ? gpu_dark_frame_ : nullptr,
             thinned_reservation->include_representative_frame
                 ? thinned_reservation->representative_device
@@ -1109,81 +1125,52 @@ class FramePipeline {
             representative_index, subtract_dark, apply_threshold,
             processor_.blr_zlp_width, threshold.zlp, threshold.core_loss,
             stream);
-      } else {
-        stem::stem_extract_representative_and_sum(
-            static_cast<const uint16_t*>(input),
-            subtract_dark ? gpu_dark_frame_ : nullptr,
-            thinned_reservation->include_representative_frame
-                ? thinned_reservation->representative_device
-                : nullptr,
-            thinned_reservation->include_bucket_sum
-                ? thinned_reservation->sum_device
-                : nullptr,
-            frames, height_, width_,
-            representative_index, subtract_dark, apply_threshold,
-            processor_.blr_zlp_width, threshold.zlp, threshold.core_loss,
-            stream);
-      }
+      });
       thinned_stream_.submit(*thinned_reservation, stream);
     };
 
     const auto emit_burst_copy = [&](stem::ProcessingStage stage,
-                                     const void* input, bool float32) {
+                                     const void* input, stem::SampleType input_type) {
       if (!burst_reservation || burst_reservation->stage != stage) { return; }
-      burst_writer_.submit_copy(*burst_reservation, input, float32, stream);
+      burst_writer_.submit_copy(*burst_reservation, input, input_type, stream);
     };
 
-    emit_burst_copy(stem::ProcessingStage::kRaw, original_input, input_float);
-    emit_thinned(stem::ProcessingStage::kRaw, original_input, input_float,
+    emit_burst_copy(stem::ProcessingStage::kRaw, original_input, raw_input_type_);
+    emit_thinned(stem::ProcessingStage::kRaw, original_input, raw_input_type_,
                  false, false);
 
     if (burst_reservation &&
         burst_reservation->stage == stem::ProcessingStage::kDarkSubtracted) {
-      if (input_float) {
+      stem::visit_samples(original_input, raw_input_type_, [&](const auto* input) {
         stem::stem_correct_with_blr_and_mean(
-            static_cast<const float*>(original_input), gpu_dark_frame_, nullptr,
+            input, gpu_dark_frame_, nullptr,
             static_cast<float*>(burst_reservation->device_ptr), nullptr, frames,
             height_, width_, processor_.blr_zlp_width,
             processor_.blr_zlp_group_columns,
             processor_.blr_core_group_columns, true, false, false, stream);
-      } else {
-        stem::stem_correct_with_blr_and_mean(
-            static_cast<const uint16_t*>(original_input), gpu_dark_frame_,
-            nullptr, static_cast<float*>(burst_reservation->device_ptr),
-            nullptr, frames, height_, width_, processor_.blr_zlp_width,
-            processor_.blr_zlp_group_columns,
-            processor_.blr_core_group_columns, true, false, false, stream);
-      }
+      });
       burst_writer_.submit_direct(*burst_reservation, stream);
     }
     emit_thinned(stem::ProcessingStage::kDarkSubtracted, original_input,
-                 input_float, true, false);
+                 raw_input_type_, true, false);
 
     if (produces_float()) {
       const float* dark =
           processor_.subtract_dark_frame ? gpu_dark_frame_ : nullptr;
       if (processor_.apply_blr_correction) {
-        if (input_float) {
+        stem::visit_samples(original_input, raw_input_type_, [&](const auto* input) {
           stem::stem_compute_blr_baseline(
-              slot->gpu_float, dark, slot->gpu_blr_baseline, frames, height_,
+              input, dark, slot->gpu_blr_baseline, frames, height_,
               width_, processor_.blr_rows, processor_.blr_zlp_width,
               processor_.blr_zlp_group_columns,
               processor_.blr_core_group_columns,
               processor_.subtract_dark_frame, stream);
-        } else {
-          stem::stem_compute_blr_baseline(
-              reinterpret_cast<const uint16_t*>(slot->gpu_u16), dark,
-              slot->gpu_blr_baseline, frames, height_, width_,
-              processor_.blr_rows, processor_.blr_zlp_width,
-              processor_.blr_zlp_group_columns,
-              processor_.blr_core_group_columns,
-              processor_.subtract_dark_frame, stream);
-        }
+        });
       }
 
-      if (input_float) {
+      stem::visit_samples(original_input, raw_input_type_, [&](const auto* input) {
         stem::stem_correct_with_blr_and_mean(
-            slot->gpu_float, dark,
+            input, dark,
             processor_.apply_blr_correction ? slot->gpu_blr_baseline : nullptr,
             slot->gpu_float,
             processor_.apply_dynamic_half_column_mask ? slot->gpu_batch_mean
@@ -1193,22 +1180,12 @@ class FramePipeline {
             processor_.blr_core_group_columns,
             processor_.subtract_dark_frame, processor_.apply_blr_correction,
             processor_.apply_dynamic_half_column_mask, stream);
-      } else {
-        stem::stem_correct_with_blr_and_mean(
-            reinterpret_cast<const uint16_t*>(slot->gpu_u16), dark,
-            processor_.apply_blr_correction ? slot->gpu_blr_baseline : nullptr,
-            slot->gpu_float,
-            processor_.apply_dynamic_half_column_mask ? slot->gpu_batch_mean
-                                                      : nullptr,
-            frames, height_, width_, processor_.blr_zlp_width,
-            processor_.blr_zlp_group_columns,
-            processor_.blr_core_group_columns,
-            processor_.subtract_dark_frame, processor_.apply_blr_correction,
-            processor_.apply_dynamic_half_column_mask, stream);
-      }
+      });
 
-      emit_burst_copy(stem::ProcessingStage::kDarkBlr, slot->gpu_float, true);
-      emit_thinned(stem::ProcessingStage::kDarkBlr, slot->gpu_float, true,
+      emit_burst_copy(stem::ProcessingStage::kDarkBlr, slot->gpu_float,
+                      stem::SampleType::kFloat32);
+      emit_thinned(stem::ProcessingStage::kDarkBlr, slot->gpu_float,
+                   stem::SampleType::kFloat32,
                    false, false);
 
       if (processor_.apply_dynamic_half_column_mask) {
@@ -1227,8 +1204,10 @@ class FramePipeline {
             slot->gpu_float, gpu_valid_mask_, frames, height_, width_, stream);
       }
 
-      emit_burst_copy(stem::ProcessingStage::kCorrected, slot->gpu_float, true);
-      emit_thinned(stem::ProcessingStage::kCorrected, slot->gpu_float, true,
+      emit_burst_copy(stem::ProcessingStage::kCorrected, slot->gpu_float,
+                      stem::SampleType::kFloat32);
+      emit_thinned(stem::ProcessingStage::kCorrected, slot->gpu_float,
+                   stem::SampleType::kFloat32,
                    false, false);
 
       if (burst_reservation &&
@@ -1241,7 +1220,8 @@ class FramePipeline {
             burst_reservation->threshold.core_loss, stream);
         burst_writer_.submit_direct(*burst_reservation, stream);
       }
-      emit_thinned(stem::ProcessingStage::kThresholded, slot->gpu_float, true,
+      emit_thinned(stem::ProcessingStage::kThresholded, slot->gpu_float,
+                   stem::SampleType::kFloat32,
                    false, true);
 
       if (!processor_.noop) {
@@ -1255,15 +1235,10 @@ class FramePipeline {
         slot->output_rank = 3;
         slot->output_frames = frames;
       }
-      slot->output_float = true;
-    } else if (input_float) {
-      slot->output_ptr = slot->gpu_float;
-      slot->output_float = true;
-      slot->output_rank = 3;
-      slot->output_frames = frames;
+      slot->output_type = stem::SampleType::kFloat32;
     } else {
-      slot->output_ptr = slot->gpu_u16;
-      slot->output_float = false;
+      slot->output_ptr = const_cast<void*>(original_input);
+      slot->output_type = raw_input_type_;
       slot->output_rank = 3;
       slot->output_frames = frames;
     }
@@ -1371,6 +1346,7 @@ class FramePipeline {
   ProcessorConfig processor_;
   uint32_t height_ = 0;
   uint32_t width_ = 0;
+  stem::SampleType raw_input_type_ = stem::SampleType::kUint16;
   float* gpu_dark_frame_ = nullptr;
   float* gpu_valid_mask_ = nullptr;
   AsyncFrameSink sink_;
@@ -1715,6 +1691,8 @@ class RuntimeController {
          << ",\"busy\":" << (burst.busy ? "true" : "false")
          << ",\"output_float32\":"
          << (burst.output_float32 ? "true" : "false")
+         << ",\"output_dtype\":\""
+         << stem::sample_type_name(burst.output_type) << "\""
          << ",\"capacity_buckets\":" << burst.capacity_buckets
          << ",\"processing_stage\":\""
          << stem::processing_stage_name(burst.config.stage) << "\""
@@ -2537,7 +2515,8 @@ class FrameAssembler {
           d_pkt_ptrs_, d_placements_, output_slot->gpu_u16,
           available_payload_len(), gather_header_len(), pkts_to_gather,
           cfg_.frames_per_tensor, stem::FRAME_HEIGHT, stem::FRAME_WIDTH,
-          cfg_.tile_duplicate_prefix_to_simulate_payload, stream_);
+          cfg_.tile_duplicate_prefix_to_simulate_payload, stream_,
+          cfg_.sample_encoding);
       if (cfg_.protect_gather_inputs()) {
         STEM_CUDA_TRY(cudaEventRecord(gather_done_, stream_));
         gather_pending_ = true;
@@ -2562,6 +2541,7 @@ class FrameAssembler {
       metadata.arrival_order = cfg_.assemble_by_arrival;
       metadata.fpga_tiles = cfg_.fpga_tile_headers;
       metadata.fpga_zlp_row_first = cfg_.fpga_zlp_row_first;
+      metadata.sample_encoding = cfg_.sample_encoding;
       pipeline_->process_slot(output_slot, metadata, stream_);
       output_slot->batch_index = emitted_batches_;
       STEM_CUDA_TRY(cudaEventRecord(output_slot->ready, stream_));
@@ -3044,6 +3024,9 @@ void print_rx_start(const StemRxConfig& cfg) {
             << " header_format=" << (cfg.fpga_tile_headers ? "fpga_tiles" : "legacy")
             << " packets_per_frame=" << cfg.expected_packets_per_frame()
             << " payload_size=" << gather_available_payload_len
+            << " sample_encoding=" << stem::sample_encoding_name(cfg.sample_encoding)
+            << " raw_dtype="
+            << stem::sample_type_name(stem::decoded_sample_type(cfg.sample_encoding))
             << " gpu_header_extract="
             << (cfg.gpu_header_extract ? "true" : "false")
             << " header_decode="
@@ -3138,19 +3121,30 @@ int run_hdf5_replay(const YAML::Node& root) {
     throw std::runtime_error("replayer.start_frame is outside the dataset");
   }
   const H5::DataType dataset_type = dataset.getDataType();
-  const bool dataset_uint16 = dataset_type.getClass() == H5T_INTEGER &&
-                              dataset_type.getSize() == sizeof(uint16_t);
+  const bool dataset_integer16 = dataset_type.getClass() == H5T_INTEGER &&
+                                 dataset_type.getSize() == sizeof(uint16_t);
+  const bool dataset_int16 = dataset_integer16 &&
+                             dataset.getIntType().getSign() == H5T_SGN_2;
   const bool dataset_float32 = dataset_type.getClass() == H5T_FLOAT &&
                                dataset_type.getSize() == sizeof(float);
-  if (!dataset_uint16 && !dataset_float32) {
+  if (!dataset_integer16 && !dataset_float32) {
     throw std::runtime_error(
-        "DAQIRI HDF5 replay expects uint16 or float32 [frames,H,W] input");
+        "DAQIRI HDF5 replay expects uint16, int16 or float32 [frames,H,W] input");
   }
+  // HDF5 integer data is already decoded. Never apply the wire ADC conversion
+  // here, including when an old network stem_rx block is present in the YAML.
+  const stem::SampleType input_type = dataset_float32
+      ? stem::SampleType::kFloat32
+      : dataset_int16 ? stem::SampleType::kInt16 : stem::SampleType::kUint16;
+  const H5::DataType memory_type = dataset_float32 ? H5::PredType::NATIVE_FLOAT
+      : dataset_int16 ? H5::PredType::NATIVE_INT16 : H5::PredType::NATIVE_UINT16;
+  std::cout << "HDF5 replay input dtype=" << stem::sample_type_name(input_type)
+            << " (no wire decoding)\n";
 
   auto pipeline = std::make_shared<FramePipeline>(
       processor, writer, burst_writer, thinned_stream,
       static_cast<uint32_t>(dims[1]), static_cast<uint32_t>(dims[2]),
-      replayer.frames_per_tensor, 1, dataset_float32);
+      replayer.frames_per_tensor, 1, input_type);
 
   cudaStream_t stream = nullptr;
   STEM_CUDA_TRY(cudaStreamCreate(&stream));
@@ -3161,13 +3155,12 @@ int run_hdf5_replay(const YAML::Node& root) {
   const uint64_t frame_pixels = dims[1] * dims[2];
   for (uint32_t i = 0; i < slot_count; ++i) {
     auto slot = std::make_unique<OutputSlot>();
-    if (dataset_uint16) {
+    if (dataset_integer16) {
       STEM_CUDA_TRY(cudaMalloc(
           &slot->gpu_u16, static_cast<uint64_t>(replayer.frames_per_tensor) *
                               frame_pixels * sizeof(uint16_t)));
     }
-    pipeline->allocate_slot_buffers(slot.get(), replayer.frames_per_tensor,
-                                    dataset_float32);
+    pipeline->allocate_slot_buffers(slot.get(), replayer.frames_per_tensor);
     STEM_CUDA_TRY(
         cudaEventCreateWithFlags(&slot->ready, cudaEventDisableTiming));
     slots.push_back(std::move(slot));
@@ -3205,10 +3198,7 @@ int run_hdf5_replay(const YAML::Node& root) {
     H5::DataSpace memspace(3, count);
     host_buffer.resize(static_cast<size_t>(batch_frames) *
                        static_cast<size_t>(frame_pixels) * element_bytes);
-    dataset.read(host_buffer.data(),
-                 dataset_float32 ? H5::PredType::NATIVE_FLOAT
-                                 : H5::PredType::NATIVE_UINT16,
-                 memspace, filespace);
+    dataset.read(host_buffer.data(), memory_type, memspace, filespace);
 
     OutputSlot* slot = acquire_replay_slot(slots);
     STEM_CUDA_TRY(cudaMemcpyAsync(dataset_float32
@@ -3223,7 +3213,7 @@ int run_hdf5_replay(const YAML::Node& root) {
     metadata.first_frame = current_frame;
     metadata.frames = batch_frames;
     metadata.complete = true;
-    pipeline->process_slot(slot, metadata, stream, dataset_float32);
+    pipeline->process_slot(slot, metadata, stream);
     slot->batch_index = emitted_batches++;
     STEM_CUDA_TRY(cudaEventRecord(slot->ready, stream));
     pipeline->enqueue(slot);
@@ -3369,7 +3359,8 @@ int main(int argc, char** argv) {
     auto pipeline = std::make_shared<FramePipeline>(
         cfgs.front().processor, cfgs.front().writer, burst_writer,
         thinned_stream, stem::FRAME_HEIGHT, stem::FRAME_WIDTH,
-        cfgs.front().frames_per_tensor, static_cast<uint32_t>(cfgs.size()));
+        cfgs.front().frames_per_tensor, static_cast<uint32_t>(cfgs.size()),
+        stem::decoded_sample_type(cfgs.front().sample_encoding));
     if (pipeline->errors() > 0) { return 1; }
 
     if (source == "network" && daqiri::daqiri_init(argv[1]) != daqiri::Status::SUCCESS) {

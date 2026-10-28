@@ -32,6 +32,7 @@
 #include <cstdint>
 
 #include "stem_packet.h"
+#include "stem_samples.h"
 
 namespace stem {
 
@@ -122,16 +123,25 @@ void stem_extract_packet_headers(uint8_t** src_ptrs, PacketHeaderInfo* headers,
 // is true and available_payload_len < TILE_PAYLOAD_BYTES, the missing tail
 // samples are filled by wrapping back to the front of the payload, so the
 // daqiri TX can drive the tile RX in a self-test loop.
+// twos_complement_12 sign-extends payload bit 11 into int16 during this same
+// gather, ignoring bits 15:12. No header bytes are decoded as samples.
 void stem_gather_tile_packets_by_placement(
     uint8_t** src_ptrs, const PacketPlacement* placements, uint8_t* dst_base,
     uint16_t available_payload_len, uint16_t header_len, uint32_t num_pkts,
     uint32_t frames, uint32_t frame_height, uint32_t frame_width,
-    bool duplicate_prefix_to_simulate_tile_payload, cudaStream_t stream);
+    bool duplicate_prefix_to_simulate_tile_payload, cudaStream_t stream,
+    SampleEncoding sample_encoding = SampleEncoding::kUint16);
 
 // Processor kernels mirror the fused Holoscan correction path. BLR is
 // estimated from the unmodified input (optionally dark-subtracted), then the
 // conversion, dark subtraction, BLR subtraction, and batch mean are performed
-// in one pass for either uint16 or float32 input.
+// in one pass for uint16, decoded int16, or float32 input.
+void stem_compute_blr_baseline(
+    const int16_t* input, const float* dark_frame, float* baseline,
+    uint32_t frames, uint32_t height, uint32_t width, uint32_t blr_rows,
+    uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, cudaStream_t stream);
+
 void stem_compute_blr_baseline(
     const uint16_t* input, const float* dark_frame, float* baseline,
     uint32_t frames, uint32_t height, uint32_t width, uint32_t blr_rows,
@@ -143,6 +153,13 @@ void stem_compute_blr_baseline(
     uint32_t frames, uint32_t height, uint32_t width, uint32_t blr_rows,
     uint32_t zlp_width, uint32_t zlp_group_columns,
     uint32_t core_group_columns, bool subtract_dark, cudaStream_t stream);
+
+void stem_correct_with_blr_and_mean(
+    const int16_t* input, const float* dark_frame, const float* blr_baseline,
+    float* output, float* batch_mean, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, bool apply_blr,
+    bool compute_batch_mean, cudaStream_t stream);
 
 void stem_correct_with_blr_and_mean(
     const uint16_t* input, const float* dark_frame, const float* blr_baseline,
@@ -183,8 +200,15 @@ void stem_threshold_frames_float(const float* input, float* output,
                                  cudaStream_t stream);
 
 // Produce the live-view products without materializing another frame batch.
-// Both outputs are float32 so raw sums cannot overflow uint16. Either output
+// Both outputs are float32 so raw sums cannot overflow a 16-bit integer. Either output
 // pointer may be null when that product is disabled.
+void stem_extract_representative_and_sum(
+    const int16_t* input, const float* dark_frame, float* representative,
+    float* sum, uint32_t frames, uint32_t height, uint32_t width,
+    uint32_t representative_frame_index, bool subtract_dark,
+    bool apply_threshold, uint32_t zlp_width, float zlp_threshold,
+    float core_threshold, cudaStream_t stream);
+
 void stem_extract_representative_and_sum(
     const uint16_t* input, const float* dark_frame, float* representative,
     float* sum, uint32_t frames, uint32_t height, uint32_t width,

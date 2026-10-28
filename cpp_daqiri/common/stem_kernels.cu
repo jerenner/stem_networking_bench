@@ -225,6 +225,7 @@ __device__ __forceinline__ bool tile_geometry(uint32_t tile_index,
   return true;
 }
 
+template <bool DecodeSigned12>
 __global__ void stem_gather_tile_packets_by_placement_kernel(
     uint8_t** src_ptrs, const PacketPlacement* placements, uint8_t* dst_base,
     uint16_t available_payload_len, uint16_t header_len, uint32_t num_pkts,
@@ -275,7 +276,12 @@ __global__ void stem_gather_tile_packets_by_placement_kernel(
                              static_cast<uint64_t>(row_start + local_row) *
                                  static_cast<uint64_t>(frame_width) +
                              static_cast<uint64_t>(col_start + local_col);
-    output[dst_idx] = payload[src_sample_idx];
+    if constexpr (DecodeSigned12) {
+      reinterpret_cast<int16_t*>(dst_base)[dst_idx] =
+          decode_twos_complement_12(payload[src_sample_idx]);
+    } else {
+      output[dst_idx] = payload[src_sample_idx];
+    }
   }
 }
 
@@ -283,12 +289,22 @@ void stem_gather_tile_packets_by_placement(
     uint8_t** src_ptrs, const PacketPlacement* placements, uint8_t* dst_base,
     uint16_t available_payload_len, uint16_t header_len, uint32_t num_pkts,
     uint32_t frames, uint32_t frame_height, uint32_t frame_width,
-    bool duplicate_prefix_to_simulate_tile_payload, cudaStream_t stream) {
+    bool duplicate_prefix_to_simulate_tile_payload, cudaStream_t stream,
+    SampleEncoding sample_encoding) {
   if (num_pkts == 0) { return; }
-  stem_gather_tile_packets_by_placement_kernel<<<num_pkts, 256, 0, stream>>>(
-      src_ptrs, placements, dst_base, available_payload_len, header_len,
-      num_pkts, frames, frame_height, frame_width,
-      duplicate_prefix_to_simulate_tile_payload);
+  if (sample_encoding == SampleEncoding::kTwosComplement12) {
+    stem_gather_tile_packets_by_placement_kernel<true>
+        <<<num_pkts, 256, 0, stream>>>(
+            src_ptrs, placements, dst_base, available_payload_len, header_len,
+            num_pkts, frames, frame_height, frame_width,
+            duplicate_prefix_to_simulate_tile_payload);
+  } else {
+    stem_gather_tile_packets_by_placement_kernel<false>
+        <<<num_pkts, 256, 0, stream>>>(
+            src_ptrs, placements, dst_base, available_payload_len, header_len,
+            num_pkts, frames, frame_height, frame_width,
+            duplicate_prefix_to_simulate_tile_payload);
+  }
   check_cuda_launch("stem_gather_tile_packets_by_placement_kernel");
 }
 
@@ -366,6 +382,16 @@ void launch_stem_compute_blr_baseline(
 
 void stem_compute_blr_baseline(
     const uint16_t* input, const float* dark_frame, float* baseline,
+    uint32_t frames, uint32_t height, uint32_t width, uint32_t blr_rows,
+    uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, cudaStream_t stream) {
+  launch_stem_compute_blr_baseline(
+      input, dark_frame, baseline, frames, height, width, blr_rows, zlp_width,
+      zlp_group_columns, core_group_columns, subtract_dark, stream);
+}
+
+void stem_compute_blr_baseline(
+    const int16_t* input, const float* dark_frame, float* baseline,
     uint32_t frames, uint32_t height, uint32_t width, uint32_t blr_rows,
     uint32_t zlp_width, uint32_t zlp_group_columns,
     uint32_t core_group_columns, bool subtract_dark, cudaStream_t stream) {
@@ -457,6 +483,18 @@ void launch_stem_correct_with_blr_and_mean(
 
 void stem_correct_with_blr_and_mean(
     const uint16_t* input, const float* dark_frame, const float* blr_baseline,
+    float* output, float* batch_mean, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t zlp_width, uint32_t zlp_group_columns,
+    uint32_t core_group_columns, bool subtract_dark, bool apply_blr,
+    bool compute_batch_mean, cudaStream_t stream) {
+  launch_stem_correct_with_blr_and_mean(
+      input, dark_frame, blr_baseline, output, batch_mean, frames, height,
+      width, zlp_width, zlp_group_columns, core_group_columns, subtract_dark,
+      apply_blr, compute_batch_mean, stream);
+}
+
+void stem_correct_with_blr_and_mean(
+    const int16_t* input, const float* dark_frame, const float* blr_baseline,
     float* output, float* batch_mean, uint32_t frames, uint32_t height,
     uint32_t width, uint32_t zlp_width, uint32_t zlp_group_columns,
     uint32_t core_group_columns, bool subtract_dark, bool apply_blr,
@@ -742,6 +780,18 @@ void launch_stem_extract_representative_and_sum(
 
 void stem_extract_representative_and_sum(
     const uint16_t* input, const float* dark_frame, float* representative,
+    float* sum, uint32_t frames, uint32_t height, uint32_t width,
+    uint32_t representative_frame_index, bool subtract_dark,
+    bool apply_threshold, uint32_t zlp_width, float zlp_threshold,
+    float core_threshold, cudaStream_t stream) {
+  launch_stem_extract_representative_and_sum(
+      input, dark_frame, representative, sum, frames, height, width,
+      representative_frame_index, subtract_dark, apply_threshold, zlp_width,
+      zlp_threshold, core_threshold, stream);
+}
+
+void stem_extract_representative_and_sum(
+    const int16_t* input, const float* dark_frame, float* representative,
     float* sum, uint32_t frames, uint32_t height, uint32_t width,
     uint32_t representative_frame_index, bool subtract_dark,
     bool apply_threshold, uint32_t zlp_width, float zlp_threshold,

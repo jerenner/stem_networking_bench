@@ -70,7 +70,8 @@ Legacy `stem_rx.subtract_dark` and `stem_rx.apply_valid_pixel_mask` are still
 accepted as deprecated aliases when `processor` is absent.
 
 The processor uses the same fused correction order as the Holoscan `tiling`
-path for both network `uint16` and HDF5 replay `float32` input: optional
+path for network `uint16`/decoded `int16` and HDF5 replay
+`uint16`/`int16`/`float32` input: optional
 dark-aware grouped BLR estimation, fused conversion/dark/BLR correction and
 batch mean, combined valid-pixel and two-sided dynamic masking with excluded
 edge rows, then optional frame reduction.
@@ -617,7 +618,7 @@ Runtime-safe controls are applied between bucket reservations:
   frame, topic, products, and thresholds
 
 The burst output dtype family is fixed by its startup allocation. Changing
-between network raw `uint16` and processed `float32`, increasing the maximum
+between network raw `uint16`/`int16` and processed `float32`, increasing the maximum
 burst size, enabling an unallocated output, changing ZeroMQ endpoints/queue
 depth, processor kernels/calibration, continuous writer settings, or receiver
 packet/NIC geometry requires restart.
@@ -882,7 +883,8 @@ identically on the CPU and GPU: `5A 5A` at bytes 0..1, link ID at byte 2,
 tile slot 0..15 at byte 3, little-endian 16-bit firmware frame counter at bytes
 4..5, and `A5 A5` at bytes 8..9. Invalid markers, IDs, and slot upper bits are
 rejected. The ETH field and idle-cycle filler are ignored, not used as source
-IDs or timestamps. No ADC sample bits are modified by assembly.
+IDs or timestamps. ADC payload interpretation is selected separately by
+`stem_rx.sample_encoding`, described below.
 
 The provisional ID assignment is:
 
@@ -908,6 +910,7 @@ stem_rx:
   header_size: 42
   stem_header_size: 64
   payload_size: 8192
+  sample_encoding: twos_complement_12
   tile_duplicate_prefix_to_simulate_payload: false
   capture_latency: false
   fpga_zlp_slot_order: read_then_row
@@ -962,8 +965,63 @@ provisional.** Frame identity here follows firmware labels, not a verified
 sensor exposure, and no one-tile header/payload skew is compensated. Burst HDF5
 attributes include `assembly_mode: fpga_tiles`, `mapping_status: provisional`
 and the ZLP slot order; live metadata also flags the map as provisional. The
-existing gather and processing kernels are unchanged. Use raw inspection
-before relying on BLR/dark calibrations derived for another arrangement.
+tile geometry is unchanged. Use raw inspection before relying on BLR/dark
+calibrations derived for another arrangement.
+
+### Signed ADC Samples
+
+The current FPGA sends **12-bit two's-complement ADC samples in bits 11:0**
+of each little-endian 16-bit detector word. Select:
+
+```yaml
+stem_rx:
+  sample_encoding: twos_complement_12
+```
+
+This option is enabled in `stem_rx_igx_fpga_tiles.yaml`. The backward-compatible
+default is `uint16`, which leaves all 16 sample bits untouched for legacy test
+transmitters. All receivers sharing the processing/output pipeline must use
+the same encoding. Changing it requires restarting acquisition, not just
+changing a live-view control. The synthetic source remains unsigned.
+
+The existing GPU gather sign-extends bit 11 while placing each sample in its
+tile: `0x0000 -> 0`, `0x07ff -> 2047`, `0x0800 -> -2048`, and
+`0x0fff -> -1`. Bits 15:12 are ignored, including any existing sign extension.
+Packet headers are not modified. This adds no separate kernel, full-frame
+conversion pass, or float32 allocation to raw-only acquisition; decoded raw
+frames remain two bytes per pixel (`int16`). Missing tiles/samples remain zero.
+The gather has separate signed/unsigned specializations, so the unsigned path
+does not pay a per-sample decoding branch. Live throughput still needs testing
+on the target GPU.
+
+Decoding runs **even with `processor.noop: true` and all corrections disabled**:
+it defines the numerical input rather than an optional detector correction.
+The fused BLR/dark/mean kernels and live representative/sum kernels accept
+`int16` alongside `uint16` and `float32`. Negatives are preserved until an
+explicit masking/thresholding step removes them. Raw continuous and burst HDF5
+output use signed `int16`; corrected/reduced HDF5 and live-view products remain
+float32. Raw bursts are decoded detector values, not byte-preserving packet
+captures. Burst metadata records the input wire encoding for network sources.
+
+HDF5 replay detects `int16`, `uint16`, or `float32` from the dataset's type,
+including integer signedness. It **does not apply wire decoding again**, even
+if an old `stem_rx.sample_encoding` setting remains in the replay YAML. Thus a
+signed raw burst can be replayed through the same fused analysis kernels.
+Do not reinterpret existing float32 microscopy files as encoded ADC words.
+
+Build new dark frames and masks from signed-decoded acquisitions before using
+them for calibration. An old unsigned interpretation near the sign boundary
+changes means and variances, not just a removable constant; the previous
+walking-dot calibration is not a valid dark reference for this ADC stream.
+Startup logs print `sample_encoding=twos_complement_12 raw_dtype=int16` so the
+effective configuration can be checked without inferring it from the GUI.
+
+Host checks: `cmake -S cpp_daqiri/tests -B /tmp/stem-host-tests`,
+`cmake --build /tmp/stem-host-tests`, then
+`ctest --test-dir /tmp/stem-host-tests --output-on-failure`.
+On the IGX, rebuild the application image and run
+`cpp_daqiri/scripts/run_daqiri_validation.sh hdf5 --image <rebuilt-image>` for
+signed replay, raw/burst HDF5, dark correction, BLR, two-sided masking and sums.
 
 ### Headerless / Invalid-Header FPGA Diagnostics
 
@@ -1031,7 +1089,7 @@ FPGA sends valid metadata.
 For an HDF5 smoke run, copy the RX config, set `writer.noop: false`, and run at
 a low rate. The HDF5 writer is a debug sink, not the throughput default.
 Use `scripts/compare_h5_outputs.py` to make the HDS/non-HDS parity check a
-pixel-level gate. The HDF5 replay path accepts `uint16` or `float32`
+pixel-level gate. The HDF5 replay path accepts `uint16`, `int16`, or `float32`
 `[frames,H,W]` input datasets. Exact comparisons are strongest for
 deterministic replay or `processor.noop:true` uint16 gather output. Reduced
 float `/processed` output from DAQIRI vs Holoscan should use relative tolerance
@@ -1137,7 +1195,7 @@ cpp_daqiri/scripts/parse_spark_parity_results.py \
 
 ## HDF5 replay
 
-The DAQIRI receiver binary can replay finite `uint16` or `float32` HDF5
+The DAQIRI receiver binary can replay finite `uint16`, `int16`, or `float32` HDF5
 datasets with shape `[frames,H,W]` through the same `FramePipeline` and fused
 CUDA processing kernels used by live network input. The host-side wrapper
 generates the container config and bind-mounts all files, so no interactive
@@ -1182,7 +1240,7 @@ a live 100 Gb/s stream and therefore is not a receiver keep-up test.
 | `configs/stem_rx_igx_fpga_dual.yaml` | Dual-interface IGX FPGA production config |
 | `configs/stem_rx_igx_loopback.yaml` | IGX hardware-loopback RX config |
 | `configs/stem_rx_igx_loopback_hds.yaml` | IGX hardware-loopback RX config with HDS |
-| `configs/stem_replay_hdf5.yaml` | finite uint16/float32 HDF5 replay config for processor parity |
+| `configs/stem_replay_hdf5.yaml` | finite uint16/int16/float32 HDF5 replay config for processor parity |
 | `configs/stem_rx_synthetic.yaml` | one-to-eight-receiver GPU processing-capacity benchmark |
 | `scripts/validate_synthetic_rx.py` | no-NIC GPU/HDF5 correctness and wrap validation |
 | `configs/synthetic_benchmark/*.yaml` | reproducible local smoke/profile, B200 validation, paced 800-Gbit/s, and maximum-rate runs |

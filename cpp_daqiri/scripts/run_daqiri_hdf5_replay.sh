@@ -25,7 +25,7 @@ Usage:
   $0 --input INPUT.h5 [options]
 
 Required:
-  --input PATH                 uint16/float32 HDF5 input with [frames,H,W]
+  --input PATH                 uint16/int16/float32 HDF5 input with [frames,H,W]
 
 Processing and output:
   --dark PATH                  matching dark-frame HDF5; enables full processing

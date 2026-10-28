@@ -188,14 +188,15 @@ struct BurstWriter::Impl {
 
   Impl(const BurstWriterConfig& value, uint32_t frame_height,
        uint32_t frame_width, uint32_t bucket_frames, uint32_t receivers,
-       bool raw_float)
+       SampleType raw_type)
       : config(value),
         height(frame_height),
         width(frame_width),
         frames_per_bucket(bucket_frames),
         receiver_count(receivers),
-        raw_input_float32(raw_float),
-        output_float(config.stage != ProcessingStage::kRaw || raw_float) {
+        raw_input_type(raw_type),
+        output_type(config.stage == ProcessingStage::kRaw
+                        ? raw_type : SampleType::kFloat32) {
     // An unallocated burst writer cannot meaningfully be armed. Keeping this
     // false also prevents control clients from presenting a disabled capability
     // as ready to capture.
@@ -234,7 +235,7 @@ struct BurstWriter::Impl {
     const uint64_t elements = static_cast<uint64_t>(frames_per_bucket) *
                               height * width;
     const size_t bytes = static_cast<size_t>(elements) *
-                         (output_float ? sizeof(float) : sizeof(uint16_t));
+                         sample_type_bytes(output_type);
     buffers.resize(receiver_count);
     states.resize(receiver_count);
     for (auto& receiver_buffers : buffers) {
@@ -354,12 +355,12 @@ struct BurstWriter::Impl {
     const uint64_t elements = static_cast<uint64_t>(metadata.frames) * height *
                               width;
     buffer->bytes = static_cast<size_t>(elements) *
-                    (output_float ? sizeof(float) : sizeof(uint16_t));
+                    sample_type_bytes(output_type);
     if (buffer->bytes > buffer->capacity) {
       throw std::runtime_error("burst batch exceeds preallocated buffer size");
     }
     return BurstWriter::Reservation{buffer, buffer->device, buffer->bytes,
-                                    output_float, runtime.stage,
+                                    output_type, runtime.stage,
                                     runtime.threshold};
   }
 
@@ -424,7 +425,9 @@ struct BurstWriter::Impl {
     H5::DSetCreatPropList properties;
     hsize_t chunk[3] = {1, height, width};
     properties.setChunk(3, chunk);
-    const H5::DataType type = output_float ? H5::PredType::NATIVE_FLOAT
+    const H5::DataType type = output_type == SampleType::kFloat32
+        ? H5::PredType::NATIVE_FLOAT
+        : output_type == SampleType::kInt16 ? H5::PredType::NATIVE_INT16
                                            : H5::PredType::NATIVE_UINT16;
     H5::DataSet dataset = file.createDataSet(
         normalized_dataset_path(job.runtime.dataset_name), type, filespace,
@@ -462,8 +465,11 @@ struct BurstWriter::Impl {
                              first.fpga_zlp_row_first ? "row_then_read"
                                                       : "read_then_row");
     }
-    write_string_attribute(dataset, "dtype",
-                           output_float ? "float32" : "uint16");
+    write_string_attribute(dataset, "dtype", sample_type_name(output_type));
+    if (first.interface_name != "hdf5_replay") {
+      write_string_attribute(dataset, "wire_sample_encoding",
+                             sample_encoding_name(first.sample_encoding));
+    }
   }
 #endif
 
@@ -559,7 +565,8 @@ struct BurstWriter::Impl {
     BurstRuntimeState state;
     state.capability_enabled = config.enabled;
     state.armed = runtime.armed;
-    state.output_float32 = output_float;
+    state.output_float32 = output_type == SampleType::kFloat32;
+    state.output_type = output_type;
     state.capacity_buckets = config.buckets_per_capture;
     state.config = runtime;
     state.busy = !jobs.empty() || active_jobs != 0 ||
@@ -584,11 +591,11 @@ struct BurstWriter::Impl {
           "buckets_per_capture exceeds the startup allocation; restart with "
           "a larger burst_writer.buckets_per_capture");
     }
-    const bool requested_float =
-        value.stage != ProcessingStage::kRaw || raw_input_float32;
-    if (requested_float != output_float) {
+    const SampleType requested_type = value.stage == ProcessingStage::kRaw
+        ? raw_input_type : SampleType::kFloat32;
+    if (requested_type != output_type) {
       throw std::runtime_error(
-          "changing between raw uint16 and processed float32 burst output "
+          "changing between raw integer and processed float32 burst output "
           "requires restart");
     }
     if (value.filepath_template.empty()) {
@@ -662,8 +669,8 @@ struct BurstWriter::Impl {
   uint32_t width = 0;
   uint32_t frames_per_bucket = 0;
   uint32_t receiver_count = 0;
-  bool raw_input_float32 = false;
-  bool output_float = false;
+  SampleType raw_input_type = SampleType::kUint16;
+  SampleType output_type = SampleType::kUint16;
   std::vector<std::vector<std::unique_ptr<Buffer>>> buffers;
   std::vector<ReceiverState> states;
 
@@ -679,9 +686,9 @@ struct BurstWriter::Impl {
 
 BurstWriter::BurstWriter(const BurstWriterConfig& config, uint32_t height,
                          uint32_t width, uint32_t frames_per_bucket,
-                         uint32_t receiver_count, bool raw_input_float32)
+                         uint32_t receiver_count, SampleType raw_input_type)
     : impl_(std::make_unique<Impl>(config, height, width, frames_per_bucket,
-                                   receiver_count, raw_input_float32)) {}
+                                   receiver_count, raw_input_type)) {}
 
 BurstWriter::~BurstWriter() = default;
 
@@ -711,10 +718,10 @@ std::optional<BurstWriter::Reservation> BurstWriter::reserve(
 }
 
 void BurstWriter::submit_copy(const Reservation& reservation,
-                              const void* source, bool source_float32,
+                              const void* source, SampleType source_type,
                               cudaStream_t stream) {
   if (!reservation) { return; }
-  if (source_float32 != reservation.float32) {
+  if (source_type != reservation.sample_type) {
     throw std::runtime_error("burst stage source type does not match output type");
   }
   auto* buffer = static_cast<Impl::Buffer*>(reservation.token);

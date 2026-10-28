@@ -66,6 +66,8 @@ stem_rx:
   header_size: 42
   stem_header_size: 64
   payload_size: 8192
+  # Decode ADC bits 11:0 into int16 [-2048, 2047] during tile gather.
+  sample_encoding: "twos_complement_12"
   tile_duplicate_prefix_to_simulate_payload: false
   frames_per_tensor: 128
   batch_close_slack_packets: 512
