@@ -48,6 +48,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -210,6 +211,11 @@ struct StemRxConfig {
   uint16_t effective_payload_size() const {
     return stem::resolve_tile_payload_size(
         payload_size, tile_duplicate_prefix_to_simulate_payload);
+  }
+
+  stem::FrameRowFlips frame_row_flips() const {
+    return fpga_tile_headers ? stem::fpga_detector_row_flips()
+                             : stem::FrameRowFlips{};
   }
 
   uint32_t expected_packets_per_frame() const {
@@ -445,6 +451,11 @@ void apply_stem_rx_node(StemRxConfig& cfg, const YAML::Node& rx) {
   if (rx["sample_encoding"]) {
     cfg.sample_encoding = stem::parse_sample_encoding(
         rx["sample_encoding"].as<std::string>());
+  }
+  if (rx["flip_top_imaging_rows"] || rx["flip_bottom_reference_rows"]) {
+    throw std::runtime_error(
+        "detector row flips are fixed for header_format=fpga_tiles; "
+        "remove flip_top_imaging_rows and flip_bottom_reference_rows from the RX config");
   }
   if (rx["header_format"]) {
     const auto format = rx["header_format"].as<std::string>();
@@ -686,6 +697,10 @@ std::vector<StemRxConfig> parse_stem_rx_cfgs(const YAML::Node& root) {
       throw std::runtime_error(
           "shared processing/output requires the same sample_encoding for all receivers");
     }
+    if (!cfgs.empty() && cfg.frame_row_flips() != cfgs.front().frame_row_flips()) {
+      throw std::runtime_error(
+          "shared processing/calibration requires the same header-derived row layout for all receivers");
+    }
     cfgs.push_back(std::move(cfg));
   }
   return cfgs;
@@ -764,6 +779,7 @@ struct OutputSlot {
   uint32_t frames = 0;
   void* output_ptr = nullptr;
   stem::SampleType output_type = stem::SampleType::kUint16;
+  stem::FrameRowFlips row_flips;
   uint32_t output_rank = 3;
   uint32_t output_frames = 0;
   uint32_t output_height = 0;
@@ -775,6 +791,7 @@ struct Hdf5FrameData {
   uint32_t height = 0;
   uint32_t width = 0;
   std::string dataset_path;
+  std::optional<stem::FrameRowFlips> row_flips;
 };
 
 std::string normalize_hdf5_dataset_path(const std::string& dataset_path) {
@@ -783,6 +800,34 @@ std::string normalize_hdf5_dataset_path(const std::string& dataset_path) {
 }
 
 #ifdef STEM_DAQIRI_HAVE_HDF5
+std::optional<stem::FrameRowFlips> read_frame_row_flips(
+    const H5::DataSet& dataset) {
+  const bool has_top = dataset.attrExists("flip_top_imaging_rows");
+  const bool has_bottom = dataset.attrExists("flip_bottom_reference_rows");
+  if (!has_top && !has_bottom) { return std::nullopt; }
+  if (has_top != has_bottom) {
+    throw std::runtime_error("HDF5 row orientation needs both flip attributes");
+  }
+  const auto flag = [&](const char* name) {
+    auto attribute = dataset.openAttribute(name);
+    if (attribute.getSpace().getSimpleExtentNpoints() != 1) {
+      throw std::runtime_error("HDF5 row flip attribute must be scalar");
+    }
+    const auto type = attribute.getDataType().getClass();
+    if (type != H5T_INTEGER && type != H5T_ENUM) {
+      throw std::runtime_error("HDF5 row flip attribute must be integer or boolean");
+    }
+    int64_t value = 0;
+    attribute.read(H5::PredType::NATIVE_INT64, &value);
+    if (value < 0 || value > 1) {
+      throw std::runtime_error("HDF5 row flip attribute must be 0 or 1");
+    }
+    return value != 0;
+  };
+  return stem::FrameRowFlips{flag("flip_top_imaging_rows"),
+                            flag("flip_bottom_reference_rows")};
+}
+
 Hdf5FrameData read_single_frame_float_dataset(const std::string& file_path,
                                               const std::string& dataset_path) {
   const std::string normalized_path = normalize_hdf5_dataset_path(dataset_path);
@@ -796,6 +841,7 @@ Hdf5FrameData read_single_frame_float_dataset(const std::string& file_path,
 
   Hdf5FrameData frame;
   frame.dataset_path = normalized_path;
+  frame.row_flips = read_frame_row_flips(dataset);
   if (rank == 2) {
     frame.height = static_cast<uint32_t>(dims[0]);
     frame.width = static_cast<uint32_t>(dims[1]);
@@ -928,11 +974,22 @@ class AsyncFrameSink {
         dataset_ = std::make_unique<H5::DataSet>(
             file_->createDataSet(cfg_.dataset_name, h5_type, filespace, prop));
         dataset_type_ = slot->output_type;
+        dataset_row_flips_ = slot->row_flips;
+        const H5::DataSpace scalar(H5S_SCALAR);
+        for (const auto& flag : {
+                 std::make_pair("flip_top_imaging_rows", slot->row_flips.flip_top_imaging_rows),
+                 std::make_pair("flip_bottom_reference_rows", slot->row_flips.flip_bottom_reference_rows)}) {
+          auto attribute = dataset_->createAttribute(flag.first,
+              H5::PredType::NATIVE_UINT32, scalar);
+          const uint32_t value = flag.second;
+          attribute.write(H5::PredType::NATIVE_UINT32, &value);
+        }
         dataset_height_ = slot->output_height;
         dataset_width_ = slot->output_width;
         current_frames_ = batch_frames;
       } else {
         if (dataset_type_ != slot->output_type ||
+            dataset_row_flips_ != slot->row_flips ||
             dataset_height_ != slot->output_height ||
             dataset_width_ != slot->output_width) {
           std::fprintf(
@@ -981,6 +1038,7 @@ class AsyncFrameSink {
   std::unique_ptr<H5::DataSet> dataset_;
   hsize_t current_frames_ = 0;
   stem::SampleType dataset_type_ = stem::SampleType::kUint16;
+  stem::FrameRowFlips dataset_row_flips_;
   hsize_t dataset_height_ = 0;
   hsize_t dataset_width_ = 0;
 #endif
@@ -993,11 +1051,13 @@ class FramePipeline {
                 const stem::ThinnedStreamConfig& thinned_stream,
                 uint32_t height, uint32_t width, uint32_t frames_per_bucket,
                 uint32_t receiver_count,
-                stem::SampleType raw_input_type = stem::SampleType::kUint16)
+                stem::SampleType raw_input_type = stem::SampleType::kUint16,
+                stem::FrameRowFlips row_flips = {})
       : processor_(processor),
         height_(height),
         width_(width),
         raw_input_type_(raw_input_type),
+        row_flips_(row_flips),
         sink_(writer),
         burst_writer_(burst_writer, height, width, frames_per_bucket,
                       receiver_count, raw_input_type),
@@ -1006,6 +1066,9 @@ class FramePipeline {
     if (height_ == 0 || width_ == 0) {
       throw std::runtime_error(
           "FramePipeline requires non-zero frame dimensions");
+    }
+    if (row_flips_.enabled() && height_ != stem::FRAME_HEIGHT) {
+      throw std::runtime_error("detector row flips require 1024-row frames");
     }
     if (processor_.apply_dynamic_half_column_mask &&
         (processor_.dynamic_mask_median_window_pixels == 0 ||
@@ -1047,7 +1110,15 @@ class FramePipeline {
       throw std::runtime_error(
           "processor.dynamic_mask_excluded_edge_rows leaves no imaging pixels");
     }
-    load_correction_inputs();
+    try {
+      load_correction_inputs();
+    } catch (...) {
+      // A mismatching mask can fail after the dark frame was allocated.
+      // Constructor failure does not invoke this class's destructor.
+      if (gpu_dark_frame_) { cudaFree(gpu_dark_frame_); }
+      if (gpu_valid_mask_) { cudaFree(gpu_valid_mask_); }
+      throw;
+    }
   }
 
   ~FramePipeline() {
@@ -1244,6 +1315,7 @@ class FramePipeline {
     }
 
     slot->frames = frames;
+    slot->row_flips = row_flips_;
     slot->output_height = height_;
     slot->output_width = width_;
   }
@@ -1289,6 +1361,15 @@ class FramePipeline {
     if (frame.height != height_ || frame.width != width_) {
       throw std::runtime_error(label +
                                " shape does not match incoming frame shape");
+    }
+    if (!frame.row_flips && row_flips_.enabled()) {
+      throw std::runtime_error(label +
+          " has no row-orientation metadata; rebuild from oriented raw frames "
+          "or use scripts/conversion/flip_detector_rows.py");
+    }
+    if (frame.row_flips && *frame.row_flips != row_flips_) {
+      throw std::runtime_error(label +
+          " row orientation does not match the incoming frames");
     }
   }
 
@@ -1347,6 +1428,7 @@ class FramePipeline {
   uint32_t height_ = 0;
   uint32_t width_ = 0;
   stem::SampleType raw_input_type_ = stem::SampleType::kUint16;
+  stem::FrameRowFlips row_flips_;
   float* gpu_dark_frame_ = nullptr;
   float* gpu_valid_mask_ = nullptr;
   AsyncFrameSink sink_;
@@ -2517,7 +2599,7 @@ class FrameAssembler {
           available_payload_len(), gather_header_len(), pkts_to_gather,
           cfg_.frames_per_tensor, stem::FRAME_HEIGHT, stem::FRAME_WIDTH,
           cfg_.tile_duplicate_prefix_to_simulate_payload, stream_,
-          cfg_.sample_encoding);
+          cfg_.sample_encoding, cfg_.frame_row_flips());
       if (cfg_.protect_gather_inputs()) {
         STEM_CUDA_TRY(cudaEventRecord(gather_done_, stream_));
         gather_pending_ = true;
@@ -2543,6 +2625,7 @@ class FrameAssembler {
       metadata.fpga_tiles = cfg_.fpga_tile_headers;
       metadata.fpga_zlp_row_first = cfg_.fpga_zlp_row_first;
       metadata.sample_encoding = cfg_.sample_encoding;
+      metadata.row_flips = cfg_.frame_row_flips();
       pipeline_->process_slot(output_slot, metadata, stream_);
       output_slot->batch_index = emitted_batches_;
       STEM_CUDA_TRY(cudaEventRecord(output_slot->ready, stream_));
@@ -3028,6 +3111,10 @@ void print_rx_start(const StemRxConfig& cfg) {
             << " sample_encoding=" << stem::sample_encoding_name(cfg.sample_encoding)
             << " raw_dtype="
             << stem::sample_type_name(stem::decoded_sample_type(cfg.sample_encoding))
+            << " flip_top_imaging_rows="
+            << (cfg.frame_row_flips().flip_top_imaging_rows ? "true" : "false")
+            << " flip_bottom_reference_rows="
+            << (cfg.frame_row_flips().flip_bottom_reference_rows ? "true" : "false")
             << " gpu_header_extract="
             << (cfg.gpu_header_extract ? "true" : "false")
             << " header_decode="
@@ -3139,13 +3226,15 @@ int run_hdf5_replay(const YAML::Node& root) {
       : dataset_int16 ? stem::SampleType::kInt16 : stem::SampleType::kUint16;
   const H5::DataType memory_type = dataset_float32 ? H5::PredType::NATIVE_FLOAT
       : dataset_int16 ? H5::PredType::NATIVE_INT16 : H5::PredType::NATIVE_UINT16;
+  const stem::FrameRowFlips row_flips =
+      read_frame_row_flips(dataset).value_or(stem::FrameRowFlips{});
   std::cout << "HDF5 replay input dtype=" << stem::sample_type_name(input_type)
             << " (no wire decoding)\n";
 
   auto pipeline = std::make_shared<FramePipeline>(
       processor, writer, burst_writer, thinned_stream,
       static_cast<uint32_t>(dims[1]), static_cast<uint32_t>(dims[2]),
-      replayer.frames_per_tensor, 1, input_type);
+      replayer.frames_per_tensor, 1, input_type, row_flips);
 
   cudaStream_t stream = nullptr;
   STEM_CUDA_TRY(cudaStreamCreate(&stream));
@@ -3214,6 +3303,7 @@ int run_hdf5_replay(const YAML::Node& root) {
     metadata.first_frame = current_frame;
     metadata.frames = batch_frames;
     metadata.complete = true;
+    metadata.row_flips = row_flips;
     pipeline->process_slot(slot, metadata, stream);
     slot->batch_index = emitted_batches++;
     STEM_CUDA_TRY(cudaEventRecord(slot->ready, stream));
@@ -3361,7 +3451,8 @@ int main(int argc, char** argv) {
         cfgs.front().processor, cfgs.front().writer, burst_writer,
         thinned_stream, stem::FRAME_HEIGHT, stem::FRAME_WIDTH,
         cfgs.front().frames_per_tensor, static_cast<uint32_t>(cfgs.size()),
-        stem::decoded_sample_type(cfgs.front().sample_encoding));
+        stem::decoded_sample_type(cfgs.front().sample_encoding),
+        cfgs.front().frame_row_flips());
     if (pipeline->errors() > 0) { return 1; }
 
     if (source == "network" && daqiri::daqiri_init(argv[1]) != daqiri::Status::SUCCESS) {

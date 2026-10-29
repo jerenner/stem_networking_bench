@@ -25,7 +25,14 @@ def kernel_body(source, name):
     )
     if match is None:
         raise AssertionError(f"kernel definition not found: {name}")
-    start = source.index("{", match.start())
+    # Skip default argument initializers such as FrameRowFlips{} before
+    # looking for the function body.
+    signature_end = match.end()
+    depth = 1
+    while depth:
+        depth += (source[signature_end] == "(") - (source[signature_end] == ")")
+        signature_end += 1
+    start = source.index("{", signature_end)
     depth = 1
     end = start + 1
     while depth:
@@ -80,10 +87,10 @@ int main() {
       launch(1, [&] {
         stem_gather_tile_packets_by_placement_kernel<true>(
             &ptr, &placement, reinterpret_cast<uint8_t*>(signed_output.data()),
-            payload_bytes, headers, 1, 2, FRAME_HEIGHT, FRAME_WIDTH, duplicate);
+            payload_bytes, headers, 1, 2, FRAME_HEIGHT, FRAME_WIDTH, duplicate, FrameRowFlips{});
         stem_gather_tile_packets_by_placement_kernel<false>(
             &ptr, &placement, reinterpret_cast<uint8_t*>(unsigned_output.data()),
-            payload_bytes, headers, 1, 2, FRAME_HEIGHT, FRAME_WIDTH, duplicate);
+            payload_bytes, headers, 1, 2, FRAME_HEIGHT, FRAME_WIDTH, duplicate, FrameRowFlips{});
       });
       for (uint32_t i = 0; i < TILE_SAMPLES; ++i) {
         const auto src = i >= payload_bytes / 2 ? i - payload_bytes / 2 : i;
@@ -95,6 +102,51 @@ int main() {
                            [](int16_t x) { return x != 0; }) ==
               (duplicate ? TILE_SAMPLES - 2 : TILE_SAMPLES - 1));
       require(packet.front() == 0x5a5a);
+    }
+  }
+
+  // Full-frame gather checks ensure flips cross tile boundaries without holes
+  // or collisions. Distinct row/column values catch accidental per-tile flips.
+  for (bool top : {false, true}) {
+    for (bool bottom : {false, true}) {
+      const uint16_t header_bytes = top ? 0 : headers;  // HDS / non-HDS payload offsets.
+      std::vector<std::vector<uint16_t>> packets(FULL_FRAME_TILE_PACKETS);
+      std::vector<uint8_t*> pointers(FULL_FRAME_TILE_PACKETS);
+      std::vector<PacketPlacement> placements(FULL_FRAME_TILE_PACKETS);
+      for (uint32_t tile = 0; tile < FULL_FRAME_TILE_PACKETS; ++tile) {
+        uint32_t row, col, h, w;
+        require(tile_geometry(tile, row, col, h, w));
+        packets[tile].resize(header_bytes / 2 + TILE_SAMPLES, 0x5a5a);
+        for (uint32_t i = 0; i < TILE_SAMPLES; ++i) {
+          packets[tile][header_bytes / 2 + i] = static_cast<uint16_t>(
+              (((row + i / w) * 3 + col + i % w) % 4096) | 0xa000);
+        }
+        pointers[tile] = reinterpret_cast<uint8_t*>(packets[tile].data());
+        placements[tile] = {0, static_cast<uint16_t>(tile), 1, 1};
+      }
+      std::vector<int16_t> signed_frame(2 * pixels);
+      std::vector<uint16_t> unsigned_frame(2 * pixels);
+      launch(FULL_FRAME_TILE_PACKETS, [&] {
+        stem_gather_tile_packets_by_placement_kernel<true, true>(
+            pointers.data(), placements.data(), reinterpret_cast<uint8_t*>(signed_frame.data()),
+            8192, header_bytes, FULL_FRAME_TILE_PACKETS, 2, FRAME_HEIGHT, FRAME_WIDTH, false,
+            FrameRowFlips{top, bottom});
+        stem_gather_tile_packets_by_placement_kernel<false, true>(
+            pointers.data(), placements.data(), reinterpret_cast<uint8_t*>(unsigned_frame.data()),
+            8192, header_bytes, FULL_FRAME_TILE_PACKETS, 2, FRAME_HEIGHT, FRAME_WIDTH, false,
+            FrameRowFlips{top, bottom});
+      });
+      for (uint32_t row = 0; row < FRAME_HEIGHT; ++row) {
+        const uint32_t dest = top && row >= 32 && row < 512 ? 543 - row
+            : bottom && row >= 992 ? 2015 - row : row;
+        for (uint32_t col = 0; col < FRAME_WIDTH; ++col) {
+          const uint32_t raw = (row * 3 + col) % 4096;
+          const uint32_t index = pixels + dest * FRAME_WIDTH + col;
+          require(signed_frame[index] == (raw < 2048 ? int(raw) : int(raw) - 4096));
+          require(unsigned_frame[index] == (raw | 0xa000));
+          require(signed_frame[row * FRAME_WIDTH + col] == 0);
+        }
+      }
     }
   }
 

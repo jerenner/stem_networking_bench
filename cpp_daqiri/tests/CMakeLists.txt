@@ -27,6 +27,14 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 endif()
 add_test(NAME adc_sample_decoding COMMAND test_samples)
 
+add_executable(test_frame_rows test_frame_rows.cpp)
+target_compile_features(test_frame_rows PRIVATE cxx_std_17)
+target_include_directories(test_frame_rows PRIVATE ../common)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(test_frame_rows PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME detector_row_orientation COMMAND test_frame_rows)
+
 find_package(Python3 QUIET COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   add_test(NAME signed_kernel_math_cpu_emulation

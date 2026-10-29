@@ -225,12 +225,13 @@ __device__ __forceinline__ bool tile_geometry(uint32_t tile_index,
   return true;
 }
 
-template <bool DecodeSigned12>
+template <bool DecodeSigned12, bool OrientRows = false>
 __global__ void stem_gather_tile_packets_by_placement_kernel(
     uint8_t** src_ptrs, const PacketPlacement* placements, uint8_t* dst_base,
     uint16_t available_payload_len, uint16_t header_len, uint32_t num_pkts,
     uint32_t frames, uint32_t frame_height, uint32_t frame_width,
-    bool duplicate_prefix_to_simulate_tile_payload) {
+    bool duplicate_prefix_to_simulate_tile_payload,
+    FrameRowFlips row_flips) {
   const uint32_t pkt_idx = blockIdx.x;
   if (pkt_idx >= num_pkts) { return; }
 
@@ -272,8 +273,12 @@ __global__ void stem_gather_tile_packets_by_placement_kernel(
     const uint32_t local_col = sample_idx - local_row * tile_w;
     if (local_row >= tile_h) { continue; }
 
+    uint32_t destination_row = row_start + local_row;
+    if constexpr (OrientRows) {
+      destination_row = orient_detector_row(destination_row, row_flips);
+    }
     const uint64_t dst_idx = frame_offset +
-                             static_cast<uint64_t>(row_start + local_row) *
+                             static_cast<uint64_t>(destination_row) *
                                  static_cast<uint64_t>(frame_width) +
                              static_cast<uint64_t>(col_start + local_col);
     if constexpr (DecodeSigned12) {
@@ -285,25 +290,48 @@ __global__ void stem_gather_tile_packets_by_placement_kernel(
   }
 }
 
+template <bool DecodeSigned12>
+void launch_stem_gather_tile_packets(
+    uint8_t** src_ptrs, const PacketPlacement* placements, uint8_t* dst_base,
+    uint16_t available_payload_len, uint16_t header_len, uint32_t num_pkts,
+    uint32_t frames, uint32_t frame_height, uint32_t frame_width,
+    bool duplicate_prefix_to_simulate_tile_payload, cudaStream_t stream,
+    FrameRowFlips row_flips) {
+  if (row_flips.enabled()) {
+    stem_gather_tile_packets_by_placement_kernel<DecodeSigned12, true>
+        <<<num_pkts, 256, 0, stream>>>(
+            src_ptrs, placements, dst_base, available_payload_len, header_len,
+            num_pkts, frames, frame_height, frame_width,
+            duplicate_prefix_to_simulate_tile_payload, row_flips);
+  } else {
+    stem_gather_tile_packets_by_placement_kernel<DecodeSigned12, false>
+        <<<num_pkts, 256, 0, stream>>>(
+            src_ptrs, placements, dst_base, available_payload_len, header_len,
+            num_pkts, frames, frame_height, frame_width,
+            duplicate_prefix_to_simulate_tile_payload, row_flips);
+  }
+}
+
 void stem_gather_tile_packets_by_placement(
     uint8_t** src_ptrs, const PacketPlacement* placements, uint8_t* dst_base,
     uint16_t available_payload_len, uint16_t header_len, uint32_t num_pkts,
     uint32_t frames, uint32_t frame_height, uint32_t frame_width,
     bool duplicate_prefix_to_simulate_tile_payload, cudaStream_t stream,
-    SampleEncoding sample_encoding) {
+    SampleEncoding sample_encoding, FrameRowFlips row_flips) {
   if (num_pkts == 0) { return; }
+  if (row_flips.enabled() && frame_height != FRAME_HEIGHT) {
+    throw std::runtime_error("detector row flips require 1024-row frames");
+  }
   if (sample_encoding == SampleEncoding::kTwosComplement12) {
-    stem_gather_tile_packets_by_placement_kernel<true>
-        <<<num_pkts, 256, 0, stream>>>(
-            src_ptrs, placements, dst_base, available_payload_len, header_len,
-            num_pkts, frames, frame_height, frame_width,
-            duplicate_prefix_to_simulate_tile_payload);
+    launch_stem_gather_tile_packets<true>(
+        src_ptrs, placements, dst_base, available_payload_len, header_len,
+        num_pkts, frames, frame_height, frame_width,
+        duplicate_prefix_to_simulate_tile_payload, stream, row_flips);
   } else {
-    stem_gather_tile_packets_by_placement_kernel<false>
-        <<<num_pkts, 256, 0, stream>>>(
-            src_ptrs, placements, dst_base, available_payload_len, header_len,
-            num_pkts, frames, frame_height, frame_width,
-            duplicate_prefix_to_simulate_tile_payload);
+    launch_stem_gather_tile_packets<false>(
+        src_ptrs, placements, dst_base, available_payload_len, header_len,
+        num_pkts, frames, frame_height, frame_width,
+        duplicate_prefix_to_simulate_tile_payload, stream, row_flips);
   }
   check_cuda_launch("stem_gather_tile_packets_by_placement_kernel");
 }

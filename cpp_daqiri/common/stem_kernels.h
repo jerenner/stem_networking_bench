@@ -33,6 +33,7 @@
 
 #include "stem_packet.h"
 #include "stem_samples.h"
+#include "stem_frame_rows.h"
 
 namespace stem {
 
@@ -125,12 +126,15 @@ void stem_extract_packet_headers(uint8_t** src_ptrs, PacketHeaderInfo* headers,
 // daqiri TX can drive the tile RX in a self-test loop.
 // twos_complement_12 sign-extends payload bit 11 into int16 during this same
 // gather, ignoring bits 15:12. No header bytes are decoded as samples.
+// Optional row_flips reverse the entire top imaging block (32..511) and/or
+// bottom reference block (992..1023) at placement time, never per tile.
 void stem_gather_tile_packets_by_placement(
     uint8_t** src_ptrs, const PacketPlacement* placements, uint8_t* dst_base,
     uint16_t available_payload_len, uint16_t header_len, uint32_t num_pkts,
     uint32_t frames, uint32_t frame_height, uint32_t frame_width,
     bool duplicate_prefix_to_simulate_tile_payload, cudaStream_t stream,
-    SampleEncoding sample_encoding = SampleEncoding::kUint16);
+    SampleEncoding sample_encoding = SampleEncoding::kUint16,
+    FrameRowFlips row_flips = {});
 
 // Processor kernels mirror the fused Holoscan correction path. BLR is
 // estimated from the unmodified input (optionally dark-subtracted), then the

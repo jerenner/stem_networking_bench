@@ -61,6 +61,7 @@ daqiri:
           match: {udp_dst: 23130}
 
 stem_rx:
+  # Native detector mapping always reverses rows 32..511 and 992..1023.
   header_format: "fpga_tiles"
   assemble_by_arrival: false
   header_size: 42

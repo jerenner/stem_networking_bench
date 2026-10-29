@@ -153,6 +153,13 @@ with h5py.File(tmp / "stem_pipeline_input.h5", "w") as f:
     dyn_two_sided[:, 7, 0] = -1000
     f.create_dataset("/dyn_two_sided_frames", data=dyn_two_sided)
     f.create_dataset("/signed_dyn_frames", data=dyn_two_sided.astype(np.int16))
+    oriented = np.broadcast_to(np.arange(1024, dtype=np.int16)[None, :, None],
+                               (3, 1024, 4)).copy()
+    oriented[:, 32:512] = oriented[:, 32:512][:, ::-1].copy()
+    oriented[:, 992:1024] = oriented[:, 992:1024][:, ::-1].copy()
+    ds = f.create_dataset("/oriented_frames", data=oriented)
+    for key in ("flip_top_imaging_rows", "flip_bottom_reference_rows"):
+        ds.attrs[key] = 1
 
 with h5py.File(tmp / "stem_pipeline_corr.h5", "w") as f:
     dark = np.arange(16, dtype=np.float32).reshape(4, 4) / 2.0
@@ -163,6 +170,11 @@ with h5py.File(tmp / "stem_pipeline_corr.h5", "w") as f:
     f.create_dataset("/dark", data=dark)
     f.create_dataset("/valid_pixel_mask", data=mask)
     f.create_dataset("/bad_dark", data=np.zeros((3, 4), dtype=np.float32))
+    for name in ("oriented_dark", "legacy_dark", "unlabeled_dark"):
+        ds = f.create_dataset(name, data=np.full((1024, 4), 0.5, dtype=np.float32))
+        if name != "unlabeled_dark":
+            for key in ("flip_top_imaging_rows", "flip_bottom_reference_rows"):
+                ds.attrs[key] = int(name == "oriented_dark")
 
 def write(name: str, body: str) -> None:
     (tmp / name).write_text(body, encoding="utf-8")
@@ -646,6 +658,21 @@ text = text.replace("apply_dynamic_half_column_mask: false", '''apply_dynamic_ha
   dynamic_mask_two_sided: true''')
 write("stem_case_signed_full.yaml", text.replace("stem_case_signed_blr_",
                                                "stem_case_signed_full_"))
+for case in ("raw", "correction"):
+    text = (tmp / f"stem_case_signed_{case}.yaml").read_text()
+    text = text.replace('dataset_name: "/signed_frames"', 'dataset_name: "/oriented_frames"')
+    text = text.replace('dark_frame_dataset: "/dark"', 'dark_frame_dataset: "/oriented_dark"')
+    text = text.replace("apply_valid_pixel_mask: true", "apply_valid_pixel_mask: false")
+    text = text.replace(f"stem_case_signed_{case}_", f"stem_case_oriented_{case}_")
+    # HDF5 is already oriented: a stale network header format must not flip it again.
+    text += '\n  header_format: "fpga_tiles"\n'
+    write(f"stem_case_oriented_{case}.yaml", text)
+    if case == "correction":
+        for bad in ("legacy_dark", "unlabeled_dark"):
+            bad_text = text.replace('"/oriented_dark"', f'"/{bad}"')
+            bad_text = bad_text.replace("stem_case_oriented_correction_out.h5",
+                                        f"stem_case_bad_{bad}_out.h5")
+            write(f"stem_case_bad_{bad}.yaml", bad_text)
 PY
 
     cat > "${tmpdir}/run_hdf5_container.sh" <<'EOS'
@@ -686,6 +713,10 @@ run_ok stem_case_thinned.yaml
 for case in raw window correction reduce blr burst_raw burst_thresholded thinned dynamic_two_sided full; do
     run_ok "stem_case_signed_${case}.yaml"
 done
+run_ok stem_case_oriented_raw.yaml
+run_ok stem_case_oriented_correction.yaml
+run_fail stem_case_bad_legacy_dark.yaml
+run_fail stem_case_bad_unlabeled_dark.yaml
 
 run_fail stem_case_bad_repeat.yaml
 run_fail stem_case_bad_writer.yaml
@@ -718,12 +749,16 @@ with h5py.File(tmp / "stem_pipeline_input.h5", "r") as f_in, \
     frames = f_in["/frames"][...]
     float_frames = f_in["/float_frames"][...]
     signed = f_in["/signed_frames"][...]
+    oriented = f_in["/oriented_frames"][...]
     dyn = f_in["/dyn_frames"][...]
     dyn_two_sided = f_in["/dyn_two_sided_frames"][...]
     dark = f_corr["/dark"][...]
     mask = f_corr["/valid_pixel_mask"][...]
 
 expected = {
+    "oriented_raw": (oriented, np.int16, tmp / "stem_case_oriented_raw_out.h5"),
+    "oriented_correction": (oriented[:2].astype(np.float32) - 0.5, np.float32,
+                            tmp / "stem_case_oriented_correction_out.h5"),
     "raw": (frames, np.uint16, tmp / "stem_case_raw_out.h5"),
     "float_raw": (float_frames, np.float32, tmp / "stem_case_float_raw_out.h5"),
     "window": (frames[1:4], np.uint16, tmp / "stem_case_window_out.h5"),
@@ -820,6 +855,9 @@ for name, want, dtype in (
 for name, (want, dtype, path) in expected.items():
     with h5py.File(path, "r") as f:
         got = f["/processed"][...]
+        if name.startswith("oriented_"):
+            for key in ("flip_top_imaging_rows", "flip_bottom_reference_rows"):
+                assert f["/processed"].attrs[key] == 1
     if got.shape != want.shape:
         raise AssertionError(f"{name}: shape {got.shape} != {want.shape}")
     if got.dtype != np.dtype(dtype):
@@ -969,6 +1007,19 @@ EOF
     run_config_fail "${tmpdir}/ambiguous_receiver.yaml" \
         'receiver override.*ambiguous'
 
+    # Native detector placement cannot be disabled through an old RX switch.
+    for key in flip_top_imaging_rows flip_bottom_reference_rows; do
+        cat > "${tmpdir}/bad_${key}.yaml" <<EOF
+%YAML 1.2
+---
+source: "network"
+stem_rx:
+  header_format: "fpga_tiles"
+  ${key}: false
+EOF
+        run_config_fail "${tmpdir}/bad_${key}.yaml" 'detector row flips are fixed'
+    done
+
     python3 - "${REPO_ROOT}" <<'PY'
 from pathlib import Path
 import sys
@@ -989,6 +1040,7 @@ for path in rx_configs:
         raise AssertionError(f"{path.name}: frames_per_tensor must be > 0")
     fpga_tiles = rx.get("header_format", "legacy") == "fpga_tiles"
     encodings = set()
+    orientations = set()
     for index in range(int(data.get("num_receivers", 1))):
         effective = dict(rx)
         effective.update(data.get(f"receiver{index}", rx.get(f"receiver{index}", {})))
@@ -998,8 +1050,13 @@ for path in rx_configs:
         if data.get("source") == "synthetic" and encoding != "uint16":
             raise AssertionError(f"{path.name}: synthetic input must stay unsigned")
         encodings.add(encoding)
+        if any(key in effective for key in ("flip_top_imaging_rows", "flip_bottom_reference_rows")):
+            raise AssertionError(f"{path.name}: row-flip configuration switches were removed")
+        orientations.add(effective.get("header_format", "legacy") == "fpga_tiles")
     if len(encodings) != 1:
         raise AssertionError(f"{path.name}: receiver sample encodings differ")
+    if len(orientations) != 1:
+        raise AssertionError(f"{path.name}: receiver row orientations differ")
     if not fpga_tiles and source_mask & 0xff == 0:
         raise AssertionError(f"{path.name}: expected_source_mask enables no sources")
     if fpga_tiles:

@@ -940,7 +940,8 @@ CoreLoss, link >= 6:
 
 `fpga_zlp_slot_order: row_then_read` instead uses `read = slot % 4` and
 `vertical_tile = slot / 4`. Neither option reverses sample order or sensor
-rows. Payloads are still assumed row-major within each tile: ADC-channel
+rows by itself; the fixed native detector row mapping below acts after tile placement.
+Payloads are still assumed row-major within each tile: ADC-channel
 deinterleaving and physical alignment shifts are not inferred automatically.
 
 Assembly starts in the counter-aligned bucket containing the first valid
@@ -1022,6 +1023,86 @@ Host checks: `cmake -S cpp_daqiri/tests -B /tmp/stem-host-tests`,
 On the IGX, rebuild the application image and run
 `cpp_daqiri/scripts/run_daqiri_validation.sh hdf5 --image <rebuilt-image>` for
 signed replay, raw/burst HDF5, dark correction, BLR, two-sided masking and sums.
+
+### Detector Row Orientation
+
+The FPGA's imaging/reference readout directions require two fixed in-place
+reversals, across **all ZLP and CoreLoss columns**. They are an unconditional
+part of `stem_rx.header_format: fpga_tiles`, not optional corrections:
+
+| Incoming row range (inclusive) | Fixed destination mapping |
+| --- | --- |
+| 0..31: top pattern + meta + 30 BLR | Unchanged |
+| 32..511: top imaging | `destination_row = 543 - source_row` |
+| 512..991: bottom imaging | Unchanged |
+| 992..1023: bottom pattern/meta/BLR block | `destination_row = 2015 - source_row` |
+
+No extra YAML settings or GUI switches are needed. Rebuild the application and
+restart acquisition with the existing `header_format: fpga_tiles` configuration.
+If the provisional `flip_top_imaging_rows` or `flip_bottom_reference_rows` keys
+were added to an RX config, remove them; they are no longer accepted options.
+These reversals define the coordinates received by every downstream operation,
+not just the display. Receivers sharing a processor/calibration must use the
+same header-derived layout. Legacy test transmitters, synthetic benchmarks,
+and arrival-order diagnostics retain their previous placement.
+
+The operation is fused into GPU gather, alongside signed ADC decoding. There
+is no extra frame pass, GPU buffer, or kernel launch. It reverses the global
+480-row top imaging region, **not each individual tile**. Thus a 128-row ZLP
+tile crossing row 32 is split between unchanged reference rows and reversed
+imaging rows; the mapping remains a bijection with no dropped/duplicated
+pixels. The bottom reference flip includes the pattern and metadata rows,
+but leaves all bottom imaging pixels and top reference pixels untouched.
+Legacy/synthetic layouts use the original no-orientation kernel specialization.
+Actual performance must still be checked on the IGX.
+
+Raw live products and raw bursts already include this placement correction,
+even with processor no-op enabled. Their metadata records
+`flip_top_imaging_rows` and `flip_bottom_reference_rows`; continuous HDF5 output
+also records these dataset attributes. They describe stored coordinates and
+are **metadata, not configuration switches**. Packet IDs, slots, frame counters,
+occupancy accounting, and column positions do not change. Tile-coverage tools
+must honor the permutation when interpreting oriented image locations.
+Raw column sums/means are unchanged by these within-column row permutations;
+inspect image rows rather than spectra to confirm the placement change.
+
+**Dark frames and every pixel-indexed mask must match this layout.** The dark
+builder preserves both orientation attributes from new raw captures on all
+its outputs. An untagged old capture is treated as unflipped. For a live input
+using native FPGA placement, the processor rejects calibrations with missing or
+mismatching orientation tags rather than silently subtracting the wrong rows.
+Old untagged calibrations remain accepted for unflipped legacy/replay inputs.
+
+To reuse a known unflipped dark file without acquiring it again, create a new
+file with the same permutations applied to all means, standard deviations and
+masks:
+
+```bash
+python scripts/conversion/flip_detector_rows.py \
+  old_dark.h5 oriented_dark.h5 \
+  --flip-top-imaging-rows --flip-bottom-reference-rows
+```
+
+The converter streams image datasets one frame at a time, preserves dtypes and
+metadata/filters, refuses to overwrite an existing output, and never performs
+ADC decoding or dark subtraction. It supports the same conversion for old raw
+bursts. The flags **toggle** their blocks and metadata: running both flips
+twice restores the original data. Only convert known old-layout files; do not
+flip a newly oriented burst again before building its dark.
+
+HDF5 replay treats frame coordinates as already assembled, carries their
+orientation tags into its outputs, and never repeats these receiver flips
+based on `stem_rx` settings. Calibrations must match the input dataset's tags.
+For old raw HDF5, use the converter before replay. Geometry must have 1024 rows
+when any flip is enabled.
+
+This change does **not** change the BLR estimator's row-selection convention
+or infer pattern/meta row locations. It only implements the confirmed spatial
+permutation; BLR sampling parameters and dark/mask algorithms otherwise retain
+their existing semantics.
+
+Host file/metadata checks (requires NumPy and h5py):
+`python cpp_daqiri/tests/test_frame_row_files.py`.
 
 ### Headerless / Invalid-Header FPGA Diagnostics
 

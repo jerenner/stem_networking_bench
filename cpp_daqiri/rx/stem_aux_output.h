@@ -13,6 +13,7 @@
 #include <string>
 
 #include "stem_samples.h"
+#include "stem_frame_rows.h"
 
 namespace stem {
 
@@ -114,6 +115,7 @@ struct BatchMetadata {
   bool fpga_tiles = false;
   bool fpga_zlp_row_first = false;
   SampleEncoding sample_encoding = SampleEncoding::kUint16;
+  FrameRowFlips row_flips;
 
   const char* assembly_mode() const {
     return arrival_order ? "arrival_order" : fpga_tiles ? "fpga_tiles" : "header";

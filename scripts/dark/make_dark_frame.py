@@ -145,7 +145,8 @@ def write_dark_frame(output_path: Path,
                      blinker_mask_dataset: str,
                      valid_mask_dataset: str,
                      raw_mean_dataset: str,
-                     compression: str | None):
+                     compression: str | None,
+                     row_flips=(False, False)):
     import h5py
     import numpy as np
 
@@ -204,6 +205,9 @@ def write_dark_frame(output_path: Path,
             compression=compression,
         )
         valid.attrs["description"] = "1 for pixels considered valid during runtime masking"
+        for output in (dataset, raw_dataset, stddev, blinker, valid):
+            output.attrs["flip_top_imaging_rows"] = np.uint32(row_flips[0])
+            output.attrs["flip_bottom_reference_rows"] = np.uint32(row_flips[1])
 
 
 def parse_args() -> argparse.Namespace:
@@ -259,6 +263,23 @@ def main() -> None:
     if args.edge_rows < 0:
         raise ValueError("--edge-rows must be non-negative")
 
+    # Input frames are already placed by RX. Preserve their row layout, never
+    # apply a second flip while averaging or repairing the calibration.
+    import h5py
+    import numpy as np
+    keys = ("flip_top_imaging_rows", "flip_bottom_reference_rows")
+    with h5py.File(args.input, "r") as source:
+        dataset = source[normalize_dataset_path(args.input_dataset)]
+        present = [key in dataset.attrs for key in keys]
+        if any(present) and not all(present):
+            raise ValueError("source dataset needs both row-orientation attributes")
+        row_flips = []
+        for key in keys:
+            value = np.asarray(dataset.attrs.get(key, 0))
+            if value.size != 1 or value.item() not in (0, 1):
+                raise ValueError(f"{key} must be a scalar 0 or 1")
+            row_flips.append(bool(value.item()))
+
     raw_dark_frame, dark_stddev, frames_averaged, input_shape = compute_dark_statistics(
         args.input,
         args.input_dataset,
@@ -299,6 +320,7 @@ def main() -> None:
         args.valid_mask_dataset,
         args.raw_mean_dataset,
         compression,
+        row_flips=row_flips,
     )
 
     blinker_count = int(blinker_mask.sum())
