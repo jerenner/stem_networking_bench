@@ -127,7 +127,8 @@ void stem_extract_packet_headers(uint8_t** src_ptrs, PacketHeaderInfo* headers,
 // twos_complement_12 sign-extends payload bit 11 into int16 during this same
 // gather, ignoring bits 15:12. No header bytes are decoded as samples.
 // Optional row_flips reverse the entire top imaging block (32..511) and/or
-// bottom reference block (992..1023) at placement time, never per tile.
+// map the bottom stream's leading references to 1023..992 and imaging to
+// 512..991 at placement time, never per tile. Native FPGA RX always uses both.
 void stem_gather_tile_packets_by_placement(
     uint8_t** src_ptrs, const PacketPlacement* placements, uint8_t* dst_base,
     uint16_t available_payload_len, uint16_t header_len, uint32_t num_pkts,

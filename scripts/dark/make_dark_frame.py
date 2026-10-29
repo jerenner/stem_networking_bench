@@ -146,7 +146,7 @@ def write_dark_frame(output_path: Path,
                      valid_mask_dataset: str,
                      raw_mean_dataset: str,
                      compression: str | None,
-                     row_flips=(False, False)):
+                     row_flips=(False, False), row_layout_version=2):
     import h5py
     import numpy as np
 
@@ -208,6 +208,7 @@ def write_dark_frame(output_path: Path,
         for output in (dataset, raw_dataset, stddev, blinker, valid):
             output.attrs["flip_top_imaging_rows"] = np.uint32(row_flips[0])
             output.attrs["flip_bottom_reference_rows"] = np.uint32(row_flips[1])
+            output.attrs["detector_row_layout_version"] = np.uint32(row_layout_version)
 
 
 def parse_args() -> argparse.Namespace:
@@ -271,7 +272,7 @@ def main() -> None:
     with h5py.File(args.input, "r") as source:
         dataset = source[normalize_dataset_path(args.input_dataset)]
         present = [key in dataset.attrs for key in keys]
-        if any(present) and not all(present):
+        if (any(present) or "detector_row_layout_version" in dataset.attrs) and not all(present):
             raise ValueError("source dataset needs both row-orientation attributes")
         row_flips = []
         for key in keys:
@@ -279,6 +280,12 @@ def main() -> None:
             if value.size != 1 or value.item() not in (0, 1):
                 raise ValueError(f"{key} must be a scalar 0 or 1")
             row_flips.append(bool(value.item()))
+        # Missing version with old flip flags is the cd5d807 layout, not the
+        # corrected bottom-stream placement. Never silently relabel old data.
+        version = np.asarray(dataset.attrs.get("detector_row_layout_version", 1))
+        if version.size != 1 or version.dtype.kind not in "iu" or version.item() not in (1, 2):
+            raise ValueError("unsupported detector_row_layout_version")
+        row_layout_version = int(version.item())
 
     raw_dark_frame, dark_stddev, frames_averaged, input_shape = compute_dark_statistics(
         args.input,
@@ -321,6 +328,7 @@ def main() -> None:
         args.raw_mean_dataset,
         compression,
         row_flips=row_flips,
+        row_layout_version=row_layout_version,
     )
 
     blinker_count = int(blinker_mask.sum())

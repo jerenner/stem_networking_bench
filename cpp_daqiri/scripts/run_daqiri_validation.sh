@@ -156,10 +156,13 @@ with h5py.File(tmp / "stem_pipeline_input.h5", "w") as f:
     oriented = np.broadcast_to(np.arange(1024, dtype=np.int16)[None, :, None],
                                (3, 1024, 4)).copy()
     oriented[:, 32:512] = oriented[:, 32:512][:, ::-1].copy()
-    oriented[:, 992:1024] = oriented[:, 992:1024][:, ::-1].copy()
+    bottom_stream = oriented[:, 512:1024].copy()
+    oriented[:, 992:1024] = bottom_stream[:, :32][:, ::-1]
+    oriented[:, 512:992] = bottom_stream[:, 32:]
     ds = f.create_dataset("/oriented_frames", data=oriented)
     for key in ("flip_top_imaging_rows", "flip_bottom_reference_rows"):
         ds.attrs[key] = 1
+    ds.attrs["detector_row_layout_version"] = 2
 
 with h5py.File(tmp / "stem_pipeline_corr.h5", "w") as f:
     dark = np.arange(16, dtype=np.float32).reshape(4, 4) / 2.0
@@ -170,11 +173,13 @@ with h5py.File(tmp / "stem_pipeline_corr.h5", "w") as f:
     f.create_dataset("/dark", data=dark)
     f.create_dataset("/valid_pixel_mask", data=mask)
     f.create_dataset("/bad_dark", data=np.zeros((3, 4), dtype=np.float32))
-    for name in ("oriented_dark", "legacy_dark", "unlabeled_dark"):
+    for name in ("oriented_dark", "old_oriented_dark", "legacy_dark", "unlabeled_dark"):
         ds = f.create_dataset(name, data=np.full((1024, 4), 0.5, dtype=np.float32))
         if name != "unlabeled_dark":
             for key in ("flip_top_imaging_rows", "flip_bottom_reference_rows"):
-                ds.attrs[key] = int(name == "oriented_dark")
+                ds.attrs[key] = int(name in ("oriented_dark", "old_oriented_dark"))
+        if name == "oriented_dark":
+            ds.attrs["detector_row_layout_version"] = 2
 
 def write(name: str, body: str) -> None:
     (tmp / name).write_text(body, encoding="utf-8")
@@ -668,7 +673,7 @@ for case in ("raw", "correction"):
     text += '\n  header_format: "fpga_tiles"\n'
     write(f"stem_case_oriented_{case}.yaml", text)
     if case == "correction":
-        for bad in ("legacy_dark", "unlabeled_dark"):
+        for bad in ("old_oriented_dark", "legacy_dark", "unlabeled_dark"):
             bad_text = text.replace('"/oriented_dark"', f'"/{bad}"')
             bad_text = bad_text.replace("stem_case_oriented_correction_out.h5",
                                         f"stem_case_bad_{bad}_out.h5")
@@ -717,6 +722,7 @@ run_ok stem_case_oriented_raw.yaml
 run_ok stem_case_oriented_correction.yaml
 run_fail stem_case_bad_legacy_dark.yaml
 run_fail stem_case_bad_unlabeled_dark.yaml
+run_fail stem_case_bad_old_oriented_dark.yaml
 
 run_fail stem_case_bad_repeat.yaml
 run_fail stem_case_bad_writer.yaml
@@ -856,6 +862,7 @@ for name, (want, dtype, path) in expected.items():
     with h5py.File(path, "r") as f:
         got = f["/processed"][...]
         if name.startswith("oriented_"):
+            assert f["/processed"].attrs["detector_row_layout_version"] == 2
             for key in ("flip_top_imaging_rows", "flip_bottom_reference_rows"):
                 assert f["/processed"].attrs[key] == 1
     if got.shape != want.shape:

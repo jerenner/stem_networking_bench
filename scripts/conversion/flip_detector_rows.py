@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Reverse selected detector row blocks in a new HDF5 copy, frame by frame.
+"""Convert detector row layouts in a new HDF5 copy, frame by frame.
 
 Every image-shaped dataset is transformed, including dark means, standard
 deviations and masks. No ADC decoding, calibration, or averaging is applied.
-The two flags toggle their blocks: applying the same operation twice restores
-the original data and orientation tags. Untagged files are assumed unflipped.
+Use --to-native-layout to migrate unflipped or version-1 captures/calibrations
+to the current sensor coordinates. Untagged files are assumed unflipped.
+The individual flags toggle layout states, undoing the source layout first;
+the bottom stream mapping itself is not self-inverse.
 """
 
 import argparse
@@ -15,11 +17,13 @@ import numpy as np
 
 
 FLAGS = ("flip_top_imaging_rows", "flip_bottom_reference_rows")
+VERSION_KEY = "detector_row_layout_version"
+LAYOUT_VERSION = 2
 
 
 def read_orientation(dataset):
     present = [key in dataset.attrs for key in FLAGS]
-    if any(present) and not all(present):
+    if (any(present) or VERSION_KEY in dataset.attrs) and not all(present):
         raise ValueError(f"{dataset.name}: both row-orientation attributes are required")
     result = []
     for key in FLAGS:
@@ -30,20 +34,41 @@ def read_orientation(dataset):
     return tuple(result)
 
 
-def flip_rows(frame, top_imaging=False, bottom_reference=False):
+def read_layout_version(dataset):
+    read_orientation(dataset)
+    version = np.asarray(dataset.attrs.get(VERSION_KEY, 1))
+    if version.size != 1 or version.dtype.kind not in "iu" or version.item() not in (1, 2):
+        raise ValueError(f"{dataset.name}: unsupported {VERSION_KEY}")
+    return int(version.item())
+
+
+def flip_rows(frame, top_imaging=False, bottom_reference=False, *, inverse=False,
+              layout_version=LAYOUT_VERSION):
     if frame.ndim != 2 or frame.shape[0] != 1024:
         raise ValueError("detector row flips require a 2D 1024-row frame")
-    result = frame.copy()
+    if layout_version not in (1, 2):
+        raise ValueError("unsupported detector row layout version")
+    destination = np.arange(1024)
     if top_imaging:
-        result[32:512] = frame[32:512][::-1]
+        destination[32:512] = np.arange(511, 31, -1)
     if bottom_reference:
-        result[992:1024] = frame[992:1024][::-1]
+        if layout_version == 1:
+            destination[992:1024] = np.arange(1023, 991, -1)
+        else:
+            destination[512:544] = np.arange(1023, 991, -1)
+            destination[544:1024] = np.arange(512, 992)
+    if inverse:
+        return frame[destination].copy()
+    result = np.empty_like(frame)
+    result[destination] = frame
     return result
 
 
-def convert(input_path, output_path, top_imaging=False, bottom_reference=False):
+def convert(input_path, output_path, top_imaging=False, bottom_reference=False, *, to_native=False):
     input_path, output_path = Path(input_path), Path(output_path)
-    if not (top_imaging or bottom_reference):
+    if to_native and (top_imaging or bottom_reference):
+        raise ValueError("--to-native-layout cannot be combined with individual flip flags")
+    if not (to_native or top_imaging or bottom_reference):
         raise ValueError("select at least one row block to reverse")
     if input_path.resolve() == output_path.resolve():
         raise ValueError("input and output files must differ")
@@ -58,6 +83,7 @@ def convert(input_path, output_path, top_imaging=False, bottom_reference=False):
         # Validate all tags before creating any output. Refuse to overwrite an
         # existing file, including a calibration accidentally named as output.
         orientations = {name: read_orientation(source[name]) for name in images}
+        versions = {name: read_layout_version(source[name]) for name in images}
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with h5py.File(output_path, "x") as target:
             target.attrs.update(source.attrs)
@@ -81,15 +107,23 @@ def convert(input_path, output_path, top_imaging=False, bottom_reference=False):
                     options["maxshape"] = obj.maxshape
                 dataset = target.create_dataset(name, shape=obj.shape, dtype=obj.dtype, **options)
                 dataset.attrs.update(obj.attrs)
+                before = orientations[name]
+                after = (True, True) if to_native else (before[0] ^ top_imaging,
+                                                       before[1] ^ bottom_reference)
+                def transform(frame):
+                    # Undo the *stored* mapping before applying the requested
+                    # current mapping. This also repairs cd5d807 bottom halves.
+                    stream = flip_rows(frame, *before, inverse=True,
+                                       layout_version=versions[name])
+                    return flip_rows(stream, *after)
                 if obj.ndim == 2:
-                    dataset[...] = flip_rows(obj[...], top_imaging, bottom_reference)
+                    dataset[...] = transform(obj[...])
                 else:
                     for frame in range(len(obj)):
-                        dataset[frame] = flip_rows(obj[frame], top_imaging, bottom_reference)
-                before = orientations[name]
-                after = (before[0] ^ top_imaging, before[1] ^ bottom_reference)
+                        dataset[frame] = transform(obj[frame])
                 for key, value in zip(FLAGS, after):
                     dataset.attrs[key] = np.uint32(value)
+                dataset.attrs[VERSION_KEY] = np.uint32(LAYOUT_VERSION)
             source.visititems(copy_object)
     return images
 
@@ -98,11 +132,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--to-native-layout", action="store_true",
+                        help="Migrate all images/masks to the current native FPGA sensor layout.")
     parser.add_argument("--flip-top-imaging-rows", action="store_true")
     parser.add_argument("--flip-bottom-reference-rows", action="store_true")
     args = parser.parse_args()
     images = convert(args.input, args.output, args.flip_top_imaging_rows,
-                     args.flip_bottom_reference_rows)
+                     args.flip_bottom_reference_rows, to_native=args.to_native_layout)
     print(f"Wrote {args.output}; transformed {len(images)} image dataset(s), preserving dtype.")
 
 

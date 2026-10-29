@@ -804,28 +804,39 @@ std::optional<stem::FrameRowFlips> read_frame_row_flips(
     const H5::DataSet& dataset) {
   const bool has_top = dataset.attrExists("flip_top_imaging_rows");
   const bool has_bottom = dataset.attrExists("flip_bottom_reference_rows");
-  if (!has_top && !has_bottom) { return std::nullopt; }
-  if (has_top != has_bottom) {
+  const bool has_version = dataset.attrExists("detector_row_layout_version");
+  if (!has_top && !has_bottom && !has_version) { return std::nullopt; }
+  if (!has_top || !has_bottom) {
     throw std::runtime_error("HDF5 row orientation needs both flip attributes");
   }
-  const auto flag = [&](const char* name) {
+  const auto integer_attribute = [&](const char* name) {
     auto attribute = dataset.openAttribute(name);
     if (attribute.getSpace().getSimpleExtentNpoints() != 1) {
-      throw std::runtime_error("HDF5 row flip attribute must be scalar");
+      throw std::runtime_error("HDF5 row layout attribute must be scalar");
     }
     const auto type = attribute.getDataType().getClass();
     if (type != H5T_INTEGER && type != H5T_ENUM) {
-      throw std::runtime_error("HDF5 row flip attribute must be integer or boolean");
+      throw std::runtime_error("HDF5 row layout attribute must be integer or boolean");
     }
     int64_t value = 0;
     attribute.read(H5::PredType::NATIVE_INT64, &value);
+    return value;
+  };
+  const auto flag = [&](const char* name) {
+    const auto value = integer_attribute(name);
     if (value < 0 || value > 1) {
       throw std::runtime_error("HDF5 row flip attribute must be 0 or 1");
     }
     return value != 0;
   };
+  const auto version = has_version
+      ? integer_attribute("detector_row_layout_version") : 1;
+  if (version < 1 || version > stem::DETECTOR_ROW_LAYOUT_VERSION) {
+    throw std::runtime_error("unsupported HDF5 detector_row_layout_version");
+  }
   return stem::FrameRowFlips{flag("flip_top_imaging_rows"),
-                            flag("flip_bottom_reference_rows")};
+                            flag("flip_bottom_reference_rows"),
+                            static_cast<uint32_t>(version)};
 }
 
 Hdf5FrameData read_single_frame_float_dataset(const std::string& file_path,
@@ -977,8 +988,9 @@ class AsyncFrameSink {
         dataset_row_flips_ = slot->row_flips;
         const H5::DataSpace scalar(H5S_SCALAR);
         for (const auto& flag : {
-                 std::make_pair("flip_top_imaging_rows", slot->row_flips.flip_top_imaging_rows),
-                 std::make_pair("flip_bottom_reference_rows", slot->row_flips.flip_bottom_reference_rows)}) {
+                 std::make_pair("flip_top_imaging_rows", uint32_t(slot->row_flips.flip_top_imaging_rows)),
+                 std::make_pair("flip_bottom_reference_rows", uint32_t(slot->row_flips.flip_bottom_reference_rows)),
+                 std::make_pair("detector_row_layout_version", slot->row_flips.layout_version)}) {
           auto attribute = dataset_->createAttribute(flag.first,
               H5::PredType::NATIVE_UINT32, scalar);
           const uint32_t value = flag.second;
@@ -1369,7 +1381,8 @@ class FramePipeline {
     }
     if (frame.row_flips && *frame.row_flips != row_flips_) {
       throw std::runtime_error(label +
-          " row orientation does not match the incoming frames");
+          " row orientation does not match the incoming frames (including layout version); "
+          "rebuild the calibration or convert it with flip_detector_rows.py --to-native-layout");
     }
   }
 
@@ -3115,6 +3128,7 @@ void print_rx_start(const StemRxConfig& cfg) {
             << (cfg.frame_row_flips().flip_top_imaging_rows ? "true" : "false")
             << " flip_bottom_reference_rows="
             << (cfg.frame_row_flips().flip_bottom_reference_rows ? "true" : "false")
+            << " detector_row_layout_version=" << cfg.frame_row_flips().layout_version
             << " gpu_header_extract="
             << (cfg.gpu_header_extract ? "true" : "false")
             << " header_decode="

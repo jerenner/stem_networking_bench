@@ -470,6 +470,8 @@ struct BurstWriter::Impl {
                         first.row_flips.flip_top_imaging_rows);
     write_u32_attribute(dataset, "flip_bottom_reference_rows",
                         first.row_flips.flip_bottom_reference_rows);
+    write_u32_attribute(dataset, "detector_row_layout_version",
+                        first.row_flips.layout_version);
     if (first.interface_name != "hdf5_replay") {
       write_string_attribute(dataset, "wire_sample_encoding",
                              sample_encoding_name(first.sample_encoding));
@@ -955,6 +957,7 @@ struct ThinnedStreamPublisher::Impl {
          << (slot.metadata.row_flips.flip_top_imaging_rows ? "true" : "false")
          << ",\"flip_bottom_reference_rows\":"
          << (slot.metadata.row_flips.flip_bottom_reference_rows ? "true" : "false")
+         << ",\"detector_row_layout_version\":" << slot.metadata.row_flips.layout_version
          << ",\"processing_stage\":\""
          << processing_stage_name(slot.runtime.stage)
          << "\",\"dtype\":\"float32\",\"byte_order\":\"little\""

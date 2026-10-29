@@ -61,7 +61,8 @@ daqiri:
           match: {udp_dst: 23130}
 
 stem_rx:
-  # Native detector mapping always reverses rows 32..511 and 992..1023.
+  # Native mapping: top imaging reversed; bottom leading references moved to
+  # rows 1023..992, bottom imaging shifted to rows 512..991 (layout version 2).
   header_format: "fpga_tiles"
   assemble_by_arrival: false
   header_size: 42

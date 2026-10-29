@@ -1026,16 +1026,24 @@ signed replay, raw/burst HDF5, dark correction, BLR, two-sided masking and sums.
 
 ### Detector Row Orientation
 
-The FPGA's imaging/reference readout directions require two fixed in-place
-reversals, across **all ZLP and CoreLoss columns**. They are an unconditional
-part of `stem_rx.header_format: fpga_tiles`, not optional corrections:
+Both FPGA boards send pattern, metadata, 30 BLR rows, then 480 imaging rows
+from the sensor centre outward. After initial tile placement, the following
+fixed stream-to-sensor mapping acts across **all ZLP and CoreLoss columns**.
+It is an unconditional part of `stem_rx.header_format: fpga_tiles`, not an
+optional correction (all row ranges below are inclusive):
 
 | Incoming row range (inclusive) | Fixed destination mapping |
 | --- | --- |
 | 0..31: top pattern + meta + 30 BLR | Unchanged |
 | 32..511: top imaging | `destination_row = 543 - source_row` |
-| 512..991: bottom imaging | Unchanged |
-| 992..1023: bottom pattern/meta/BLR block | `destination_row = 2015 - source_row` |
+| 512..543: bottom pattern + meta + 30 BLR | `destination_row = 1535 - source_row` |
+| 544..1023: bottom imaging | `destination_row = source_row - 32` |
+
+Thus pattern/meta land at rows 0/1 on top and 1023/1022 on bottom; BLR lands
+at 2..31 and 1021..992. The first imaging sample lands at row 511 on top
+and 512 on bottom, with both imaging streams progressing outward. The
+bottom mapping relocates **all 512 rows**; it is not a reversal of just the
+last 32 rows. This corrects the bottom-half placement introduced in `cd5d807`.
 
 No extra YAML settings or GUI switches are needed. Rebuild the application and
 restart acquisition with the existing `header_format: fpga_tiles` configuration.
@@ -1047,19 +1055,22 @@ same header-derived layout. Legacy test transmitters, synthetic benchmarks,
 and arrival-order diagnostics retain their previous placement.
 
 The operation is fused into GPU gather, alongside signed ADC decoding. There
-is no extra frame pass, GPU buffer, or kernel launch. It reverses the global
-480-row top imaging region, **not each individual tile**. Thus a 128-row ZLP
-tile crossing row 32 is split between unchanged reference rows and reversed
-imaging rows; the mapping remains a bijection with no dropped/duplicated
-pixels. The bottom reference flip includes the pattern and metadata rows,
-but leaves all bottom imaging pixels and top reference pixels untouched.
+is no extra frame pass, GPU buffer, or kernel launch. It maps global rows,
+**not each individual tile**. Thus a 128-row ZLP tile crossing a reference/
+imaging boundary is split across the appropriate output blocks; the mapping
+remains a bijection with no dropped/duplicated pixels. Top reference pixels
+are untouched. Do not additionally apply a GUI-only "Sensor layout fix
+(slave)" to these new products: their bottom half is already corrected.
 Legacy/synthetic layouts use the original no-orientation kernel specialization.
 Actual performance must still be checked on the IGX.
 
 Raw live products and raw bursts already include this placement correction,
 even with processor no-op enabled. Their metadata records
-`flip_top_imaging_rows` and `flip_bottom_reference_rows`; continuous HDF5 output
-also records these dataset attributes. They describe stored coordinates and
+`flip_top_imaging_rows`, `flip_bottom_reference_rows`, and
+`detector_row_layout_version: 2`; continuous HDF5 output also records these
+dataset attributes. The historical bottom flag now denotes the full bottom
+stream placement, with the version distinguishing its exact permutation.
+These fields describe stored coordinates and
 are **metadata, not configuration switches**. Packet IDs, slots, frame counters,
 occupancy accounting, and column positions do not change. Tile-coverage tools
 must honor the permutation when interpreting oriented image locations.
@@ -1067,31 +1078,38 @@ Raw column sums/means are unchanged by these within-column row permutations;
 inspect image rows rather than spectra to confirm the placement change.
 
 **Dark frames and every pixel-indexed mask must match this layout.** The dark
-builder preserves both orientation attributes from new raw captures on all
-its outputs. An untagged old capture is treated as unflipped. For a live input
+builder preserves the orientation flags and version from raw captures on all
+its outputs. Flags without a version denote the old version-1 placement;
+an entirely untagged old capture is treated as unflipped. For a live input
 using native FPGA placement, the processor rejects calibrations with missing or
-mismatching orientation tags rather than silently subtracting the wrong rows.
+mismatching orientation tags (including version) rather than silently
+subtracting the wrong rows. A version-1 bottom-oriented dark is **not**
+compatible with version-2 native input, even if both boolean flags match.
 Old untagged calibrations remain accepted for unflipped legacy/replay inputs.
 
-To reuse a known unflipped dark file without acquiring it again, create a new
-file with the same permutations applied to all means, standard deviations and
-masks:
+To reuse a known unflipped or version-1 dark file without acquiring it again,
+create a new file with all means, standard deviations and masks migrated to
+the current native layout:
 
 ```bash
 python scripts/conversion/flip_detector_rows.py \
   old_dark.h5 oriented_dark.h5 \
-  --flip-top-imaging-rows --flip-bottom-reference-rows
+  --to-native-layout
 ```
 
 The converter streams image datasets one frame at a time, preserves dtypes and
 metadata/filters, refuses to overwrite an existing output, and never performs
 ADC decoding or dark subtraction. It supports the same conversion for old raw
-bursts. The flags **toggle** their blocks and metadata: running both flips
-twice restores the original data. Only convert known old-layout files; do not
-flip a newly oriented burst again before building its dark.
+bursts. It undoes the source's stored layout first (version 1 when old flags
+have no version), then applies version 2 and tags the output. Already-native
+version-2 images are unchanged by `--to-native-layout`. Individual flip flags
+remain available to toggle layout states; they are not naive repeated pixel
+flips. In particular, the new bottom permutation is **not self-inverse**.
+For new dark calibration, capture new raw data and run the dark builder
+directly without any additional conversion.
 
 HDF5 replay treats frame coordinates as already assembled, carries their
-orientation tags into its outputs, and never repeats these receiver flips
+orientation flags/version into its outputs, and never repeats this receiver mapping
 based on `stem_rx` settings. Calibrations must match the input dataset's tags.
 For old raw HDF5, use the converter before replay. Geometry must have 1024 rows
 when any flip is enabled.

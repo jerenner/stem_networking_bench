@@ -322,6 +322,10 @@ void stem_gather_tile_packets_by_placement(
   if (row_flips.enabled() && frame_height != FRAME_HEIGHT) {
     throw std::runtime_error("detector row flips require 1024-row frames");
   }
+  if (row_flips.flip_bottom_reference_rows &&
+      row_flips.layout_version != DETECTOR_ROW_LAYOUT_VERSION) {
+    throw std::runtime_error("tile gather requires the current detector row layout");
+  }
   if (sample_encoding == SampleEncoding::kTwosComplement12) {
     launch_stem_gather_tile_packets<true>(
         src_ptrs, placements, dst_base, available_payload_len, header_len,

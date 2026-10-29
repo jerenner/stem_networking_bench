@@ -138,7 +138,7 @@ int main() {
       });
       for (uint32_t row = 0; row < FRAME_HEIGHT; ++row) {
         const uint32_t dest = top && row >= 32 && row < 512 ? 543 - row
-            : bottom && row >= 992 ? 2015 - row : row;
+            : bottom && row >= 512 ? (row < 544 ? 1535 - row : row - 32) : row;
         for (uint32_t col = 0; col < FRAME_WIDTH; ++col) {
           const uint32_t raw = (row * 3 + col) % 4096;
           const uint32_t index = pixels + dest * FRAME_WIDTH + col;
