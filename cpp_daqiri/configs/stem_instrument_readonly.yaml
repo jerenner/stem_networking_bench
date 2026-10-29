@@ -27,6 +27,8 @@ instrument:
       # password: "YOUR_CAMERA_PASSWORD" in your LOCAL YAML, never in Git.
       identity_file: "/run/camera_ssh/id_ed25519"
       known_hosts_file: "/run/camera_ssh/known_hosts"
+      # Only if this camera reports "no matching host key type ... ssh-rsa":
+      # host_key_algorithms: "+ssh-rsa"
       # Optional SSH jump; its authentication is independent of the camera's.
       # jump_host:
       #   host: "mothership2"

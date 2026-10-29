@@ -294,6 +294,34 @@ measurement tables; hovering over a link row exposes the lane details and raw
 register. In DM use **Temps**, **Biases**, **Rails**, and **Links**, then
 **Refresh displayed readings** after the operation finishes. The DM palette
 has fields for the known eight temperature probes, 24 supply/bias channels,
+### Legacy camera host keys
+
+If the camera SSH handshake fails with `no matching host key type` and offers
+only `ssh-rsa`, set this option on the camera, not the jump host:
+
+```yaml
+instrument:
+  readonly:
+    camera:
+      host_key_algorithms: "+ssh-rsa"
+```
+
+Merge the setting into the existing block; keep the other camera settings.
+It appends the legacy algorithm rather than replacing modern choices and does
+not disable `StrictHostKeyChecking` or bypass the verified `known_hosts` file.
+This is an explicit per-host compatibility exception: the setting is not
+inherited by `jump_host`, and defaults remain unchanged. If the jump host itself
+needs an exception, configure its own `host_key_algorithms` separately.
+An image built before this option was added must be rebuilt, then the supervisor
+restarted with the updated YAML.
+
+The legacy `ssh-rsa` signature uses SHA-1 and is disabled by modern OpenSSH
+defaults. Prefer upgrading the device SSH server when practical; do not enable
+legacy algorithms globally. This error concerns server identity, not the
+camera password or your jump-host private key. With camera password auth,
+there is no need to add `PubkeyAcceptedAlgorithms=+ssh-rsa` for this error.
+See [OpenSSH legacy compatibility guidance](https://www.openssh.com/legacy.html).
+
 and module IDs 0-7. New firmware channel names remain available in full JSON
 state and the Qt table even if not yet added to the fixed DM palette.
 

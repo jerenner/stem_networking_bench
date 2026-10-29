@@ -37,6 +37,13 @@ def ssh_arguments(settings, timeout, default_user, default_known_hosts=None):
     argv = ["ssh", "-T", "-o", "BatchMode=" + ("no" if password is not None else "yes"),
             "-o", "StrictHostKeyChecking=yes", "-o", "ForwardAgent=no",
             "-o", "ConnectTimeout={}".format(max(1, int(timeout))), "-p", str(port)]
+    host_key_algorithms = settings.get("host_key_algorithms")
+    if host_key_algorithms is not None:
+        if not isinstance(host_key_algorithms, str) or not re.fullmatch(
+            r"[+^\-]?[A-Za-z0-9@._*\-]+(?:,[A-Za-z0-9@._*\-]+)*", host_key_algorithms
+        ):
+            raise ValueError("host_key_algorithms must be a nonempty SSH algorithm list without whitespace")
+        argv += ["-o", "HostKeyAlgorithms=" + host_key_algorithms]
     if password is not None:
         argv += ["-o", "PreferredAuthentications=password", "-o", "PasswordAuthentication=yes",
                  "-o", "KbdInteractiveAuthentication=no", "-o", "PubkeyAuthentication=no",

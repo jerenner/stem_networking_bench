@@ -68,6 +68,32 @@ class CameraSshTest(unittest.TestCase):
         self.assertIn("BatchMode=yes", argv)
         self.assertIn("StrictHostKeyChecking=yes", argv)
 
+    def test_legacy_host_key_exception_is_opt_in_and_per_hop(self):
+        settings = camera()
+        argv, _ = camera_ssh_command(settings, 8)
+        self.assertNotIn("HostKeyAlgorithms=", " ".join(argv))
+        settings["host_key_algorithms"] = "+ssh-rsa"
+        argv, _ = camera_ssh_command(settings, 8)
+        self.assertIn("HostKeyAlgorithms=+ssh-rsa", argv)
+        self.assertIn("StrictHostKeyChecking=yes", argv)
+        proxy = shlex.split(next(item.split("=", 1)[1] for item in argv if item.startswith("ProxyCommand=")))
+        self.assertNotIn("HostKeyAlgorithms=+ssh-rsa", proxy)
+        self.assertIn("StrictHostKeyChecking=yes", proxy)
+        settings.pop("host_key_algorithms")
+        settings["jump_host"]["host_key_algorithms"] = "+ssh-rsa"
+        argv, _ = camera_ssh_command(settings, 8)
+        self.assertNotIn("HostKeyAlgorithms=+ssh-rsa", argv)
+        proxy = shlex.split(next(item.split("=", 1)[1] for item in argv if item.startswith("ProxyCommand=")))
+        self.assertIn("HostKeyAlgorithms=+ssh-rsa", proxy)
+
+    def test_rejects_invalid_host_key_algorithm_options(self):
+        for value in ("", True, ["ssh-rsa"], "+ssh-rsa -oStrictHostKeyChecking=no",
+                      "+ssh-rsa\nProxyCommand=bad", "+ssh-rsa;bad"):
+            settings = camera()
+            settings["host_key_algorithms"] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                camera_ssh_command(settings, 8)
+
     def test_prompt_helper_never_answers_other_prompts(self):
         _, environment = camera_ssh_command(camera(), 8)
         for prompt in ("Password:", "root@other's password:", "Are you sure you want to continue connecting?",
